@@ -82,19 +82,25 @@ The package exposes a CLI entry point `riskbalancer` with two sub-commands:
 
 1. `riskbalancer categorize --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
    - Loads the statement with the AJ Bell adapter.
-   - Prompts you to assign any unmapped instruments to a category from the plan, optionally capturing a custom volatility per instrument.
-   - Stores new mappings (per ticker) so future ingestions auto-categorize.
+   - Prompts you to assign any unmapped instruments to one or more categories from the plan. Use comma-separated entries with percentages (e.g., `Equities / Developed / NAM=70, Equities / Developed / Europe=30`). Optionally supply a custom volatility per instrument.
+   - Stores the resulting allocations (per ticker) so future ingestions auto-categorize and automatically split holdings across the selected categories.
 2. `riskbalancer analyze --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
    - Loads the plan, applies instrument mappings, ingests the statement, and prints a table showing actual vs. target weights along with an over/under invested flag for every leaf category.
 
-Instrument mappings are kept in simple YAML files, for example:
+Instrument mappings are stored in YAML, supporting multiple category allocations per instrument:
 
 ```yaml
 AMD:
-  category: "Equities / Developed / NAM"
+  allocations:
+    - category: "Equities / Developed / NAM"
+      weight: 0.7
+    - category: "Equities / Developed / Europe"
+      weight: 0.3
   volatility: 0.22
 IEF:
-  category: "Bonds / Developed / NAM / Govt"
+  allocations:
+    - category: "Bonds / Developed / NAM / Govt"
+      weight: 1.0
 ```
 
 Store one mapping file per broker (e.g., `config/mappings/ajbell.yaml`) and pass it to both `categorize` and `analyze`. Once every instrument is mapped, the analyze step runs without prompts.

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from riskbalancer import CategoryPath
 from riskbalancer.cli import (
+    CategoryAllocation,
     InstrumentMapping,
     PlanIndex,
     gather_missing_mappings,
@@ -14,12 +15,22 @@ from riskbalancer.configuration import load_portfolio_plan_from_yaml
 def test_load_and_save_mappings(tmp_path):
     path = tmp_path / "mappings.yaml"
     original = {
-        "AMD": InstrumentMapping(category=CategoryPath("Equities", "US"), volatility=0.2),
-        "IEF": InstrumentMapping(category=CategoryPath("Bonds", "US")),
+        "AMD": InstrumentMapping(
+            allocations=[
+                CategoryAllocation(path=CategoryPath("Equities", "US"), weight=0.7),
+                CategoryAllocation(path=CategoryPath("Equities", "International"), weight=0.3),
+            ],
+            volatility=0.2,
+        ),
+        "IEF": InstrumentMapping(
+            allocations=[CategoryAllocation(path=CategoryPath("Bonds", "US"), weight=1.0)]
+        ),
     }
     save_mappings(path, original)
     loaded = load_mappings(path)
-    assert loaded["AMD"].category.levels() == ("Equities", "US")
+    amd_allocs = loaded["AMD"].allocations
+    assert len(amd_allocs) == 2
+    assert amd_allocs[0].path.levels()[0] == "Equities"
     assert loaded["AMD"].volatility == 0.2
     assert loaded["IEF"].volatility is None
 
@@ -31,11 +42,12 @@ def test_gather_missing_mappings_validates_inputs(monkeypatch, tmp_path):
         [
             "invalid",
             "list",
-            "Equities / Developed / NAM",
+            "Equities / Developed / NAM=100",
             "0.3",
         ]
     )
     result = gather_missing_mappings(["AMD"], plan_index=plan_index, input_func=lambda prompt="": next(inputs))
     mapping = result["AMD"]
-    assert mapping.category.levels() == ("Equities", "Developed", "NAM")
+    assert len(mapping.allocations) == 1
+    assert mapping.allocations[0].path.levels() == ("Equities", "Developed", "NAM")
     assert mapping.volatility == 0.3

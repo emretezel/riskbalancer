@@ -11,6 +11,9 @@ authors = [{name = "RiskBalancer"}]
 requires-python = ">=3.9"
 dependencies = ["pyyaml>=6.0"]
 
+[project.optional-dependencies]
+dev = ["pytest>=6.2"]
+
 [project.urls]
 Homepage = "https://github.com/emretezel/riskbalancer"
 

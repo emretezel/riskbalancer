@@ -15,17 +15,13 @@ class AJBellCSVAdapter(StatementAdapter):
         self,
         *,
         default_category: Optional[CategoryPath] = None,
-        category_map: Optional[Mapping[str, CategoryPath]] = None,
         default_volatility: float = 0.2,
-        volatility_map: Optional[Mapping[str, float]] = None,
     ):
         super().__init__("AJ Bell CSV")
         self.default_category = default_category or CategoryPath(
-            "Uncategorized", "Unassigned", "Unassigned"
+            "Uncategorized", "Pending Review"
         )
-        self.category_map = dict(category_map or {})
         self.default_volatility = default_volatility
-        self.volatility_map = dict(volatility_map or {})
 
     def parse_path(self, path: Union[str, Path]) -> Sequence[Investment]:
         with open(path, "r", encoding="utf-8-sig") as handle:
@@ -60,8 +56,8 @@ class AJBellCSVAdapter(StatementAdapter):
         if market_value == 0:
             return None
 
-        resolved_category = self._resolve_category(ticker, name)
-        volatility = self._resolve_volatility(ticker, name)
+        resolved_category = self.default_category
+        volatility = self.default_volatility
         quantity_value = self._parse_optional_number(quantity)
 
         return Investment(
@@ -73,20 +69,6 @@ class AJBellCSVAdapter(StatementAdapter):
             volatility=volatility,
             source="aj_bell",
         )
-
-    def _resolve_category(self, ticker: Optional[str], name: str) -> CategoryPath:
-        if ticker and ticker in self.category_map:
-            return self.category_map[ticker]
-        if name in self.category_map:
-            return self.category_map[name]
-        return self.default_category
-
-    def _resolve_volatility(self, ticker: Optional[str], name: str) -> float:
-        if ticker and ticker in self.volatility_map:
-            return self.volatility_map[ticker]
-        if name in self.volatility_map:
-            return self.volatility_map[name]
-        return self.default_volatility
 
     @staticmethod
     def _parse_number(value: str) -> float:
