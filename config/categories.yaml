@@ -1,0 +1,136 @@
+assets:
+- name: Equities
+  weight: 0.55
+  children:
+  - name: Developed
+    weight: 0.75
+    children:
+    - name: NAM
+      weight: 0.34
+      volatility: 0.175
+      adjustment: 1.0
+    - name: EMEA
+      weight: 0.33
+      children:
+      - name: UK
+        weight: 0.2
+        volatility: 0.175
+        adjustment: 0.9
+      - name: Non -UK
+        weight: 0.8
+        volatility: 0.175
+        adjustment: 0.9
+    - name: Asia
+      weight: 0.33
+      children:
+      - name: Japan
+        weight: 0.4
+        volatility: 0.175
+        adjustment: 1.0
+      - name: Ex-Japan
+        weight: 0.6
+        volatility: 0.175
+        adjustment: 0.9
+  - name: EM
+    weight: 0.25
+    volatility: 0.232
+    adjustment: 0.9
+- name: Bonds
+  weight: 0.2
+  children:
+  - name: Developed
+    weight: 0.75
+    children:
+    - name: NAM
+      weight: 0.33
+      children:
+      - name: Govt
+        weight: 0.36
+        volatility: 0.055
+        adjustment: 1.0
+      - name: Corp
+        weight: 0.27
+        volatility: 0.06
+        adjustment: 1.0
+      - name: High Yield
+        weight: 0.27
+        volatility: 0.073
+        adjustment: 1.0
+      - name: Inflation
+        weight: 0.1
+        volatility: 0.055
+        adjustment: 1.35
+    - name: Europe
+      weight: 0.33
+      children:
+      - name: Govt
+        weight: 0.36
+        volatility: 0.055
+        adjustment: 0.8
+      - name: Corp
+        weight: 0.27
+        volatility: 0.06
+        adjustment: 0.85
+      - name: High Yield
+        weight: 0.27
+        volatility: 0.073
+        adjustment: 0.9
+      - name: Inflation
+        weight: 0.1
+        volatility: 0.055
+        adjustment: 1.35
+    - name: UK
+      weight: 0.33
+      children:
+      - name: Govt
+        weight: 0.45
+        volatility: 0.055
+        adjustment: 0.9
+      - name: Corp
+        weight: 0.45
+        volatility: 0.06
+        adjustment: 1.0
+      - name: Inflation
+        weight: 0.1
+        volatility: 0.055
+        adjustment: 1.35
+  - name: EM
+    weight: 0.25
+    children:
+    - name: Normal
+      weight: 0.6
+      children:
+      - name: Govt
+        weight: 1.0
+        volatility: 0.073
+        adjustment: 0.85
+    - name: Foreign
+      weight: 0.4
+      children:
+      - name: Govt
+        weight: 0.4
+        volatility: 0.073
+        adjustment: 0.85
+      - name: Corporate
+        weight: 0.6
+        volatility: 0.08
+        adjustment: 0.8
+- name: Alternative
+  weight: 0.25
+  children:
+  - name: Gold
+    weight: 0.18
+    volatility: 0.152
+    adjustment: 1.35
+  - name: Silver
+    weight: 0.12
+    volatility: 0.152
+    adjustment: 1.35
+  - name: Systematic
+    weight: 0.7
+    volatility: 0.16
+    adjustment: 1.35
+- name: Cash
+  weight: 0.0
+  volatility: 0.0
+  adjustment: 0.0
