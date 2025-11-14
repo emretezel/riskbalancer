@@ -12,7 +12,7 @@ requires-python = ">=3.9"
 dependencies = ["pyyaml>=6.0"]
 
 [project.urls]
-Homepage = "https://example.com/riskbalancer"
+Homepage = "https://github.com/emretezel/riskbalancer"
 
 [project.scripts]
 riskbalancer = "riskbalancer.cli:main"
