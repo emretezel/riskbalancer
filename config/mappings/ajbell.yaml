@@ -1,0 +1,112 @@
+AMD:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0
+CE31:
+  allocations:
+  - category: Bonds / Developed / Europe / Govt
+    weight: 1.0
+CNKY:
+  allocations:
+  - category: Equities / Developed / Asia / Japan
+    weight: 1.0
+Cash GBP:
+  allocations:
+  - category: Cash
+    weight: 1.0
+EMIM:
+  allocations:
+  - category: Equities / EM
+    weight: 1.0
+ERNS:
+  allocations:
+  - category: Bonds / Developed / UK / Govt
+    weight: 1.0
+IB01:
+  allocations:
+  - category: Bonds / Developed / NAM / Govt
+    weight: 1.0
+IBCX:
+  allocations:
+  - category: Bonds / Developed / Europe / Corp
+    weight: 1.0
+IBGS:
+  allocations:
+  - category: Bonds / Developed / Europe / Govt
+    weight: 1.0
+IGL5:
+  allocations:
+  - category: Bonds / Developed / UK / Govt
+    weight: 1.0
+IGLS:
+  allocations:
+  - category: Bonds / Developed / UK / Govt
+    weight: 1.0
+INXG:
+  allocations:
+  - category: Bonds / Developed / UK / Inflation
+    weight: 1.0
+ISF:
+  allocations:
+  - category: Equities / Developed / EMEA / UK
+    weight: 1.0
+ITPS:
+  allocations:
+  - category: Bonds / Developed / NAM / Inflation
+    weight: 1.0
+IUVF:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0
+JPEA:
+  allocations:
+  - category: Bonds / EM / Foreign / Govt
+    weight: 1.0
+LQDA:
+  allocations:
+  - category: Bonds / Developed / NAM / Corp
+    weight: 1.0
+MTIX:
+  allocations:
+  - category: Bonds / Developed / Europe / Inflation
+    weight: 1.0
+NET:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0
+SDIA:
+  allocations:
+  - category: Bonds / Developed / NAM / Corp
+    weight: 1.0
+SEML:
+  allocations:
+  - category: Bonds / EM / Normal / Govt
+    weight: 1.0
+SHYU:
+  allocations:
+  - category: Bonds / Developed / NAM / High Yield
+    weight: 1.0
+SMEA:
+  allocations:
+  - category: Equities / Developed / EMEA / Non -UK
+    weight: 1.0
+SSLN:
+  allocations:
+  - category: Alternative / Silver
+    weight: 1.0
+SUSS:
+  allocations:
+  - category: Bonds / Developed / Europe / Corp
+    weight: 1.0
+USTY:
+  allocations:
+  - category: Bonds / Developed / NAM / Govt
+    weight: 1.0
+UTIP:
+  allocations:
+  - category: Bonds / Developed / NAM / Inflation
+    weight: 1.0
+VAPX:
+  allocations:
+  - category: Equities / Developed / Asia / Ex-Japan
+    weight: 1.0

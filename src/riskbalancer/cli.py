@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import sys
 import math
+import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Mapping
 
 import yaml
 
@@ -15,6 +17,7 @@ from .models import CategoryPath, Investment
 from .portfolio import Portfolio, PortfolioAnalyzer
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
+PORTFOLIO_DIR = Path("portfolios")
 ADAPTERS = {
     "ajbell": AJBellCSVAdapter,
 }
@@ -39,6 +42,13 @@ class InstrumentMapping:
 class CategoryAllocation:
     path: CategoryPath
     weight: float
+
+
+@dataclass
+class SourceSpec:
+    adapter: str
+    statement: Path
+    mappings: Path
 
 
 class PlanIndex:
@@ -93,7 +103,9 @@ def load_mappings(path: Path) -> Dict[str, InstrumentMapping]:
         if not allocations:
             continue
         volatility = payload.get("volatility")
-        mappings[instrument] = InstrumentMapping(allocations=allocations, volatility=volatility)
+        mapping = InstrumentMapping(allocations=allocations, volatility=volatility)
+        mapping.allocations = mapping.normalized_allocations()
+        mappings[instrument] = mapping
     return mappings
 
 
@@ -145,6 +157,90 @@ def parse_allocation_input(user_input: str, plan_index: PlanIndex) -> List[Categ
     if not math.isclose(total, 1.0, abs_tol=0.01):
         raise ValueError("Allocation weights must sum to 100% (allowing small rounding)")
     return allocations
+
+
+def parse_source_spec(spec: str) -> SourceSpec:
+    parts = {}
+    for segment in spec.split(","):
+        if not segment.strip():
+            continue
+        if "=" not in segment:
+            raise ValueError(f"Invalid source specification segment '{segment}'")
+        key, value = segment.split("=", 1)
+        parts[key.strip()] = value.strip()
+    adapter = parts.get("adapter")
+    statement = parts.get("statement")
+    mappings = parts.get("mappings")
+    if not adapter or not statement or not mappings:
+        raise ValueError(
+            "Source spec must include adapter=..., statement=..., mappings=..."
+        )
+    return SourceSpec(
+        adapter=adapter,
+        statement=Path(statement),
+        mappings=Path(mappings),
+    )
+
+
+def investment_to_dict(investment: Investment) -> Dict[str, object]:
+    return {
+        "instrument_id": investment.instrument_id,
+        "description": investment.description,
+        "market_value": investment.market_value,
+        "quantity": investment.quantity,
+        "category": investment.category.label(),
+        "volatility": investment.volatility,
+        "source": investment.source,
+    }
+
+
+def investments_to_dicts(investments: Iterable[Investment]) -> List[Dict[str, object]]:
+    return [investment_to_dict(inv) for inv in investments]
+
+
+def investment_from_dict(payload: Mapping[str, object]) -> Investment:
+    category_label = payload["category"]
+    if not isinstance(category_label, str):
+        raise ValueError("Category label must be a string")
+    quantity = payload.get("quantity")
+    if quantity is not None:
+        quantity = float(quantity)
+    return Investment(
+        instrument_id=str(payload["instrument_id"]),
+        description=str(payload.get("description", "")),
+        market_value=float(payload.get("market_value", 0.0)),
+        quantity=quantity,
+        category=_parse_category_label(category_label),
+        volatility=float(payload.get("volatility", 0.0)) or 0.0001,
+        source=str(payload.get("source", "portfolio")),
+    )
+
+
+def investments_from_dicts(items: Iterable[Mapping[str, object]]) -> List[Investment]:
+    return [investment_from_dict(item) for item in items]
+
+
+def resolve_portfolio_path(value: str) -> Path:
+    path = Path(value)
+    if path.is_dir():
+        raise ValueError("Portfolio path must be a file, not a directory")
+    if not path.suffix:
+        path = PORTFOLIO_DIR / f"{path}.json"
+    return path
+
+
+def save_portfolio_snapshot(path: Path, plan_path: Path, investments: List[Investment]) -> None:
+    data = {
+        "plan": str(plan_path),
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "investments": investments_to_dicts(investments),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def load_portfolio_snapshot(path: Path) -> Dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def gather_missing_mappings(
@@ -244,6 +340,28 @@ def apply_mappings_to_investments(
     return expanded
 
 
+def gather_investments_from_sources(
+    specs: List[SourceSpec],
+    *,
+    strict: bool = False,
+) -> List[Investment]:
+    combined: List[Investment] = []
+    for spec in specs:
+        mappings = load_mappings(spec.mappings)
+        base = parse_statement(spec.statement, spec.adapter)
+        missing = sorted({inv.instrument_id for inv in base if inv.instrument_id not in mappings})
+        if missing:
+            message = (
+                f"Missing mappings for {', '.join(missing)} in {spec.statement}. "
+                "Use 'riskbalancer categorize' first."
+            )
+            if strict:
+                raise ValueError(message)
+            print("Warning:", message)
+        combined.extend(apply_mappings_to_investments(base, mappings))
+    return combined
+
+
 def cmd_categorize(args: argparse.Namespace) -> int:
     plan = load_portfolio_plan_from_yaml(
         args.plan, default_leaf_volatility=args.default_leaf_volatility
@@ -303,6 +421,58 @@ def cmd_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_portfolio_build(args: argparse.Namespace) -> int:
+    plan_path = Path(args.plan)
+    source_specs = [parse_source_spec(spec) for spec in args.source]
+    investments = gather_investments_from_sources(source_specs, strict=True)
+    portfolio_path = resolve_portfolio_path(args.portfolio)
+    if portfolio_path.exists() and not args.overwrite:
+        raise FileExistsError(f"{portfolio_path} already exists. Use --overwrite to replace it.")
+    save_portfolio_snapshot(portfolio_path, plan_path, investments)
+    print(f"Saved portfolio with {len(investments)} investments to {portfolio_path}")
+    return 0
+
+
+def cmd_portfolio_report(args: argparse.Namespace) -> int:
+    portfolio_path = resolve_portfolio_path(args.portfolio)
+    if not portfolio_path.exists():
+        raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
+    snapshot = load_portfolio_snapshot(portfolio_path)
+    plan_path = Path(args.plan) if args.plan else Path(snapshot["plan"])
+    plan = load_portfolio_plan_from_yaml(
+        plan_path, default_leaf_volatility=args.default_leaf_volatility
+    )
+    investments = investments_from_dicts(snapshot["investments"])
+    print_category_statuses(plan, investments, f"portfolio:{portfolio_path.stem}")
+    return 0
+
+
+def cmd_portfolio_list(args: argparse.Namespace) -> int:
+    directory = PORTFOLIO_DIR
+    if not directory.exists():
+        print("No stored portfolios.")
+        return 0
+    files = sorted(directory.glob("*.json"))
+    if not files:
+        print("No stored portfolios.")
+        return 0
+    for file in files:
+        snapshot = load_portfolio_snapshot(file)
+        created = snapshot.get("created_at", "?")
+        plan = snapshot.get("plan", "?")
+        print(f"{file.name:<25} plan={plan} created={created}")
+    return 0
+
+
+def cmd_portfolio_delete(args: argparse.Namespace) -> int:
+    portfolio_path = resolve_portfolio_path(args.portfolio)
+    if not portfolio_path.exists():
+        raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
+    portfolio_path.unlink()
+    print(f"Deleted {portfolio_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RiskBalancer CLI")
     parser.add_argument(
@@ -330,6 +500,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--mappings", required=True, help="Path to YAML mapping file with instrument categories"
     )
     analyze.set_defaults(func=cmd_analyze)
+
+    portfolio_parser = subparsers.add_parser("portfolio", help="Manage stored portfolios")
+    portfolio_sub = portfolio_parser.add_subparsers(dest="portfolio_command", required=True)
+
+    build = portfolio_sub.add_parser("build", help="Construct and persist a portfolio snapshot")
+    build.add_argument("--plan", required=True, help="Path to categories YAML")
+    build.add_argument(
+        "--portfolio",
+        required=True,
+        help="Portfolio name or file path (defaults to portfolios/<name>.json if no extension)",
+    )
+    build.add_argument(
+        "--source",
+        action="append",
+        required=True,
+        help="Adapter statement spec: adapter=...,statement=...,mappings=...",
+    )
+    build.add_argument("--overwrite", action="store_true", help="Overwrite existing portfolio file")
+    build.set_defaults(func=cmd_portfolio_build)
+
+    report = portfolio_sub.add_parser("report", help="Analyze a stored portfolio snapshot")
+    report.add_argument(
+        "--portfolio",
+        required=True,
+        help="Portfolio name or file path",
+    )
+    report.add_argument(
+        "--plan",
+        help="Optional plan path override (defaults to plan stored with the portfolio)",
+    )
+    report.set_defaults(func=cmd_portfolio_report)
+
+    plist = portfolio_sub.add_parser("list", help="List stored portfolio snapshots")
+    plist.set_defaults(func=cmd_portfolio_list)
+
+    delete = portfolio_sub.add_parser("delete", help="Delete a stored portfolio snapshot")
+    delete.add_argument(
+        "--portfolio",
+        required=True,
+        help="Portfolio name or file path to delete",
+    )
+    delete.set_defaults(func=cmd_portfolio_delete)
     return parser
 
 

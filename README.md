@@ -7,6 +7,7 @@ RiskBalancer is a Python tool that ingests multi-broker statements, categorises 
 .
 ├── pyproject.toml         # packaging metadata and pytest config
 ├── config/                # YAML category configuration + instrument mappings
+├── portfolios/            # stored portfolio snapshots (JSON, gitignored)
 ├── src/
 │   └── riskbalancer/
 │       ├── adapters/      # broker specific ingestion adapters
@@ -104,6 +105,18 @@ IEF:
 ```
 
 Store one mapping file per broker (e.g., `config/mappings/ajbell.yaml`) and pass it to both `categorize` and `analyze`. Once every instrument is mapped, the analyze step runs without prompts.
+
+### Portfolio snapshots
+
+Use the `portfolio` command group to combine multiple broker statements (each with its own adapter + mapping config), persist the normalized investments, and revisit the snapshot later without re-parsing CSVs:
+
+- `riskbalancer portfolio build --plan config/categories.yaml --portfolio my-portfolio --source adapter=ajbell,statement=private/portfolio-AB8LNFS-SIPP.csv,mappings=config/mappings/ajbell.yaml`
+  - Repeat `--source ...` for every broker feed you want to include. The CLI enforces that mappings exist for all instruments, expands each holding into the configured category allocations, and writes the resulting investments to `portfolios/my-portfolio.json` (use `--portfolio` with a path to override the location; JSON under `portfolios/` is gitignored).
+- `riskbalancer portfolio list` shows stored snapshots along with their associated plan files and timestamps.
+- `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml]` reloads the stored investments, optionally overrides the plan path, and produces the same risk-parity report as `analyze`.
+- `riskbalancer portfolio delete --portfolio my-portfolio` removes a snapshot when you no longer need it.
+
+Portfolio files are JSON documents that capture the investments (instrument id, description, category label, market value, quantity, volatility, source) plus metadata such as the plan path and creation timestamp. Keeping them under `portfolios/` separates generated artifacts from configuration and code while preserving the ability to archive or version them if desired.
 
 ## Next steps
 
