@@ -126,7 +126,6 @@ AMD:
       weight: 0.7
     - category: "Equities / Developed / Europe"
       weight: 0.3
-  volatility: 0.22
 IEF:
   allocations:
     - category: "Bonds / Developed / NAM / Govt"
