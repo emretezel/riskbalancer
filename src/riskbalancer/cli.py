@@ -17,6 +17,7 @@ from .configuration import load_portfolio_plan_from_yaml
 from .models import CategoryPath, Investment
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
+DEFAULT_LEAF_VOLATILITY = 0.15
 PORTFOLIO_DIR = Path("portfolios")
 ADAPTERS = {
     "ajbell": AJBellCSVAdapter,
@@ -438,7 +439,7 @@ def gather_investments_from_sources(
 
 def cmd_categorize(args: argparse.Namespace) -> int:
     plan = load_portfolio_plan_from_yaml(
-        args.plan, default_leaf_volatility=args.default_leaf_volatility
+        args.plan, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY
     )
     plan_index = PlanIndex.from_plan(plan)
     mapping_path = Path(args.mappings)
@@ -452,29 +453,6 @@ def cmd_categorize(args: argparse.Namespace) -> int:
     mappings.update(new_entries)
     save_mappings(mapping_path, mappings)
     print(f"Stored {len(new_entries)} new mappings in {mapping_path}")
-    return 0
-
-
-def cmd_analyze(args: argparse.Namespace) -> int:
-    plan = load_portfolio_plan_from_yaml(
-        args.plan, default_leaf_volatility=args.default_leaf_volatility
-    )
-    mapping_path = Path(args.mappings)
-    mappings = load_mappings(mapping_path)
-    investments = parse_statement(Path(args.statement), args.adapter)
-    missing = sorted({inv.instrument_id for inv in investments if inv.instrument_id not in mappings})
-    if missing:
-        print(
-            "Warning: these instruments are not mapped and will use the default category: "
-            + ", ".join(missing)
-        )
-    expanded = apply_mappings_to_investments(investments, mappings)
-    total_value, summary = summarize_portfolio(plan, expanded)
-    print(f"Processed {len(expanded)} investments from {args.adapter}, total value £{total_value:,.2f}")
-    print_summary_table(total_value, summary)
-    if args.export:
-        export_summary_to_csv(Path(args.export), summary)
-        print(f"Wrote summary to {args.export}")
     return 0
 
 
@@ -497,7 +475,7 @@ def cmd_portfolio_report(args: argparse.Namespace) -> int:
     snapshot = load_portfolio_snapshot(portfolio_path)
     plan_path = Path(args.plan) if args.plan else Path(snapshot["plan"])
     plan = load_portfolio_plan_from_yaml(
-        plan_path, default_leaf_volatility=args.default_leaf_volatility
+        plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY
     )
     investments = investments_from_dicts(snapshot["investments"])
     total_value, summary = summarize_portfolio(plan, investments)
@@ -537,12 +515,6 @@ def cmd_portfolio_delete(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RiskBalancer CLI")
-    parser.add_argument(
-        "--default-leaf-volatility",
-        type=float,
-        default=0.15,
-        help="Fallback volatility for categories lacking explicit values",
-    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     categorize = subparsers.add_parser("categorize", help="Assign categories to unmapped instruments")
@@ -553,16 +525,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--mappings", required=True, help="Path to YAML mapping file to read/update"
     )
     categorize.set_defaults(func=cmd_categorize)
-
-    analyze = subparsers.add_parser("analyze", help="Ingest statement and report category status")
-    analyze.add_argument("--adapter", default="ajbell", choices=ADAPTERS.keys())
-    analyze.add_argument("--statement", required=True, help="Path to broker CSV statement")
-    analyze.add_argument("--plan", required=True, help="Path to categories YAML")
-    analyze.add_argument(
-        "--mappings", required=True, help="Path to YAML mapping file with instrument categories"
-    )
-    analyze.add_argument("--export", help="Optional CSV path to export summary table")
-    analyze.set_defaults(func=cmd_analyze)
 
     portfolio_parser = subparsers.add_parser("portfolio", help="Manage stored portfolios")
     portfolio_sub = portfolio_parser.add_subparsers(dest="portfolio_command", required=True)

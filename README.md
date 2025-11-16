@@ -101,9 +101,6 @@ The package exposes a CLI entry point `riskbalancer` with two sub-commands:
    - Loads the statement with the AJ Bell adapter.
    - Prompts you to assign any unmapped instruments to one or more categories from the plan. Enter comma-separated category paths (e.g., `Equities / Developed / NAM, Equities / Developed / Europe`). Holdings are split evenly across the categories listed. Optionally supply a custom volatility per instrument.
    - Stores the resulting allocations (per ticker) so future ingestions auto-categorize and automatically split holdings across the selected categories.
-2. `riskbalancer analyze --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
-   - Loads the plan, applies instrument mappings, ingests the statement, and prints a table showing actual vs. target weights along with an over/under invested flag for every leaf category.
-   - Use `--export outputs/analyze.csv` to dump the summary table (category label, risk weights, volatility, cash weights, actual and target GBP values, deltas) for Excel.
 
 Instrument mappings are stored in YAML, supporting multiple category allocations per instrument (evenly split):
 
@@ -118,7 +115,7 @@ IEF:
     - "Bonds / Developed / NAM / Govt"
 ```
 
-Store one mapping file per broker (e.g., `config/mappings/ajbell.yaml`) and pass it to both `categorize` and `analyze`. Once every instrument is mapped, the analyze step runs without prompts.
+Store one mapping file per broker (e.g., `config/mappings/ajbell.yaml`) and pass it to `categorize` (and the portfolio builders below). Once every instrument is mapped, the build/report steps run without prompts.
 
 ### Portfolio snapshots
 
@@ -127,7 +124,7 @@ Use the `portfolio` command group to combine multiple broker statements (each wi
 - `riskbalancer portfolio build --plan config/categories.yaml --portfolio my-portfolio --source adapter=ajbell,statement=private/portfolio-AB8LNFS-SIPP.csv,mappings=config/mappings/ajbell.yaml`
   - Repeat `--source ...` for every broker feed you want to include. The CLI enforces that mappings exist for all instruments, expands each holding into the configured category allocations, and writes the resulting investments to `portfolios/my-portfolio.json` (use `--portfolio` with a path to override the location; JSON under `portfolios/` is gitignored).
 - `riskbalancer portfolio list` shows stored snapshots along with their associated plan files and timestamps.
-- `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, and produces (and optionally exports) the same risk-parity report as `analyze`.
+- `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, and produces (and optionally exports) the risk-parity summary table (category label, raw/normalized risk weights, volatility, cash weights, actual vs. target GBP values, deltas).
 - `riskbalancer portfolio delete --portfolio my-portfolio` removes a snapshot when you no longer need it.
 
 Portfolio files are JSON documents that capture the investments (instrument id, description, category label, market value, quantity, volatility, source) plus metadata such as the plan path and creation timestamp. Keeping them under `portfolios/` separates generated artifacts from configuration and code while preserving the ability to archive or version them if desired.
