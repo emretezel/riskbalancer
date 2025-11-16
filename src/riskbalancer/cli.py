@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import math
 import json
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,11 +28,11 @@ class InstrumentMapping:
     volatility: Optional[float] = None
 
     def normalized_allocations(self) -> List["CategoryAllocation"]:
-        total = sum(allocation.weight for allocation in self.allocations)
-        if total <= 0:
-            raise ValueError("Allocation weights must be positive")
+        if not self.allocations:
+            raise ValueError("Instrument mapping must contain at least one category")
+        share = 1.0 / len(self.allocations)
         return [
-            CategoryAllocation(path=allocation.path, weight=allocation.weight / total)
+            CategoryAllocation(path=allocation.path, weight=share)
             for allocation in self.allocations
         ]
 
@@ -41,7 +40,7 @@ class InstrumentMapping:
 @dataclass
 class CategoryAllocation:
     path: CategoryPath
-    weight: float
+    weight: float = 1.0
 
 
 @dataclass
@@ -88,34 +87,29 @@ def load_mappings(path: Path) -> Dict[str, InstrumentMapping]:
     for instrument, payload in data.items():
         allocations_data = payload.get("allocations")
         if not allocations_data and payload.get("category"):
-            allocations_data = [
-                {"category": payload["category"], "weight": payload.get("weight", 1.0)}
-            ]
+            allocations_data = [payload["category"]]
         if not allocations_data:
             continue
         allocations: List[CategoryAllocation] = []
         for entry in allocations_data:
-            category_label = entry.get("category")
+            if isinstance(entry, str):
+                category_label = entry
+            else:
+                category_label = entry.get("category")
             if not category_label:
                 continue
-            weight = float(entry.get("weight", 1.0))
-            allocations.append(CategoryAllocation(path=_parse_category_label(category_label), weight=weight))
+            allocations.append(CategoryAllocation(path=_parse_category_label(category_label)))
         if not allocations:
             continue
         volatility = payload.get("volatility")
-        mapping = InstrumentMapping(allocations=allocations, volatility=volatility)
-        mapping.allocations = mapping.normalized_allocations()
-        mappings[instrument] = mapping
+        mappings[instrument] = InstrumentMapping(allocations=allocations, volatility=volatility)
     return mappings
 
 
 def save_mappings(path: Path, mappings: Dict[str, InstrumentMapping]) -> None:
     serializable = {
         instrument: {
-            "allocations": [
-                {"category": allocation.path.label(), "weight": allocation.weight}
-                for allocation in mapping.allocations
-            ],
+            "allocations": [allocation.path.label() for allocation in mapping.allocations],
             **({"volatility": mapping.volatility} if mapping.volatility else {}),
         }
         for instrument, mapping in mappings.items()
@@ -124,38 +118,17 @@ def save_mappings(path: Path, mappings: Dict[str, InstrumentMapping]) -> None:
     path.write_text(yaml.safe_dump(serializable, sort_keys=True), encoding="utf-8")
 
 
-def _parse_weight_input(raw: str) -> float:
-    cleaned = raw.strip().rstrip("%")
-    if not cleaned:
-        raise ValueError("Weight value is required")
-    value = float(cleaned)
-    if value > 1:
-        value = value / 100.0
-    if value <= 0:
-        raise ValueError("Weights must be positive")
-    return value
-
-
 def parse_allocation_input(user_input: str, plan_index: PlanIndex) -> List[CategoryAllocation]:
     entries = [entry.strip() for entry in user_input.split(",") if entry.strip()]
     if not entries:
         raise ValueError("At least one allocation must be provided")
     allocations: List[CategoryAllocation] = []
     for entry in entries:
-        if "=" in entry:
-            category_label, weight_text = entry.split("=", 1)
-        elif ":" in entry:
-            category_label, weight_text = entry.split(":", 1)
-        else:
-            category_label, weight_text = entry, "100"
+        category_label = entry
         resolved = plan_index.resolve(category_label)
         if not resolved:
             raise ValueError(f"Unknown category path '{category_label.strip()}'")
-        weight = _parse_weight_input(weight_text)
-        allocations.append(CategoryAllocation(path=resolved, weight=weight))
-    total = sum(alloc.weight for alloc in allocations)
-    if not math.isclose(total, 1.0, abs_tol=0.01):
-        raise ValueError("Allocation weights must sum to 100% (allowing small rounding)")
+        allocations.append(CategoryAllocation(path=resolved))
     return allocations
 
 
@@ -187,9 +160,7 @@ def investment_to_dict(investment: Investment) -> Dict[str, object]:
         "instrument_id": investment.instrument_id,
         "description": investment.description,
         "market_value": investment.market_value,
-        "quantity": investment.quantity,
         "category": investment.category.label(),
-        "volatility": investment.volatility,
         "source": investment.source,
     }
 
@@ -202,14 +173,10 @@ def investment_from_dict(payload: Mapping[str, object]) -> Investment:
     category_label = payload["category"]
     if not isinstance(category_label, str):
         raise ValueError("Category label must be a string")
-    quantity = payload.get("quantity")
-    if quantity is not None:
-        quantity = float(quantity)
     return Investment(
         instrument_id=str(payload["instrument_id"]),
         description=str(payload.get("description", "")),
         market_value=float(payload.get("market_value", 0.0)),
-        quantity=quantity,
         category=_parse_category_label(category_label),
         volatility=float(payload.get("volatility", 0.0)) or 0.0001,
         source=str(payload.get("source", "portfolio")),
@@ -256,7 +223,10 @@ def gather_missing_mappings(
         return new_mappings
     missing_list = sorted(set(missing))
     print("Assign categories (supports multiple allocations) for the following instruments.")
-    print("Format: 'Category A=70, Category B=30'. Type 'list' to view options or 'quit' to abort.")
+    print(
+        "Enter comma-separated category paths (e.g., 'Equities / Developed / NAM, Equities / Developed / Europe')."
+    )
+    print("Type 'list' to view options or 'quit' to abort. Holdings will be split evenly across entries.")
     labels = plan_index.available_labels()
     for instrument in missing_list:
         allocations: Optional[List[CategoryAllocation]] = None
@@ -293,7 +263,6 @@ def gather_missing_mappings(
                 print("Please enter a positive number for volatility or leave empty.")
 
         mapping = InstrumentMapping(allocations=allocations, volatility=volatility)
-        mapping.allocations = mapping.normalized_allocations()
         new_mappings[instrument] = mapping
     return new_mappings
 

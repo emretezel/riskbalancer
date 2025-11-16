@@ -1,112 +1,84 @@
 AMD:
   allocations:
-  - category: Equities / Developed / NAM
-    weight: 1.0
+  - Equities / Developed / NAM
 CE31:
   allocations:
-  - category: Bonds / Developed / Europe / Govt
-    weight: 1.0
+  - Bonds / Developed / Europe / Govt
 CNKY:
   allocations:
-  - category: Equities / Developed / Asia / Japan
-    weight: 1.0
+  - Equities / Developed / Asia / Japan
 Cash GBP:
   allocations:
-  - category: Cash
-    weight: 1.0
+  - Cash
 EMIM:
   allocations:
-  - category: Equities / EM
-    weight: 1.0
+  - Equities / EM
 ERNS:
   allocations:
-  - category: Bonds / Developed / UK / Govt
-    weight: 1.0
+  - Bonds / Developed / UK / Govt
 IB01:
   allocations:
-  - category: Bonds / Developed / NAM / Govt
-    weight: 1.0
+  - Bonds / Developed / NAM / Govt
 IBCX:
   allocations:
-  - category: Bonds / Developed / Europe / Corp
-    weight: 1.0
+  - Bonds / Developed / Europe / Corp
 IBGS:
   allocations:
-  - category: Bonds / Developed / Europe / Govt
-    weight: 1.0
+  - Bonds / Developed / Europe / Govt
 IGL5:
   allocations:
-  - category: Bonds / Developed / UK / Govt
-    weight: 1.0
+  - Bonds / Developed / UK / Govt
 IGLS:
   allocations:
-  - category: Bonds / Developed / UK / Govt
-    weight: 1.0
+  - Bonds / Developed / UK / Govt
 INXG:
   allocations:
-  - category: Bonds / Developed / UK / Inflation
-    weight: 1.0
+  - Bonds / Developed / UK / Inflation
 ISF:
   allocations:
-  - category: Equities / Developed / EMEA / UK
-    weight: 1.0
+  - Equities / Developed / EMEA / UK
 ITPS:
   allocations:
-  - category: Bonds / Developed / NAM / Inflation
-    weight: 1.0
+  - Bonds / Developed / NAM / Inflation
 IUVF:
   allocations:
-  - category: Equities / Developed / NAM
-    weight: 1.0
+  - Equities / Developed / NAM
 JPEA:
   allocations:
-  - category: Bonds / EM / Foreign / Govt
-    weight: 1.0
+  - Bonds / EM / Foreign / Govt
 LQDA:
   allocations:
-  - category: Bonds / Developed / NAM / Corp
-    weight: 1.0
+  - Bonds / Developed / NAM / Corp
 MTIX:
   allocations:
-  - category: Bonds / Developed / Europe / Inflation
-    weight: 1.0
+  - Bonds / Developed / Europe / Inflation
 NET:
   allocations:
-  - category: Equities / Developed / NAM
-    weight: 1.0
+  - Equities / Developed / NAM
 SDIA:
   allocations:
-  - category: Bonds / Developed / NAM / Corp
-    weight: 1.0
+  - Bonds / Developed / NAM / Corp
 SEML:
   allocations:
-  - category: Bonds / EM / Normal / Govt
-    weight: 1.0
+  - Bonds / EM / Normal / Govt
 SHYU:
   allocations:
-  - category: Bonds / Developed / NAM / High Yield
-    weight: 1.0
+  - Bonds / Developed / NAM / High Yield
 SMEA:
   allocations:
-  - category: Equities / Developed / EMEA / Non -UK
-    weight: 1.0
+  - Equities / Developed / EMEA / Non -UK
 SSLN:
   allocations:
-  - category: Alternative / Silver
-    weight: 1.0
+  - Alternative / Silver
 SUSS:
   allocations:
-  - category: Bonds / Developed / Europe / Corp
-    weight: 1.0
+  - Bonds / Developed / Europe / Corp
 USTY:
   allocations:
-  - category: Bonds / Developed / NAM / Govt
-    weight: 1.0
+  - Bonds / Developed / NAM / Govt
 UTIP:
   allocations:
-  - category: Bonds / Developed / NAM / Inflation
-    weight: 1.0
+  - Bonds / Developed / NAM / Inflation
 VAPX:
   allocations:
-  - category: Equities / Developed / Asia / Ex-Japan
-    weight: 1.0
+  - Equities / Developed / Asia / Ex-Japan

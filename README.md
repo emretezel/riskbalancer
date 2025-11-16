@@ -83,25 +83,22 @@ The package exposes a CLI entry point `riskbalancer` with two sub-commands:
 
 1. `riskbalancer categorize --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
    - Loads the statement with the AJ Bell adapter.
-   - Prompts you to assign any unmapped instruments to one or more categories from the plan. Use comma-separated entries with percentages (e.g., `Equities / Developed / NAM=70, Equities / Developed / Europe=30`). Optionally supply a custom volatility per instrument.
+   - Prompts you to assign any unmapped instruments to one or more categories from the plan. Enter comma-separated category paths (e.g., `Equities / Developed / NAM, Equities / Developed / Europe`). Holdings are split evenly across the categories listed. Optionally supply a custom volatility per instrument.
    - Stores the resulting allocations (per ticker) so future ingestions auto-categorize and automatically split holdings across the selected categories.
 2. `riskbalancer analyze --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
    - Loads the plan, applies instrument mappings, ingests the statement, and prints a table showing actual vs. target weights along with an over/under invested flag for every leaf category.
 
-Instrument mappings are stored in YAML, supporting multiple category allocations per instrument:
+Instrument mappings are stored in YAML, supporting multiple category allocations per instrument (evenly split):
 
 ```yaml
 AMD:
   allocations:
-    - category: "Equities / Developed / NAM"
-      weight: 0.7
-    - category: "Equities / Developed / Europe"
-      weight: 0.3
+    - "Equities / Developed / NAM"
+    - "Equities / Developed / Europe"
   volatility: 0.22
 IEF:
   allocations:
-    - category: "Bonds / Developed / NAM / Govt"
-      weight: 1.0
+    - "Bonds / Developed / NAM / Govt"
 ```
 
 Store one mapping file per broker (e.g., `config/mappings/ajbell.yaml`) and pass it to both `categorize` and `analyze`. Once every instrument is mapped, the analyze step runs without prompts.

@@ -17,13 +17,13 @@ def test_load_and_save_mappings(tmp_path):
     original = {
         "AMD": InstrumentMapping(
             allocations=[
-                CategoryAllocation(path=CategoryPath("Equities", "US"), weight=0.7),
-                CategoryAllocation(path=CategoryPath("Equities", "International"), weight=0.3),
+                CategoryAllocation(path=CategoryPath("Equities", "US")),
+                CategoryAllocation(path=CategoryPath("Equities", "International")),
             ],
             volatility=0.2,
         ),
         "IEF": InstrumentMapping(
-            allocations=[CategoryAllocation(path=CategoryPath("Bonds", "US"), weight=1.0)]
+            allocations=[CategoryAllocation(path=CategoryPath("Bonds", "US"))]
         ),
     }
     save_mappings(path, original)
@@ -42,7 +42,7 @@ def test_gather_missing_mappings_validates_inputs(monkeypatch, tmp_path):
         [
             "invalid",
             "list",
-            "Equities / Developed / NAM=100",
+            "Equities / Developed / NAM",
             "0.3",
         ]
     )
