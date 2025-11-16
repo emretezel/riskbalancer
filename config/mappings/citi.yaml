@@ -1,0 +1,8 @@
+BDP:
+  allocations:
+  - category: Cash
+    weight: 1.0
+C:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0

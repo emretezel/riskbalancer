@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from riskbalancer import CategoryPath, CategoryTarget, Investment
 from riskbalancer.cli import (
     CategoryAllocation,
@@ -19,13 +21,11 @@ def test_parse_source_spec_valid():
     assert str(spec.mappings) == "m.yaml"
 
 
-def test_parse_source_spec_missing_field():
-    try:
-        parse_source_spec("adapter=ajbell,statement=s.csv")
-    except ValueError as exc:
-        assert "adapter=..., statement=..., mappings=..." in str(exc)
-    else:
-        raise AssertionError("Expected ValueError")
+def test_parse_source_spec_missing_field_defaults_mapping(tmp_path, monkeypatch):
+    spec = parse_source_spec("adapter=ajbell,statement=s.csv")
+    assert spec.adapter == "ajbell"
+    assert spec.statement.name == "s.csv"
+    assert spec.mappings == Path("config/mappings/ajbell.yaml")
 
 
 def test_investment_serialization_round_trip():

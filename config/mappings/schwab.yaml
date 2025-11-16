@@ -1,0 +1,8 @@
+Cash & Cash Investments:
+  allocations:
+  - category: Cash
+    weight: 1.0
+INTC:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0

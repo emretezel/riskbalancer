@@ -1,0 +1,4 @@
+Positions and Mark-to-Market Profit and Loss,Header,DataDiscriminator,Asset Class,Currency,Symbol,Description,Prior Quantity,Quantity,Prior Price,Price,Prior Market Value,Market Value,Position,Trading,Comm.,Other,Total
+Positions and Mark-to-Market Profit and Loss,Data,Summary,Stocks,GBP,EMIM,ISHARES CORE EM IMI ACC,100,100,34.00,35.00,3400,3500,100,0,0,0,100
+Positions and Mark-to-Market Profit and Loss,Data,Summary,Stocks,USD,PLTR,PALANTIR TECHNOLOGIES INC-A,50,50,200,210,10000,10500,500,0,0,0,500
+Positions and Mark-to-Market Profit and Loss,Data,,Total in GBP,GBP,,, , , , , 10000,10500,500,0,0,0,500

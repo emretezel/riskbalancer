@@ -18,17 +18,26 @@ from typing import Callable, Dict, Iterable, List, Optional, Mapping
 import yaml
 from collections import defaultdict
 
-from .adapters import AJBellCSVAdapter, IBKRCSVAdapter, MS401KCSVAdapter
+from .adapters import (
+    AJBellCSVAdapter,
+    CitiCSVAdapter,
+    IBKRCSVAdapter,
+    MS401KCSVAdapter,
+    SchwabCSVAdapter,
+)
 from .configuration import load_portfolio_plan_from_yaml
 from .models import CategoryPath, Investment
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
 DEFAULT_LEAF_VOLATILITY = 0.15
 PORTFOLIO_DIR = Path("portfolios")
+MANUAL_MAPPINGS_PATH = Path("config/mappings/manual.yaml")
 ADAPTERS = {
     "ajbell": AJBellCSVAdapter,
+    "citi": CitiCSVAdapter,
     "ibkr": IBKRCSVAdapter,
     "ms401k": MS401KCSVAdapter,
+    "schwab": SchwabCSVAdapter,
 }
 
 
@@ -197,10 +206,8 @@ def parse_source_spec(spec: str) -> SourceSpec:
     adapter = parts.get("adapter")
     statement = parts.get("statement")
     mappings = parts.get("mappings")
-    if not adapter or not statement or not mappings:
-        raise ValueError(
-            "Source spec must include adapter=..., statement=..., mappings=..."
-        )
+    if not adapter or not statement:
+        raise ValueError("Source spec must include adapter=... and statement=...")
     mappings_path = Path(mappings) if mappings else Path(f"config/mappings/{adapter}.yaml")
     mappings_path.parent.mkdir(parents=True, exist_ok=True)
     return SourceSpec(
@@ -484,7 +491,7 @@ def build_adapter(name: str, fx_rates: Optional[Dict[str, float]] = None):
     adapter_cls = ADAPTERS.get(name.lower())
     if not adapter_cls:
         raise ValueError(f"Unknown adapter '{name}'. Available: {', '.join(ADAPTERS)}")
-    if adapter_cls in {IBKRCSVAdapter, MS401KCSVAdapter}:
+    if adapter_cls in {IBKRCSVAdapter, MS401KCSVAdapter, SchwabCSVAdapter, CitiCSVAdapter}:
         return adapter_cls(default_category=DEFAULT_CATEGORY, fx_rates=fx_rates)
     return adapter_cls(default_category=DEFAULT_CATEGORY)
 
@@ -632,16 +639,43 @@ def cmd_portfolio_add_instrument(args: argparse.Namespace) -> int:
     portfolio_path = resolve_portfolio_path(args.portfolio)
     if not portfolio_path.exists():
         raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
-    category = _parse_category_label(args.category)
-    append_manual_investment(
-        portfolio_path,
-        instrument_id=args.instrument_id,
-        description=args.description,
-        market_value=args.market_value,
-        category_label=category.label(),
-        source="manual",
-    )
-    print(f"Added {args.instrument_id} to {portfolio_path}")
+    plan_path = Path(args.plan or "config/categories.yaml")
+    plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
+    plan_index = PlanIndex.from_plan(plan)
+
+    manual_path = MANUAL_MAPPINGS_PATH
+    manual_path.parent.mkdir(parents=True, exist_ok=True)
+    manual_mappings = load_mappings(manual_path)
+
+    mapping: InstrumentMapping | None = None
+    if args.category:
+        allocations = parse_allocation_input(args.category, plan_index)
+        mapping = InstrumentMapping(allocations=allocations)
+    else:
+        mapping = manual_mappings.get(args.instrument_id)
+        if not mapping:
+            new_entries = gather_missing_mappings([args.instrument_id], plan_index=plan_index)
+            mapping = new_entries[args.instrument_id]
+            manual_mappings.update(new_entries)
+
+    if mapping is None:
+        raise ValueError("Unable to determine category allocation for manual instrument.")
+
+    manual_mappings[args.instrument_id] = mapping
+    save_mappings(manual_path, manual_mappings)
+
+    allocations = mapping.normalized_allocations()
+    for allocation in allocations:
+        append_manual_investment(
+            portfolio_path,
+            instrument_id=args.instrument_id,
+            description=args.description,
+            market_value=args.market_value * allocation.weight,
+            category_label=allocation.path.label(),
+            source="manual",
+        )
+
+    print(f"Added {args.instrument_id} to {portfolio_path} using manual mappings")
     return 0
 
 
@@ -721,7 +755,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_manual.add_argument("--instrument-id", required=True)
     add_manual.add_argument("--description", required=True)
     add_manual.add_argument("--market-value", required=True, type=float)
-    add_manual.add_argument("--category", required=True, help="Category path (e.g., Equities / Developed / NAM)")
+    add_manual.add_argument("--category", help="Optional category path(s); prompt/manual mappings used if omitted")
+    add_manual.add_argument(
+        "--plan",
+        default="config/categories.yaml",
+        help="Path to categories YAML used when capturing manual mappings (defaults to config/categories.yaml)",
+    )
     add_manual.set_defaults(func=cmd_portfolio_add_instrument)
     return parser
 

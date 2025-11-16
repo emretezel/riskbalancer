@@ -1,0 +1,80 @@
+CNKY:
+  allocations:
+  - category: Equities / Developed / Asia / Japan
+    weight: 1.0
+EMCA:
+  allocations:
+  - category: Bonds / EM / Foreign / Corporate
+    weight: 1.0
+EMIM:
+  allocations:
+  - category: Equities / EM
+    weight: 1.0
+HY9H:
+  allocations:
+  - category: Equities / Developed / Asia / Ex-Japan
+    weight: 1.0
+IBCI:
+  allocations:
+  - category: Bonds / Developed / Europe / Inflation
+    weight: 1.0
+IBTA:
+  allocations:
+  - category: Bonds / Developed / NAM / Govt
+    weight: 1.0
+IEAA:
+  allocations:
+  - category: Bonds / Developed / Europe / Corp
+    weight: 1.0
+IGLT:
+  allocations:
+  - category: Bonds / Developed / UK / Govt
+    weight: 1.0
+INXG:
+  allocations:
+  - category: Bonds / Developed / UK / Inflation
+    weight: 1.0
+ISF:
+  allocations:
+  - category: Equities / Developed / EMEA / UK
+    weight: 1.0
+IUVF:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0
+JNKEz:
+  allocations:
+  - category: Bonds / Developed / Europe / High Yield
+    weight: 1.0
+PLTR:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0
+SDIA:
+  allocations:
+  - category: Bonds / Developed / NAM / Corp
+    weight: 1.0
+SEGA:
+  allocations:
+  - category: Bonds / Developed / Europe / Govt
+    weight: 1.0
+SEML:
+  allocations:
+  - category: Bonds / EM / Normal / Govt
+    weight: 1.0
+SLXX:
+  allocations:
+  - category: Bonds / Developed / UK / Corp
+    weight: 1.0
+SMEA:
+  allocations:
+  - category: Equities / Developed / EMEA / Non -UK
+    weight: 1.0
+TSLA:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0
+VAPX:
+  allocations:
+  - category: Equities / Developed / Asia / Ex-Japan
+    weight: 1.0

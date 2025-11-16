@@ -1,0 +1,5 @@
+Holdings,,,,,,,,,,
+
+"Security ID","CUSIP","Account Number","Account Nickname/Title","Description","Asset Classification","Quantity","Price","Price as of Date","Timezone","Change Price Amount","Change Price %","Market Value","Market Value Change","Gain/Loss $","Gain/Loss %","Activity Date","Accrued Interest","Dividend Reinvestment","Market","Sub-Asset Classification"
+"BDP","PER980304","C53219033","","BANK DEPOSIT PROGRAM","Cash","1,538.62","$1.00","11/14/2025","ET","$0.00","0.00%","$1,538.62","$0.00","$0.00","0.00%","2025-11-14","0.00","","OTC",""
+"C","172967424","C53219033","","CITIGROUP INC","Equities","238.00","$100.30","N/A","ET","$0.00","0.00%","$23,871.40","$0.00","$4,833.78","25.39%","2025-01-23","0.00","Cash","NYSE","Common Stocks"
