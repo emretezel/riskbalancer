@@ -7,6 +7,7 @@ RiskBalancer is a Python tool that ingests multi-broker statements, categorises 
 .
 ├── pyproject.toml         # packaging metadata and pytest config
 ├── config/                # YAML category configuration + instrument mappings
+│   └── fx.yaml            # optional manual FX rates (GBP base)
 ├── portfolios/            # stored portfolio snapshots (JSON, gitignored)
 ├── src/
 │   └── riskbalancer/
@@ -77,6 +78,21 @@ assets:
 
 Use `load_portfolio_plan_from_yaml("config/categories.yaml", default_leaf_volatility=0.2)` to materialise a `PortfolioPlan`. Volatilities can be specified at any level; leaves that omit them fall back to the supplied default. Each leaf may declare an `adjustment` (default `1.0`) to scale its raw risk weight before the loader normalises the weights across all leaves. Every resulting `CategoryTarget` exposes both the raw `risk_weight` (product of weights × adjustment) and the `target_weight` (`normalized_risk_weight`). Weight validations tolerate small rounding errors (e.g., `33%` entries) but can be tightened by providing a smaller `tolerance`.
 
+### FX rates
+
+Manual FX rates (e.g., USD→GBP) can be maintained in `config/fx.yaml`:
+
+```yaml
+date: 2025-11-16
+base: GBP
+rates:
+  USD: 0.79
+  EUR: 0.86
+  CHF: 0.90
+```
+
+Future CLI work can load this file to convert statements that report market values in non-GBP currencies.
+
 ## CLI workflow
 
 The package exposes a CLI entry point `riskbalancer` with two sub-commands:
@@ -87,6 +103,7 @@ The package exposes a CLI entry point `riskbalancer` with two sub-commands:
    - Stores the resulting allocations (per ticker) so future ingestions auto-categorize and automatically split holdings across the selected categories.
 2. `riskbalancer analyze --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
    - Loads the plan, applies instrument mappings, ingests the statement, and prints a table showing actual vs. target weights along with an over/under invested flag for every leaf category.
+   - Use `--export outputs/analyze.csv` to dump the summary table (category label, risk weights, volatility, cash weights, actual and target GBP values, deltas) for Excel.
 
 Instrument mappings are stored in YAML, supporting multiple category allocations per instrument (evenly split):
 
@@ -110,7 +127,7 @@ Use the `portfolio` command group to combine multiple broker statements (each wi
 - `riskbalancer portfolio build --plan config/categories.yaml --portfolio my-portfolio --source adapter=ajbell,statement=private/portfolio-AB8LNFS-SIPP.csv,mappings=config/mappings/ajbell.yaml`
   - Repeat `--source ...` for every broker feed you want to include. The CLI enforces that mappings exist for all instruments, expands each holding into the configured category allocations, and writes the resulting investments to `portfolios/my-portfolio.json` (use `--portfolio` with a path to override the location; JSON under `portfolios/` is gitignored).
 - `riskbalancer portfolio list` shows stored snapshots along with their associated plan files and timestamps.
-- `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml]` reloads the stored investments, optionally overrides the plan path, and produces the same risk-parity report as `analyze`.
+- `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, and produces (and optionally exports) the same risk-parity report as `analyze`.
 - `riskbalancer portfolio delete --portfolio my-portfolio` removes a snapshot when you no longer need it.
 
 Portfolio files are JSON documents that capture the investments (instrument id, description, category label, market value, quantity, volatility, source) plus metadata such as the plan path and creation timestamp. Keeping them under `portfolios/` separates generated artifacts from configuration and code while preserving the ability to archive or version them if desired.

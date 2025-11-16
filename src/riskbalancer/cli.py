@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import json
 from dataclasses import dataclass
@@ -9,11 +10,11 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Mapping
 
 import yaml
+from collections import defaultdict
 
 from .adapters import AJBellCSVAdapter
 from .configuration import load_portfolio_plan_from_yaml
 from .models import CategoryPath, Investment
-from .portfolio import Portfolio, PortfolioAnalyzer
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
 PORTFOLIO_DIR = Path("portfolios")
@@ -187,6 +188,110 @@ def investments_from_dicts(items: Iterable[Mapping[str, object]]) -> List[Invest
     return [investment_from_dict(item) for item in items]
 
 
+def summarize_portfolio(plan, investments: List[Investment]):
+    totals = defaultdict(float)
+    for investment in investments:
+        totals[investment.category] += investment.market_value
+    total_value = sum(totals.values())
+
+    normalized_weights = {}
+    risk_over_vol = {}
+    for target in plan:
+        normalized = target.target_weight
+        normalized_weights[target.path] = normalized
+        risk_over_vol[target.path] = normalized / target.volatility
+
+    cash_weight_denominator = sum(risk_over_vol.values()) or 1.0
+    summary = []
+    for target in plan:
+        actual_value = totals.get(target.path, 0.0)
+        actual_weight = (actual_value / total_value) if total_value else 0.0
+        normalized_risk = normalized_weights[target.path]
+        risk_weight = target.risk_weight
+        cash_weight = risk_over_vol[target.path] / cash_weight_denominator
+        target_value = cash_weight * total_value
+        summary.append(
+            {
+                "path": target.path,
+                "label": target.path.label(),
+                "risk_weight_raw": risk_weight,
+                "risk_weight_normalized": normalized_risk,
+                "volatility": target.volatility,
+                "cash_weight": cash_weight,
+                "actual_value": actual_value,
+                "actual_weight": actual_weight,
+                "target_value": target_value,
+                "target_weight": cash_weight,
+            }
+        )
+    return total_value, summary
+
+
+def print_summary_table(total_value: float, rows: List[Dict[str, float]]) -> None:
+    header = (
+        f"{'Category':55}"
+        f"{'Risk Wt':>10}"
+        f"{'Norm Wt':>10}"
+        f"{'Vol':>8}"
+        f"{'Cash Wt':>10}"
+        f"{'Actual £':>14}"
+        f"{'Target £':>14}"
+        f"{'Delta £':>14}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        label = row["label"]
+        risk = row["risk_weight_raw"]
+        norm = row["risk_weight_normalized"]
+        vol = row["volatility"]
+        cash = row["cash_weight"]
+        actual_value = row["actual_value"]
+        target_value = row["target_value"]
+        delta = actual_value - target_value
+        print(
+            f"{label:55}"
+            f"{risk:10.3f}"
+            f"{norm:10.3f}"
+            f"{vol:8.3f}"
+            f"{cash:10.3f}"
+            f"{actual_value:14,.2f}"
+            f"{target_value:14,.2f}"
+            f"{delta:14,.2f}"
+        )
+    print("-" * len(header))
+    print(f"{'Total Portfolio Value:':>110} {total_value:14,.2f}")
+
+
+def export_summary_to_csv(path: Path, rows: List[Dict[str, float]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "Category",
+                "RiskWeightRaw",
+                "RiskWeightNormalized",
+                "Volatility",
+                "CashWeight",
+                "ActualValueGBP",
+                "TargetValueGBP",
+                "DeltaGBP",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    row["label"],
+                    row["risk_weight_raw"],
+                    row["risk_weight_normalized"],
+                    row["volatility"],
+                    row["cash_weight"],
+                    row["actual_value"],
+                    row["target_value"],
+                    row["actual_value"] - row["target_value"],
+                ]
+            )
 def resolve_portfolio_path(value: str) -> Path:
     path = Path(value)
     if path.is_dir():
@@ -350,28 +455,6 @@ def cmd_categorize(args: argparse.Namespace) -> int:
     return 0
 
 
-def format_percentage(value: float) -> str:
-    return f"{value * 100:6.2f}%"
-
-
-def print_category_statuses(plan, investments: List[Investment], adapter_name: str) -> None:
-    portfolio = Portfolio()
-    portfolio.extend(investments)
-    analyzer = PortfolioAnalyzer(plan, portfolio)
-    statuses = analyzer.category_status()
-    total_value = portfolio.total_value()
-    print(f"Processed {len(investments)} investments from {adapter_name}, total value £{total_value:,.2f}")
-    header = f"{'Category':50} {'Actual':>10} {'Target':>10} {'Delta':>10} Status"
-    print(header)
-    print("-" * len(header))
-    for status in statuses:
-        label = status.path.label()
-        actual = format_percentage(status.actual_weight)
-        target = format_percentage(status.target_cash_weight)
-        delta = format_percentage(status.delta)
-        print(f"{label:50} {actual:>10} {target:>10} {delta:>10} {status.status}")
-
-
 def cmd_analyze(args: argparse.Namespace) -> int:
     plan = load_portfolio_plan_from_yaml(
         args.plan, default_leaf_volatility=args.default_leaf_volatility
@@ -386,7 +469,12 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             + ", ".join(missing)
         )
     expanded = apply_mappings_to_investments(investments, mappings)
-    print_category_statuses(plan, expanded, args.adapter)
+    total_value, summary = summarize_portfolio(plan, expanded)
+    print(f"Processed {len(expanded)} investments from {args.adapter}, total value £{total_value:,.2f}")
+    print_summary_table(total_value, summary)
+    if args.export:
+        export_summary_to_csv(Path(args.export), summary)
+        print(f"Wrote summary to {args.export}")
     return 0
 
 
@@ -412,7 +500,12 @@ def cmd_portfolio_report(args: argparse.Namespace) -> int:
         plan_path, default_leaf_volatility=args.default_leaf_volatility
     )
     investments = investments_from_dicts(snapshot["investments"])
-    print_category_statuses(plan, investments, f"portfolio:{portfolio_path.stem}")
+    total_value, summary = summarize_portfolio(plan, investments)
+    print(f"Loaded {len(investments)} investments from {portfolio_path}")
+    print_summary_table(total_value, summary)
+    if args.export:
+        export_summary_to_csv(Path(args.export), summary)
+        print(f"Wrote summary to {args.export}")
     return 0
 
 
@@ -468,6 +561,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument(
         "--mappings", required=True, help="Path to YAML mapping file with instrument categories"
     )
+    analyze.add_argument("--export", help="Optional CSV path to export summary table")
     analyze.set_defaults(func=cmd_analyze)
 
     portfolio_parser = subparsers.add_parser("portfolio", help="Manage stored portfolios")
@@ -498,6 +592,9 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--plan",
         help="Optional plan path override (defaults to plan stored with the portfolio)",
+    )
+    report.add_argument(
+        "--export", help="Optional CSV path to export the summary for Excel/analysis"
     )
     report.set_defaults(func=cmd_portfolio_report)
 

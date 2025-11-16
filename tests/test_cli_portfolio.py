@@ -1,4 +1,4 @@
-from riskbalancer import CategoryPath, Investment
+from riskbalancer import CategoryPath, CategoryTarget, Investment
 from riskbalancer.cli import (
     CategoryAllocation,
     InstrumentMapping,
@@ -6,7 +6,9 @@ from riskbalancer.cli import (
     investment_from_dict,
     investment_to_dict,
     parse_source_spec,
+    summarize_portfolio,
 )
+from riskbalancer.portfolio import PortfolioPlan
 
 
 def test_parse_source_spec_valid():
@@ -64,3 +66,45 @@ def test_apply_mappings_splits_investment():
     assert result[0].category.levels() == ("Equities", "Developed", "NAM")
     assert result[0].volatility == 0.25
     assert sorted(inv.market_value for inv in result) == [500.0, 500.0]
+
+
+def test_summarize_portfolio_calculates_cash_and_targets():
+    plan = PortfolioPlan(
+        [
+            CategoryTarget(
+                path=CategoryPath("Equities", "Developed", "NAM"),
+                normalized_risk_weight=0.6,
+                volatility=0.2,
+                risk_weight=0.3,
+            ),
+            CategoryTarget(
+                path=CategoryPath("Equities", "Developed", "Europe"),
+                normalized_risk_weight=0.4,
+                volatility=0.25,
+                risk_weight=0.2,
+            ),
+        ]
+    )
+    investments = [
+        Investment(
+            instrument_id="ETF",
+            description="World ETF",
+            market_value=600.0,
+            category=CategoryPath("Equities", "Developed", "NAM"),
+            volatility=0.2,
+        ),
+        Investment(
+            instrument_id="ETF2",
+            description="World ETF 2",
+            market_value=400.0,
+            category=CategoryPath("Equities", "Developed", "Europe"),
+            volatility=0.25,
+        ),
+    ]
+
+    total_value, summary = summarize_portfolio(plan, investments)
+    assert total_value == 1000.0
+    by_label = {row["label"]: row for row in summary}
+    assert by_label["Equities / Developed / NAM"]["actual_value"] == 600.0
+    assert by_label["Equities / Developed / Europe"]["actual_value"] == 400.0
+    assert abs(sum(row["cash_weight"] for row in summary) - 1.0) < 1e-9
