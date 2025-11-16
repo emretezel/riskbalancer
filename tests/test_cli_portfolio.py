@@ -5,6 +5,7 @@ from riskbalancer.cli import (
     apply_mappings_to_investments,
     investment_from_dict,
     investment_to_dict,
+    load_fx_rates,
     parse_source_spec,
     summarize_portfolio,
 )
@@ -108,3 +109,13 @@ def test_summarize_portfolio_calculates_cash_and_targets():
     assert by_label["Equities / Developed / NAM"]["actual_value"] == 600.0
     assert by_label["Equities / Developed / Europe"]["actual_value"] == 400.0
     assert abs(sum(row["cash_weight"] for row in summary) - 1.0) < 1e-9
+
+
+def test_load_fx_rates(tmp_path):
+    fx_file = tmp_path / "fx.yaml"
+    fx_file.write_text(
+        "base: GBP\nrates:\n  USD: 0.8\n  EUR: 0.9\n",
+        encoding="utf-8",
+    )
+    rates = load_fx_rates(str(fx_file))
+    assert rates["USD"] == 0.8

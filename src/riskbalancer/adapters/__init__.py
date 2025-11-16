@@ -6,5 +6,6 @@ Author: Emre Tezel
 
 from .aj_bell import AJBellCSVAdapter
 from .base import StatementAdapter
+from .ibkr import IBKRCSVAdapter
 
-__all__ = ["AJBellCSVAdapter", "StatementAdapter"]
+__all__ = ["AJBellCSVAdapter", "IBKRCSVAdapter", "StatementAdapter"]

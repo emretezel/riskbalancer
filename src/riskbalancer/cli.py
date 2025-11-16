@@ -18,7 +18,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Mapping
 import yaml
 from collections import defaultdict
 
-from .adapters import AJBellCSVAdapter
+from .adapters import AJBellCSVAdapter, IBKRCSVAdapter
 from .configuration import load_portfolio_plan_from_yaml
 from .models import CategoryPath, Investment
 
@@ -27,6 +27,7 @@ DEFAULT_LEAF_VOLATILITY = 0.15
 PORTFOLIO_DIR = Path("portfolios")
 ADAPTERS = {
     "ajbell": AJBellCSVAdapter,
+    "ibkr": IBKRCSVAdapter,
 }
 
 
@@ -204,6 +205,23 @@ def parse_source_spec(spec: str) -> SourceSpec:
         statement=Path(statement),
         mappings=Path(mappings),
     )
+
+
+def load_fx_rates(path: Optional[str]) -> Dict[str, float]:
+    """Load FX rates (currency -> GBP) from YAML."""
+    if not path:
+        return {}
+    fx_path = Path(path)
+    if not fx_path.exists():
+        return {}
+    data = yaml.safe_load(fx_path.read_text(encoding="utf-8"))
+    if not data:
+        return {}
+    base = data.get("base", "GBP").upper()
+    if base != "GBP":
+        raise ValueError("FX file must use GBP as the base currency")
+    rates = data.get("rates", {})
+    return {currency.upper(): float(value) for currency, value in rates.items()}
 
 
 def investment_to_dict(investment: Investment) -> Dict[str, object]:
@@ -461,15 +479,17 @@ def gather_missing_mappings(
     return new_mappings
 
 
-def build_adapter(name: str):
+def build_adapter(name: str, fx_rates: Optional[Dict[str, float]] = None):
     adapter_cls = ADAPTERS.get(name.lower())
     if not adapter_cls:
         raise ValueError(f"Unknown adapter '{name}'. Available: {', '.join(ADAPTERS)}")
+    if adapter_cls is IBKRCSVAdapter:
+        return adapter_cls(default_category=DEFAULT_CATEGORY, fx_rates=fx_rates)
     return adapter_cls(default_category=DEFAULT_CATEGORY)
 
 
-def parse_statement(statement_path: Path, adapter_name: str):
-    adapter = build_adapter(adapter_name)
+def parse_statement(statement_path: Path, adapter_name: str, fx_rates: Optional[Dict[str, float]] = None):
+    adapter = build_adapter(adapter_name, fx_rates=fx_rates)
     return adapter.parse_path(statement_path)
 
 
@@ -508,12 +528,13 @@ def gather_investments_from_sources(
     specs: List[SourceSpec],
     *,
     strict: bool = False,
+    fx_rates: Optional[Dict[str, float]] = None,
 ) -> List[Investment]:
     """Parse multiple statements and combine the resulting mapped investments."""
     combined: List[Investment] = []
     for spec in specs:
         mappings = load_mappings(spec.mappings)
-        base = parse_statement(spec.statement, spec.adapter)
+        base = parse_statement(spec.statement, spec.adapter, fx_rates=fx_rates)
         missing = sorted({inv.instrument_id for inv in base if inv.instrument_id not in mappings})
         if missing:
             message = (
@@ -532,9 +553,11 @@ def cmd_categorize(args: argparse.Namespace) -> int:
         args.plan, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY
     )
     plan_index = PlanIndex.from_plan(plan)
-    mapping_path = Path(args.mappings)
+    mapping_path = Path(args.mappings) if args.mappings else Path(f"config/mappings/{args.adapter}.yaml")
+    mapping_path.parent.mkdir(parents=True, exist_ok=True)
     mappings = load_mappings(mapping_path)
-    investments = parse_statement(Path(args.statement), args.adapter)
+    fx_rates = load_fx_rates(args.fx)
+    investments = parse_statement(Path(args.statement), args.adapter, fx_rates=fx_rates)
     missing = [inv.instrument_id for inv in investments if inv.instrument_id not in mappings]
     if not missing:
         print("All instruments already have mappings. Nothing to do.")
@@ -549,7 +572,8 @@ def cmd_categorize(args: argparse.Namespace) -> int:
 def cmd_portfolio_build(args: argparse.Namespace) -> int:
     plan_path = Path(args.plan)
     source_specs = [parse_source_spec(spec) for spec in args.source]
-    investments = gather_investments_from_sources(source_specs, strict=True)
+    fx_rates = load_fx_rates(args.fx)
+    investments = gather_investments_from_sources(source_specs, strict=True, fx_rates=fx_rates)
     portfolio_path = resolve_portfolio_path(args.portfolio)
     if portfolio_path.exists() and not args.overwrite:
         raise FileExistsError(f"{portfolio_path} already exists. Use --overwrite to replace it.")
@@ -563,7 +587,7 @@ def cmd_portfolio_report(args: argparse.Namespace) -> int:
     if not portfolio_path.exists():
         raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
     snapshot = load_portfolio_snapshot(portfolio_path)
-    plan_path = Path(args.plan) if args.plan else Path(snapshot["plan"])
+    plan_path = Path(args.plan) if args.plan else Path(snapshot.get("plan", "config/categories.yaml"))
     plan = load_portfolio_plan_from_yaml(
         plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY
     )
@@ -627,9 +651,19 @@ def build_parser() -> argparse.ArgumentParser:
     categorize = subparsers.add_parser("categorize", help="Assign categories to unmapped instruments")
     categorize.add_argument("--adapter", default="ajbell", choices=ADAPTERS.keys())
     categorize.add_argument("--statement", required=True, help="Path to broker CSV statement")
-    categorize.add_argument("--plan", required=True, help="Path to categories YAML")
     categorize.add_argument(
-        "--mappings", required=True, help="Path to YAML mapping file to read/update"
+        "--plan",
+        default="config/categories.yaml",
+        help="Path to categories YAML (defaults to config/categories.yaml)",
+    )
+    categorize.add_argument(
+        "--mappings",
+        help="Path to YAML mapping file (defaults to config/mappings/<adapter>.yaml)",
+    )
+    categorize.add_argument(
+        "--fx",
+        default="config/fx.yaml",
+        help="Optional FX rate YAML used when the statement is not GBP (defaults to config/fx.yaml if present)",
     )
     categorize.set_defaults(func=cmd_categorize)
 
@@ -637,7 +671,11 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_sub = portfolio_parser.add_subparsers(dest="portfolio_command", required=True)
 
     build = portfolio_sub.add_parser("build", help="Construct and persist a portfolio snapshot")
-    build.add_argument("--plan", required=True, help="Path to categories YAML")
+    build.add_argument(
+        "--plan",
+        default="config/categories.yaml",
+        help="Path to categories YAML (defaults to config/categories.yaml)",
+    )
     build.add_argument(
         "--portfolio",
         required=True,
@@ -650,6 +688,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Adapter statement spec: adapter=...,statement=...,mappings=...",
     )
     build.add_argument("--overwrite", action="store_true", help="Overwrite existing portfolio file")
+    build.add_argument(
+        "--fx",
+        help="Optional FX rate YAML (base GBP) used to convert non-GBP statements",
+    )
     build.set_defaults(func=cmd_portfolio_build)
 
     report = portfolio_sub.add_parser("report", help="Analyze a stored portfolio snapshot")
@@ -660,7 +702,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument(
         "--plan",
-        help="Optional plan path override (defaults to plan stored with the portfolio)",
+        help="Optional plan path override (defaults to plan stored with the portfolio or config/categories.yaml)",
     )
     report.add_argument(
         "--export", help="Optional CSV path to export the summary for Excel/analysis"
