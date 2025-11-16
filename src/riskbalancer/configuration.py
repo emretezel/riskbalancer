@@ -122,8 +122,10 @@ class CategoryNode:
             accumulator.append(
                 {
                     "path": path,
+                    "weight": absolute_weight,
                     "risk_weight": risk_weight,
                     "volatility": volatility,
+                    "adjustment": self.adjustment,
                 }
             )
 
@@ -172,6 +174,7 @@ def load_portfolio_plan_from_yaml(
             normalized_risk_weight=item["risk_weight"] / risk_total,
             volatility=item["volatility"],
             risk_weight=item["risk_weight"],
+            adjustment=item.get("adjustment", 1.0),
         )
         for item in leaf_data
     ]

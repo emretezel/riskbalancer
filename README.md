@@ -78,6 +78,21 @@ assets:
 
 Use `load_portfolio_plan_from_yaml("config/categories.yaml", default_leaf_volatility=0.2)` to materialise a `PortfolioPlan`. Volatilities can be specified at any level; leaves that omit them fall back to the supplied default. Each leaf may declare an `adjustment` (default `1.0`) to scale its raw risk weight before the loader normalises the weights across all leaves. Every resulting `CategoryTarget` exposes both the raw `risk_weight` (product of weights × adjustment) and the `target_weight` (`normalized_risk_weight`). Weight validations tolerate small rounding errors (e.g., `33%` entries) but can be tightened by providing a smaller `tolerance`.
 
+### Installation
+
+RiskBalancer follows the standard `src/` layout and exposes a CLI entry point. To install locally:
+
+1. (Optional) Create/activate a virtual environment (e.g., `python -m venv .venv && source .venv/bin/activate`).
+2. Install in editable mode with the development extras:
+   ```bash
+   pip install -e .[dev]
+   ```
+   This pulls in `pyyaml` plus pytest for local testing.
+3. Confirm the CLI is available:
+   ```bash
+   riskbalancer --help
+   ```
+
 ### FX rates
 
 Manual FX rates (e.g., USD→GBP) can be maintained in `config/fx.yaml`:
@@ -99,20 +114,23 @@ The package exposes a CLI entry point `riskbalancer` with two sub-commands:
 
 1. `riskbalancer categorize --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
    - Loads the statement with the AJ Bell adapter.
-   - Prompts you to assign any unmapped instruments to one or more categories from the plan. Enter comma-separated category paths (e.g., `Equities / Developed / NAM, Equities / Developed / Europe`). Holdings are split evenly across the categories listed. Optionally supply a custom volatility per instrument.
+   - Prompts you to assign any unmapped instruments to one or more categories from the plan. Enter comma-separated category paths with optional weights (e.g., `Equities / Developed / NAM=70, Equities / Developed / Europe=30`). Holdings are split according to the weights supplied (defaults to an even split if weights are omitted). Optionally supply a custom volatility per instrument.
    - Stores the resulting allocations (per ticker) so future ingestions auto-categorize and automatically split holdings across the selected categories.
 
-Instrument mappings are stored in YAML, supporting multiple category allocations per instrument (evenly split):
+Instrument mappings are stored in YAML, supporting multiple category allocations per instrument (custom weights are optional; they default to 100% if omitted):
 
 ```yaml
 AMD:
   allocations:
-    - "Equities / Developed / NAM"
-    - "Equities / Developed / Europe"
+    - category: "Equities / Developed / NAM"
+      weight: 0.7
+    - category: "Equities / Developed / Europe"
+      weight: 0.3
   volatility: 0.22
 IEF:
   allocations:
-    - "Bonds / Developed / NAM / Govt"
+    - category: "Bonds / Developed / NAM / Govt"
+      weight: 1.0
 ```
 
 Store one mapping file per broker (e.g., `config/mappings/ajbell.yaml`) and pass it to `categorize` (and the portfolio builders below). Once every instrument is mapped, the build/report steps run without prompts.

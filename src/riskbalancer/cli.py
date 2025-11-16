@@ -40,9 +40,11 @@ class InstrumentMapping:
     def normalized_allocations(self) -> List["CategoryAllocation"]:
         if not self.allocations:
             raise ValueError("Instrument mapping must contain at least one category")
-        share = 1.0 / len(self.allocations)
+        total = sum(allocation.weight for allocation in self.allocations)
+        if total <= 0:
+            raise ValueError("Allocation weights must be positive")
         return [
-            CategoryAllocation(path=allocation.path, weight=share)
+            CategoryAllocation(path=allocation.path, weight=allocation.weight / total)
             for allocation in self.allocations
         ]
 
@@ -111,11 +113,15 @@ def load_mappings(path: Path) -> Dict[str, InstrumentMapping]:
         for entry in allocations_data:
             if isinstance(entry, str):
                 category_label = entry
+                weight = 1.0
             else:
                 category_label = entry.get("category")
+                weight = float(entry.get("weight", 1.0))
             if not category_label:
                 continue
-            allocations.append(CategoryAllocation(path=_parse_category_label(category_label)))
+            allocations.append(
+                CategoryAllocation(path=_parse_category_label(category_label), weight=weight)
+            )
         if not allocations:
             continue
         volatility = payload.get("volatility")
@@ -127,7 +133,10 @@ def save_mappings(path: Path, mappings: Dict[str, InstrumentMapping]) -> None:
     """Persist instrument mappings to YAML."""
     serializable = {
         instrument: {
-            "allocations": [allocation.path.label() for allocation in mapping.allocations],
+            "allocations": [
+                {"category": allocation.path.label(), "weight": allocation.weight}
+                for allocation in mapping.allocations
+            ],
             **({"volatility": mapping.volatility} if mapping.volatility else {}),
         }
         for instrument, mapping in mappings.items()
@@ -143,12 +152,34 @@ def parse_allocation_input(user_input: str, plan_index: PlanIndex) -> List[Categ
         raise ValueError("At least one allocation must be provided")
     allocations: List[CategoryAllocation] = []
     for entry in entries:
-        category_label = entry
+        if "=" in entry:
+            category_label, weight_text = entry.split("=", 1)
+        elif ":" in entry:
+            category_label, weight_text = entry.split(":", 1)
+        else:
+            category_label, weight_text = entry, "100"
         resolved = plan_index.resolve(category_label)
         if not resolved:
             raise ValueError(f"Unknown category path '{category_label.strip()}'")
-        allocations.append(CategoryAllocation(path=resolved))
+        weight = _parse_weight_input(weight_text)
+        allocations.append(CategoryAllocation(path=resolved, weight=weight))
+    total = sum(allocation.weight for allocation in allocations)
+    if total <= 0:
+        raise ValueError("Allocation weights must be positive")
     return allocations
+
+
+def _parse_weight_input(raw: str) -> float:
+    """Parse textual weights (e.g. 70 or 70%) into fractions."""
+    cleaned = raw.strip().rstrip("%")
+    if not cleaned:
+        raise ValueError("Weight value is required")
+    value = float(cleaned)
+    if value > 1:
+        value = value / 100.0
+    if value <= 0:
+        raise ValueError("Weights must be positive")
+    return value
 
 
 def parse_source_spec(spec: str) -> SourceSpec:
@@ -240,6 +271,7 @@ def summarize_portfolio(plan, investments: List[Investment]):
                 "label": target.path.label(),
                 "risk_weight_raw": risk_weight,
                 "risk_weight_normalized": normalized_risk,
+                "adjustment": getattr(target, "adjustment", 1.0),
                 "volatility": target.volatility,
                 "cash_weight": cash_weight,
                 "actual_value": actual_value,
@@ -256,6 +288,7 @@ def print_summary_table(total_value: float, rows: List[Dict[str, float]]) -> Non
         f"{'Category':55}"
         f"{'Risk Wt':>10}"
         f"{'Norm Wt':>10}"
+        f"{'Adj':>6}"
         f"{'Vol':>8}"
         f"{'Cash Wt':>10}"
         f"{'Actual £':>14}"
@@ -268,6 +301,7 @@ def print_summary_table(total_value: float, rows: List[Dict[str, float]]) -> Non
         label = row["label"]
         risk = row["risk_weight_raw"]
         norm = row["risk_weight_normalized"]
+        adjustment = row["adjustment"]
         vol = row["volatility"]
         cash = row["cash_weight"]
         actual_value = row["actual_value"]
@@ -277,6 +311,7 @@ def print_summary_table(total_value: float, rows: List[Dict[str, float]]) -> Non
             f"{label:55}"
             f"{risk:10.3f}"
             f"{norm:10.3f}"
+            f"{adjustment:6.2f}"
             f"{vol:8.3f}"
             f"{cash:10.3f}"
             f"{actual_value:14,.2f}"
@@ -296,6 +331,7 @@ def export_summary_to_csv(path: Path, rows: List[Dict[str, float]]) -> None:
                 "Category",
                 "RiskWeightRaw",
                 "RiskWeightNormalized",
+                "Adjustment",
                 "Volatility",
                 "CashWeight",
                 "ActualValueGBP",
@@ -309,6 +345,7 @@ def export_summary_to_csv(path: Path, rows: List[Dict[str, float]]) -> None:
                     row["label"],
                     row["risk_weight_raw"],
                     row["risk_weight_normalized"],
+                    row["adjustment"],
                     row["volatility"],
                     row["cash_weight"],
                     row["actual_value"],
@@ -381,9 +418,9 @@ def gather_missing_mappings(
     missing_list = sorted(set(missing))
     print("Assign categories (supports multiple allocations) for the following instruments.")
     print(
-        "Enter comma-separated category paths (e.g., 'Equities / Developed / NAM, Equities / Developed / Europe')."
+        "Enter comma-separated category paths with optional weights (e.g., 'Equities / Developed / NAM=70, Equities / Developed / Europe=30')."
     )
-    print("Type 'list' to view options or 'quit' to abort. Holdings will be split evenly across entries.")
+    print("Type 'list' to view options or 'quit' to abort.")
     labels = plan_index.available_labels()
     for instrument in missing_list:
         allocations: Optional[List[CategoryAllocation]] = None

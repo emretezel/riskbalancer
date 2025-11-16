@@ -47,8 +47,8 @@ def test_investment_serialization_round_trip():
 def test_apply_mappings_splits_investment():
     mapping = InstrumentMapping(
         allocations=[
-            CategoryAllocation(path=CategoryPath("Equities", "Developed", "NAM")),
-            CategoryAllocation(path=CategoryPath("Equities", "Developed", "Europe")),
+            CategoryAllocation(path=CategoryPath("Equities", "Developed", "NAM"), weight=0.7),
+            CategoryAllocation(path=CategoryPath("Equities", "Developed", "Europe"), weight=0.3),
         ],
         volatility=0.25,
     )
@@ -65,7 +65,7 @@ def test_apply_mappings_splits_investment():
     assert sum(inv.market_value for inv in result) == 1000.0
     assert result[0].category.levels() == ("Equities", "Developed", "NAM")
     assert result[0].volatility == 0.25
-    assert sorted(inv.market_value for inv in result) == [500.0, 500.0]
+    assert sorted(round(inv.market_value, 2) for inv in result) == [300.0, 700.0]
 
 
 def test_summarize_portfolio_calculates_cash_and_targets():

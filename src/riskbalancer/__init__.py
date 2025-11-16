@@ -19,4 +19,4 @@ __all__ = [
     "load_portfolio_plan_from_yaml",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"

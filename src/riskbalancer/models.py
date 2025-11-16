@@ -65,6 +65,7 @@ class CategoryTarget:
     normalized_risk_weight: float
     volatility: float
     risk_weight: float
+    adjustment: float = 1.0
 
     def __post_init__(self) -> None:
         if self.normalized_risk_weight < 0 or self.normalized_risk_weight > 1:
@@ -73,6 +74,8 @@ class CategoryTarget:
             raise ValueError("risk_weight must be non-negative")
         if self.volatility <= 0:
             raise ValueError("volatility must be positive")
+        if self.adjustment <= 0:
+            raise ValueError("adjustment must be positive")
 
     @property
     def target_weight(self) -> float:
