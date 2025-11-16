@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""
+Configuration helpers for RiskBalancer category hierarchies.
+
+Author: Emre Tezel
+"""
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Mapping, Optional, Sequence, Union
@@ -14,6 +20,7 @@ Scalar = Union[float, int, str]
 
 
 def _parse_weight(raw: Optional[Scalar]) -> float:
+    """Parse percentages/fractions into float weights."""
     if raw is None:
         raise ValueError("Weight value is required")
     if isinstance(raw, (float, int)):
@@ -31,6 +38,7 @@ def _parse_weight(raw: Optional[Scalar]) -> float:
 
 
 def _parse_optional_volatility(raw: Optional[Scalar]) -> Optional[float]:
+    """Parse optional volatility entries into floats (if provided)."""
     if raw is None:
         return None
     if isinstance(raw, (float, int)):
@@ -41,6 +49,7 @@ def _parse_optional_volatility(raw: Optional[Scalar]) -> Optional[float]:
 
 
 def _parse_adjustment(raw: Optional[Scalar]) -> float:
+    """Parse adjustment factors; fallback to 1.0 if blank."""
     if raw is None:
         return 1.0
     if isinstance(raw, (float, int)):
@@ -64,6 +73,7 @@ class CategoryNode:
 
     @classmethod
     def from_mapping(cls, data: Mapping) -> "CategoryNode":
+        """Create a node (and its children) from dictionary data."""
         children_raw = data.get("children") or []
         children = [cls.from_mapping(child) for child in children_raw]
         return cls(
@@ -119,6 +129,7 @@ class CategoryNode:
 
 
 def load_category_nodes_from_yaml(path: Union[str, Path]) -> list[CategoryNode]:
+    """Load hierarchical category nodes from a YAML file."""
     with open(path, "r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle)
     if not data:
@@ -136,6 +147,7 @@ def load_portfolio_plan_from_yaml(
     tolerance: float = 2e-2,
     default_leaf_volatility: float = 0.15,
 ) -> PortfolioPlan:
+    """Build a PortfolioPlan by flattening YAML category definitions."""
     nodes = load_category_nodes_from_yaml(path)
     total_top = sum(node.weight for node in nodes)
     if abs(total_top - 1.0) > tolerance:

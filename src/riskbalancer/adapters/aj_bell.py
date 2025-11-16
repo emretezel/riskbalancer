@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""
+AJ Bell statement adapter for RiskBalancer.
+
+Author: Emre Tezel
+"""
+
 import csv
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence, TextIO, Union

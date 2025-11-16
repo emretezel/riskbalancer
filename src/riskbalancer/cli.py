@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""
+RiskBalancer command-line interface utilities.
+
+Author: Emre Tezel
+"""
+
 import argparse
 import csv
 import sys
@@ -26,6 +32,8 @@ ADAPTERS = {
 
 @dataclass
 class InstrumentMapping:
+    """User-defined allocation metadata and optional volatility override."""
+
     allocations: List["CategoryAllocation"]
     volatility: Optional[float] = None
 
@@ -41,18 +49,24 @@ class InstrumentMapping:
 
 @dataclass
 class CategoryAllocation:
+    """Represents a single category allocation entry."""
+
     path: CategoryPath
     weight: float = 1.0
 
 
 @dataclass
 class SourceSpec:
+    """Descriptor for a statement source specified via CLI flags."""
+
     adapter: str
     statement: Path
     mappings: Path
 
 
 class PlanIndex:
+    """Helper that resolves free-form category labels to canonical paths."""
+
     def __init__(self, labels: Dict[str, CategoryPath]):
         self._labels = labels
 
@@ -82,6 +96,7 @@ def _parse_category_label(label: str) -> CategoryPath:
 
 
 def load_mappings(path: Path) -> Dict[str, InstrumentMapping]:
+    """Load instrument mappings from a YAML file."""
     if not path.exists():
         return {}
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -109,6 +124,7 @@ def load_mappings(path: Path) -> Dict[str, InstrumentMapping]:
 
 
 def save_mappings(path: Path, mappings: Dict[str, InstrumentMapping]) -> None:
+    """Persist instrument mappings to YAML."""
     serializable = {
         instrument: {
             "allocations": [allocation.path.label() for allocation in mapping.allocations],
@@ -121,6 +137,7 @@ def save_mappings(path: Path, mappings: Dict[str, InstrumentMapping]) -> None:
 
 
 def parse_allocation_input(user_input: str, plan_index: PlanIndex) -> List[CategoryAllocation]:
+    """Parse user-provided comma-separated category labels into allocations."""
     entries = [entry.strip() for entry in user_input.split(",") if entry.strip()]
     if not entries:
         raise ValueError("At least one allocation must be provided")
@@ -135,6 +152,7 @@ def parse_allocation_input(user_input: str, plan_index: PlanIndex) -> List[Categ
 
 
 def parse_source_spec(spec: str) -> SourceSpec:
+    """Parse --source adapter/statement/mapping definitions."""
     parts = {}
     for segment in spec.split(","):
         if not segment.strip():
@@ -158,6 +176,7 @@ def parse_source_spec(spec: str) -> SourceSpec:
 
 
 def investment_to_dict(investment: Investment) -> Dict[str, object]:
+    """Convert an Investment to a serialisable dict."""
     return {
         "instrument_id": investment.instrument_id,
         "description": investment.description,
@@ -168,10 +187,12 @@ def investment_to_dict(investment: Investment) -> Dict[str, object]:
 
 
 def investments_to_dicts(investments: Iterable[Investment]) -> List[Dict[str, object]]:
+    """Serialise a list of investments for storage."""
     return [investment_to_dict(inv) for inv in investments]
 
 
 def investment_from_dict(payload: Mapping[str, object]) -> Investment:
+    """Hydrate an Investment from stored JSON data."""
     category_label = payload["category"]
     if not isinstance(category_label, str):
         raise ValueError("Category label must be a string")
@@ -186,10 +207,12 @@ def investment_from_dict(payload: Mapping[str, object]) -> Investment:
 
 
 def investments_from_dicts(items: Iterable[Mapping[str, object]]) -> List[Investment]:
+    """Hydrate multiple investments from stored JSON data."""
     return [investment_from_dict(item) for item in items]
 
 
 def summarize_portfolio(plan, investments: List[Investment]):
+    """Aggregate the portfolio and compute risk/cash weights + target values."""
     totals = defaultdict(float)
     for investment in investments:
         totals[investment.category] += investment.market_value
@@ -294,6 +317,7 @@ def export_summary_to_csv(path: Path, rows: List[Dict[str, float]]) -> None:
                 ]
             )
 def resolve_portfolio_path(value: str) -> Path:
+    """Resolve portfolio names into JSON file paths."""
     path = Path(value)
     if path.is_dir():
         raise ValueError("Portfolio path must be a file, not a directory")
@@ -303,6 +327,7 @@ def resolve_portfolio_path(value: str) -> Path:
 
 
 def save_portfolio_snapshot(path: Path, plan_path: Path, investments: List[Investment]) -> None:
+    """Persist a full portfolio snapshot (investments + metadata)."""
     data = {
         "plan": str(plan_path),
         "created_at": datetime.utcnow().isoformat() + "Z",
@@ -313,7 +338,33 @@ def save_portfolio_snapshot(path: Path, plan_path: Path, investments: List[Inves
 
 
 def load_portfolio_snapshot(path: Path) -> Dict[str, object]:
+    """Load previously stored portfolio snapshot JSON."""
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def append_manual_investment(
+    path: Path,
+    *,
+    instrument_id: str,
+    description: str,
+    market_value: float,
+    category_label: str,
+    source: str = "manual",
+) -> None:
+    snapshot = load_portfolio_snapshot(path)
+    investments = snapshot.get("investments", [])
+    investments.append(
+        {
+            "instrument_id": instrument_id,
+            "description": description,
+            "market_value": market_value,
+            "category": category_label,
+            "source": source,
+        }
+    )
+    snapshot["investments"] = investments
+    snapshot["updated_at"] = datetime.utcnow().isoformat() + "Z"
+    path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
 
 
 def gather_missing_mappings(
@@ -389,6 +440,7 @@ def apply_mappings_to_investments(
     investments: List[Investment],
     mappings: Dict[str, InstrumentMapping],
 ) -> List[Investment]:
+    """Split each investment across mapped categories and return the flattened list."""
     expanded: List[Investment] = []
     for investment in investments:
         mapping = mappings.get(investment.instrument_id)
@@ -420,6 +472,7 @@ def gather_investments_from_sources(
     *,
     strict: bool = False,
 ) -> List[Investment]:
+    """Parse multiple statements and combine the resulting mapped investments."""
     combined: List[Investment] = []
     for spec in specs:
         mappings = load_mappings(spec.mappings)
@@ -513,6 +566,23 @@ def cmd_portfolio_delete(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_portfolio_add_instrument(args: argparse.Namespace) -> int:
+    portfolio_path = resolve_portfolio_path(args.portfolio)
+    if not portfolio_path.exists():
+        raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
+    category = _parse_category_label(args.category)
+    append_manual_investment(
+        portfolio_path,
+        instrument_id=args.instrument_id,
+        description=args.description,
+        market_value=args.market_value,
+        category_label=category.label(),
+        source="manual",
+    )
+    print(f"Added {args.instrument_id} to {portfolio_path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RiskBalancer CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -570,6 +640,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Portfolio name or file path to delete",
     )
     delete.set_defaults(func=cmd_portfolio_delete)
+
+    add_manual = portfolio_sub.add_parser("add", help="Manually append an instrument to a portfolio")
+    add_manual.add_argument("--portfolio", required=True, help="Portfolio name or path")
+    add_manual.add_argument("--instrument-id", required=True)
+    add_manual.add_argument("--description", required=True)
+    add_manual.add_argument("--market-value", required=True, type=float)
+    add_manual.add_argument("--category", required=True, help="Category path (e.g., Equities / Developed / NAM)")
+    add_manual.set_defaults(func=cmd_portfolio_add_instrument)
     return parser
 
 

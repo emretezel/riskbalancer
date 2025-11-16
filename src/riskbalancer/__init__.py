@@ -1,5 +1,7 @@
 """
 RiskBalancer core package.
+
+Author: Emre Tezel
 """
 from .configuration import CategoryNode, load_portfolio_plan_from_yaml
 from .models import CategoryPath, CategoryStatus, CategoryTarget, Investment
@@ -17,4 +19,4 @@ __all__ = [
     "load_portfolio_plan_from_yaml",
 ]
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"

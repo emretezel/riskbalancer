@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "riskbalancer"
-version = "0.1.0"
+version = "1.0.0"
 description = "Portfolio risk balancing toolkit for multi-broker statements"
 readme = "README.md"
 authors = [{name = "RiskBalancer"}]
 requires-python = ">=3.9"
 dependencies = ["pyyaml>=6.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [project.optional-dependencies]
 dev = ["pytest>=6.2"]

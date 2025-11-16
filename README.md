@@ -123,6 +123,7 @@ Use the `portfolio` command group to combine multiple broker statements (each wi
 
 - `riskbalancer portfolio build --plan config/categories.yaml --portfolio my-portfolio --source adapter=ajbell,statement=private/portfolio-AB8LNFS-SIPP.csv,mappings=config/mappings/ajbell.yaml`
   - Repeat `--source ...` for every broker feed you want to include. The CLI enforces that mappings exist for all instruments, expands each holding into the configured category allocations, and writes the resulting investments to `portfolios/my-portfolio.json` (use `--portfolio` with a path to override the location; JSON under `portfolios/` is gitignored).
+- `riskbalancer portfolio add --portfolio my-portfolio --instrument-id MANUAL1 --description "Special Holding" --market-value 10000 --category "Equities / Developed / NAM"` appends a manual instrument to an existing snapshot. Use this to capture holdings that aren’t in a broker CSV (cash, bespoke positions, etc.).
 - `riskbalancer portfolio list` shows stored snapshots along with their associated plan files and timestamps.
 - `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, and produces (and optionally exports) the risk-parity summary table (category label, raw/normalized risk weights, volatility, cash weights, actual vs. target GBP values, deltas).
 - `riskbalancer portfolio delete --portfolio my-portfolio` removes a snapshot when you no longer need it.

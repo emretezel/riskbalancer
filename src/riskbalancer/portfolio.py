@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""
+Portfolio planning and analysis utilities for RiskBalancer.
+
+Author: Emre Tezel
+"""
+
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Sequence
 

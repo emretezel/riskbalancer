@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""
+Core dataclasses used throughout RiskBalancer.
+
+Author: Emre Tezel
+"""
+
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple, Union
 
