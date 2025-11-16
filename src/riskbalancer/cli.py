@@ -18,7 +18,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Mapping
 import yaml
 from collections import defaultdict
 
-from .adapters import AJBellCSVAdapter, IBKRCSVAdapter
+from .adapters import AJBellCSVAdapter, IBKRCSVAdapter, MS401KCSVAdapter
 from .configuration import load_portfolio_plan_from_yaml
 from .models import CategoryPath, Investment
 
@@ -28,6 +28,7 @@ PORTFOLIO_DIR = Path("portfolios")
 ADAPTERS = {
     "ajbell": AJBellCSVAdapter,
     "ibkr": IBKRCSVAdapter,
+    "ms401k": MS401KCSVAdapter,
 }
 
 
@@ -200,18 +201,18 @@ def parse_source_spec(spec: str) -> SourceSpec:
         raise ValueError(
             "Source spec must include adapter=..., statement=..., mappings=..."
         )
+    mappings_path = Path(mappings) if mappings else Path(f"config/mappings/{adapter}.yaml")
+    mappings_path.parent.mkdir(parents=True, exist_ok=True)
     return SourceSpec(
         adapter=adapter,
         statement=Path(statement),
-        mappings=Path(mappings),
+        mappings=mappings_path,
     )
 
 
-def load_fx_rates(path: Optional[str]) -> Dict[str, float]:
+def load_fx_rates(path: Optional[str] = None) -> Dict[str, float]:
     """Load FX rates (currency -> GBP) from YAML."""
-    if not path:
-        return {}
-    fx_path = Path(path)
+    fx_path = Path(path or "config/fx.yaml")
     if not fx_path.exists():
         return {}
     data = yaml.safe_load(fx_path.read_text(encoding="utf-8"))
@@ -483,7 +484,7 @@ def build_adapter(name: str, fx_rates: Optional[Dict[str, float]] = None):
     adapter_cls = ADAPTERS.get(name.lower())
     if not adapter_cls:
         raise ValueError(f"Unknown adapter '{name}'. Available: {', '.join(ADAPTERS)}")
-    if adapter_cls is IBKRCSVAdapter:
+    if adapter_cls in {IBKRCSVAdapter, MS401KCSVAdapter}:
         return adapter_cls(default_category=DEFAULT_CATEGORY, fx_rates=fx_rates)
     return adapter_cls(default_category=DEFAULT_CATEGORY)
 
@@ -556,7 +557,7 @@ def cmd_categorize(args: argparse.Namespace) -> int:
     mapping_path = Path(args.mappings) if args.mappings else Path(f"config/mappings/{args.adapter}.yaml")
     mapping_path.parent.mkdir(parents=True, exist_ok=True)
     mappings = load_mappings(mapping_path)
-    fx_rates = load_fx_rates(args.fx)
+    fx_rates = load_fx_rates()
     investments = parse_statement(Path(args.statement), args.adapter, fx_rates=fx_rates)
     missing = [inv.instrument_id for inv in investments if inv.instrument_id not in mappings]
     if not missing:
@@ -572,7 +573,7 @@ def cmd_categorize(args: argparse.Namespace) -> int:
 def cmd_portfolio_build(args: argparse.Namespace) -> int:
     plan_path = Path(args.plan)
     source_specs = [parse_source_spec(spec) for spec in args.source]
-    fx_rates = load_fx_rates(args.fx)
+    fx_rates = load_fx_rates()
     investments = gather_investments_from_sources(source_specs, strict=True, fx_rates=fx_rates)
     portfolio_path = resolve_portfolio_path(args.portfolio)
     if portfolio_path.exists() and not args.overwrite:
@@ -659,11 +660,6 @@ def build_parser() -> argparse.ArgumentParser:
     categorize.add_argument(
         "--mappings",
         help="Path to YAML mapping file (defaults to config/mappings/<adapter>.yaml)",
-    )
-    categorize.add_argument(
-        "--fx",
-        default="config/fx.yaml",
-        help="Optional FX rate YAML used when the statement is not GBP (defaults to config/fx.yaml if present)",
     )
     categorize.set_defaults(func=cmd_categorize)
 

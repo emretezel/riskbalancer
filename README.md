@@ -22,7 +22,8 @@ The package uses the adapter pattern so each broker statement source can provide
 ### Available adapters
 
 - `AJBellCSVAdapter` ingests AJ Bell statement exports and exposes hooks to supply category mappings per ticker.
-- `IBKRCSVAdapter` ingests Interactive Brokers MTM CSV exports (picking up GBP-valued rows under the Positions and Mark-to-Market P&L section).
+- `IBKRCSVAdapter` ingests Interactive Brokers MTM CSV exports (converting to GBP using `config/fx.yaml`).
+- `MS401KCSVAdapter` ingests Morgan Stanley 401(k) CSV exports (the download available from their participant portal) and converts USD balances to GBP.
 
 ## Category configuration (YAML)
 
@@ -113,11 +114,11 @@ Future CLI work can load this file to convert statements that report market valu
 
 The package exposes a CLI entry point `riskbalancer` with two sub-commands:
 
-1. `riskbalancer categorize --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml --fx config/fx.yaml`
+1. `riskbalancer categorize --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
    - Loads the statement with the AJ Bell adapter.
    - Prompts you to assign any unmapped instruments to one or more categories from the plan. Enter comma-separated category paths with optional weights (e.g., `Equities / Developed / NAM=70, Equities / Developed / Europe=30`). Holdings are split according to the weights supplied (defaults to an even split if weights are omitted). Optionally supply a custom volatility per instrument.
    - Stores the resulting allocations (per ticker) so future ingestions auto-categorize and automatically split holdings across the selected categories.
-   - `--fx` is optional when the statement is already denominated in GBP, but required (and defaults to `config/fx.yaml`) for adapters like IBKR that report in multiple currencies.
+   - For non-GBP statements (e.g., IBKR), ensure `config/fx.yaml` contains up-to-date GBP-based conversion rates so holdings are converted automatically.
 
 Instrument mappings are stored in YAML, supporting multiple category allocations per instrument (custom weights are optional; they default to 100% if omitted):
 
@@ -140,9 +141,9 @@ Store one mapping file per broker (e.g., `config/mappings/ajbell.yaml`) and pass
 
 Use the `portfolio` command group to combine multiple broker statements (each with its own adapter + mapping config), persist the normalized investments, and revisit the snapshot later without re-parsing CSVs:
 
-- `riskbalancer portfolio build --plan config/categories.yaml --portfolio my-portfolio --source adapter=ajbell,statement=private/portfolio-AB8LNFS-SIPP.csv,mappings=config/mappings/ajbell.yaml [--fx config/fx.yaml]`
+- `riskbalancer portfolio build --plan config/categories.yaml --portfolio my-portfolio --source adapter=ajbell,statement=private/portfolio-AB8LNFS-SIPP.csv,mappings=config/mappings/ajbell.yaml`
   - Repeat `--source ...` for every broker feed you want to include. The CLI enforces that mappings exist for all instruments, expands each holding into the configured category allocations, and writes the resulting investments to `portfolios/my-portfolio.json` (use `--portfolio` with a path to override the location; JSON under `portfolios/` is gitignored).
-  - Add `--fx` (pointing to a GBP-based FX YAML) when any source statement is denominated in a foreign currency (e.g., Interactive Brokers). Positions are converted to GBP before they are persisted.
+  - When source statements are denominated in other currencies, `config/fx.yaml` (if present) is loaded automatically and applied to convert market values into GBP before they are persisted.
 - `riskbalancer portfolio add --portfolio my-portfolio --instrument-id MANUAL1 --description "Special Holding" --market-value 10000 --category "Equities / Developed / NAM"` appends a manual instrument to an existing snapshot. Use this to capture holdings that aren’t in a broker CSV (cash, bespoke positions, etc.).
 - `riskbalancer portfolio list` shows stored snapshots along with their associated plan files and timestamps.
 - `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, and produces (and optionally exports) the risk-parity summary table (category label, raw/normalized risk weights, volatility, cash weights, actual vs. target GBP values, deltas).
