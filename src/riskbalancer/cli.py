@@ -11,8 +11,8 @@ import csv
 import json
 import sys
 from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, cast
 
@@ -69,12 +69,14 @@ class CategoryAllocation:
 
 
 @dataclass
-class SourceSpec:
-    """Descriptor for a statement source specified via CLI flags."""
+class ImportRecord:
+    """Metadata describing a broker statement imported into a portfolio."""
 
+    source_id: str
     adapter: str
-    statement: Path
-    mappings: Path
+    statement: str
+    mappings: str
+    imported_at: str
 
 
 class PlanIndex:
@@ -193,28 +195,15 @@ def _parse_weight_input(raw: str) -> float:
     return value
 
 
-def parse_source_spec(spec: str) -> SourceSpec:
-    """Parse --source adapter/statement/mapping definitions."""
-    parts = {}
-    for segment in spec.split(","):
-        if not segment.strip():
-            continue
-        if "=" not in segment:
-            raise ValueError(f"Invalid source specification segment '{segment}'")
-        key, value = segment.split("=", 1)
-        parts[key.strip()] = value.strip()
-    adapter = parts.get("adapter")
-    statement = parts.get("statement")
-    mappings = parts.get("mappings")
-    if not adapter or not statement:
-        raise ValueError("Source spec must include adapter=... and statement=...")
-    mappings_path = Path(mappings) if mappings else Path(f"config/mappings/{adapter}.yaml")
+def resolve_mapping_path(adapter: str, raw_path: Optional[str] = None) -> Path:
+    """Resolve the mappings path for a broker adapter."""
+    mappings_path = Path(raw_path) if raw_path else Path(f"config/mappings/{adapter}.yaml")
     mappings_path.parent.mkdir(parents=True, exist_ok=True)
-    return SourceSpec(
-        adapter=adapter,
-        statement=Path(statement),
-        mappings=mappings_path,
-    )
+    return mappings_path
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def load_fx_rates(path: Optional[str] = None) -> Dict[str, float]:
@@ -234,13 +223,19 @@ def load_fx_rates(path: Optional[str] = None) -> Dict[str, float]:
 
 def investment_to_dict(investment: Investment) -> Dict[str, object]:
     """Convert an Investment to a serialisable dict."""
-    return {
+    payload: Dict[str, object] = {
         "instrument_id": investment.instrument_id,
         "description": investment.description,
         "market_value": investment.market_value,
         "category": investment.category.label(),
+        "volatility": investment.volatility,
         "source": investment.source,
     }
+    if investment.quantity is not None:
+        payload["quantity"] = investment.quantity
+    if investment.source_id is not None:
+        payload["source_id"] = investment.source_id
+    return payload
 
 
 def investments_to_dicts(investments: Iterable[Investment]) -> List[Dict[str, object]]:
@@ -253,6 +248,22 @@ def _coerce_float(value: object, *, field_name: str) -> float:
     if isinstance(value, (int, float, str)):
         return float(value)
     raise ValueError(f"{field_name} must be numeric")
+
+
+def _coerce_optional_float(value: object, *, field_name: str) -> Optional[float]:
+    if value is None:
+        return None
+    return _coerce_float(value, field_name=field_name)
+
+
+def import_record_to_dict(record: ImportRecord) -> Dict[str, str]:
+    return {
+        "source_id": record.source_id,
+        "adapter": record.adapter,
+        "statement": record.statement,
+        "mappings": record.mappings,
+        "imported_at": record.imported_at,
+    }
 
 
 def _snapshot_investments(snapshot: Mapping[str, object]) -> List[Dict[str, object]]:
@@ -268,18 +279,72 @@ def _snapshot_investments(snapshot: Mapping[str, object]) -> List[Dict[str, obje
     return investments
 
 
+def _snapshot_imports(snapshot: Mapping[str, object]) -> List[ImportRecord]:
+    raw_imports = snapshot.get("imports", [])
+    if raw_imports is None:
+        return []
+    if not isinstance(raw_imports, list):
+        raise ValueError("Stored imports must be a list")
+    imports: List[ImportRecord] = []
+    for item in raw_imports:
+        if not isinstance(item, dict):
+            raise ValueError("Each stored import must be an object")
+        source_id = item.get("source_id")
+        adapter = item.get("adapter")
+        statement = item.get("statement")
+        mappings = item.get("mappings")
+        imported_at = item.get("imported_at")
+        if not all(
+            isinstance(value, str)
+            for value in (source_id, adapter, statement, mappings, imported_at)
+        ):
+            raise ValueError("Stored import metadata must use string values")
+        imports.append(
+            ImportRecord(
+                source_id=cast(str, source_id),
+                adapter=cast(str, adapter),
+                statement=cast(str, statement),
+                mappings=cast(str, mappings),
+                imported_at=cast(str, imported_at),
+            )
+        )
+    return imports
+
+
+def _snapshot_plan_path(snapshot: Mapping[str, object]) -> Path:
+    plan_value = snapshot.get("plan", "config/categories.yaml")
+    if not isinstance(plan_value, str):
+        raise ValueError("Stored plan path must be a string")
+    return Path(plan_value)
+
+
+def _snapshot_created_at(snapshot: Mapping[str, object]) -> str:
+    created_at = snapshot.get("created_at")
+    if isinstance(created_at, str):
+        return created_at
+    updated_at = snapshot.get("updated_at")
+    if isinstance(updated_at, str):
+        return updated_at
+    return _utc_timestamp()
+
+
 def investment_from_dict(payload: Mapping[str, object]) -> Investment:
     """Hydrate an Investment from stored JSON data."""
     category_label = payload["category"]
     if not isinstance(category_label, str):
         raise ValueError("Category label must be a string")
+    source_id_value = payload.get("source_id")
+    if source_id_value is not None and not isinstance(source_id_value, str):
+        raise ValueError("source_id must be a string when present")
     return Investment(
         instrument_id=str(payload["instrument_id"]),
         description=str(payload.get("description", "")),
         market_value=_coerce_float(payload.get("market_value", 0.0), field_name="market_value"),
         category=_parse_category_label(category_label),
         volatility=_coerce_float(payload.get("volatility", 0.0), field_name="volatility") or 0.0001,
+        quantity=_coerce_optional_float(payload.get("quantity"), field_name="quantity"),
         source=str(payload.get("source", "portfolio")),
+        source_id=cast(Optional[str], source_id_value),
     )
 
 
@@ -411,11 +476,23 @@ def resolve_portfolio_path(value: str) -> Path:
     return path
 
 
-def save_portfolio_snapshot(path: Path, plan_path: Path, investments: List[Investment]) -> None:
+def save_portfolio_snapshot(
+    path: Path,
+    plan_path: Path,
+    investments: List[Investment],
+    *,
+    imports: Optional[List[ImportRecord]] = None,
+    created_at: Optional[str] = None,
+    updated_at: Optional[str] = None,
+) -> None:
     """Persist a full portfolio snapshot (investments + metadata)."""
+    created = created_at or _utc_timestamp()
+    updated = updated_at or created
     data = {
         "plan": str(plan_path),
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": created,
+        "updated_at": updated,
+        "imports": [import_record_to_dict(record) for record in (imports or [])],
         "investments": investments_to_dicts(investments),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -425,31 +502,6 @@ def save_portfolio_snapshot(path: Path, plan_path: Path, investments: List[Inves
 def load_portfolio_snapshot(path: Path) -> Dict[str, object]:
     """Load previously stored portfolio snapshot JSON."""
     return json.loads(path.read_text(encoding="utf-8"))
-
-
-def append_manual_investment(
-    path: Path,
-    *,
-    instrument_id: str,
-    description: str,
-    market_value: float,
-    category_label: str,
-    source: str = "manual",
-) -> None:
-    snapshot = load_portfolio_snapshot(path)
-    investments = _snapshot_investments(snapshot)
-    investments.append(
-        {
-            "instrument_id": instrument_id,
-            "description": description,
-            "market_value": market_value,
-            "category": category_label,
-            "source": source,
-        }
-    )
-    snapshot["investments"] = investments
-    snapshot["updated_at"] = datetime.utcnow().isoformat() + "Z"
-    path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
 
 
 def gather_missing_mappings(
@@ -557,37 +609,38 @@ def apply_mappings_to_investments(
     return expanded
 
 
-def gather_investments_from_sources(
-    specs: List[SourceSpec],
+def ensure_mappings_for_investments(
+    investments: Iterable[Investment],
+    mapping_path: Path,
     *,
-    strict: bool = False,
-    fx_rates: Optional[Dict[str, float]] = None,
-) -> List[Investment]:
-    """Parse multiple statements and combine the resulting mapped investments."""
-    combined: List[Investment] = []
-    for spec in specs:
-        mappings = load_mappings(spec.mappings)
-        base = parse_statement(spec.statement, spec.adapter, fx_rates=fx_rates)
-        missing = sorted({inv.instrument_id for inv in base if inv.instrument_id not in mappings})
-        if missing:
-            message = (
-                f"Missing mappings for {', '.join(missing)} in {spec.statement}. "
-                "Use 'riskbalancer categorize' first."
-            )
-            if strict:
-                raise ValueError(message)
-            print("Warning:", message)
-        combined.extend(apply_mappings_to_investments(base, mappings))
-    return combined
+    plan_index: PlanIndex,
+    input_func: Optional[Callable[[str], str]] = None,
+) -> tuple[Dict[str, InstrumentMapping], int]:
+    """Load mappings, prompt for missing instruments, and persist new entries."""
+    mappings = load_mappings(mapping_path)
+    missing = sorted(
+        {inv.instrument_id for inv in investments if inv.instrument_id not in mappings}
+    )
+    if not missing:
+        return mappings, 0
+    new_entries = gather_missing_mappings(
+        missing,
+        plan_index=plan_index,
+        input_func=input_func,
+    )
+    mappings.update(new_entries)
+    save_mappings(mapping_path, mappings)
+    return mappings, len(new_entries)
+
+
+def tag_imported_investments(investments: Iterable[Investment], source_id: str) -> List[Investment]:
+    return [replace(investment, source_id=source_id) for investment in investments]
 
 
 def cmd_categorize(args: argparse.Namespace) -> int:
     plan = load_portfolio_plan_from_yaml(args.plan, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     plan_index = PlanIndex.from_plan(plan)
-    mapping_path = (
-        Path(args.mappings) if args.mappings else Path(f"config/mappings/{args.adapter}.yaml")
-    )
-    mapping_path.parent.mkdir(parents=True, exist_ok=True)
+    mapping_path = resolve_mapping_path(args.adapter, args.mappings)
     mappings = load_mappings(mapping_path)
     fx_rates = load_fx_rates()
     investments = parse_statement(Path(args.statement), args.adapter, fx_rates=fx_rates)
@@ -595,23 +648,80 @@ def cmd_categorize(args: argparse.Namespace) -> int:
     if not missing:
         print("All instruments already have mappings. Nothing to do.")
         return 0
-    new_entries = gather_missing_mappings(missing, plan_index=plan_index)
-    mappings.update(new_entries)
-    save_mappings(mapping_path, mappings)
-    print(f"Stored {len(new_entries)} new mappings in {mapping_path}")
+    _, new_count = ensure_mappings_for_investments(
+        investments,
+        mapping_path,
+        plan_index=plan_index,
+    )
+    print(f"Stored {new_count} new mappings in {mapping_path}")
     return 0
 
 
-def cmd_portfolio_build(args: argparse.Namespace) -> int:
-    plan_path = Path(args.plan)
-    source_specs = [parse_source_spec(spec) for spec in args.source]
-    fx_rates = load_fx_rates()
-    investments = gather_investments_from_sources(source_specs, strict=True, fx_rates=fx_rates)
+def cmd_portfolio_create(args: argparse.Namespace) -> int:
     portfolio_path = resolve_portfolio_path(args.portfolio)
+    plan_path = Path(args.plan)
     if portfolio_path.exists() and not args.overwrite:
         raise FileExistsError(f"{portfolio_path} already exists. Use --overwrite to replace it.")
-    save_portfolio_snapshot(portfolio_path, plan_path, investments)
-    print(f"Saved portfolio with {len(investments)} investments to {portfolio_path}")
+    save_portfolio_snapshot(portfolio_path, plan_path, [], imports=[])
+    print(f"Created empty portfolio at {portfolio_path}")
+    return 0
+
+
+def cmd_portfolio_import(args: argparse.Namespace) -> int:
+    portfolio_path = resolve_portfolio_path(args.portfolio)
+    if not portfolio_path.exists():
+        raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
+    snapshot = load_portfolio_snapshot(portfolio_path)
+    plan_path = _snapshot_plan_path(snapshot)
+    plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
+    plan_index = PlanIndex.from_plan(plan)
+
+    mapping_path = resolve_mapping_path(args.adapter, args.mappings)
+    fx_rates = load_fx_rates(args.fx)
+    parsed_investments = parse_statement(Path(args.statement), args.adapter, fx_rates=fx_rates)
+    mappings, new_count = ensure_mappings_for_investments(
+        parsed_investments,
+        mapping_path,
+        plan_index=plan_index,
+    )
+    imported_investments = tag_imported_investments(
+        apply_mappings_to_investments(parsed_investments, mappings),
+        args.source_id,
+    )
+
+    existing_investments = investments_from_dicts(_snapshot_investments(snapshot))
+    preserved_investments = [
+        investment for investment in existing_investments if investment.source_id != args.source_id
+    ]
+    replaced_count = len(existing_investments) - len(preserved_investments)
+
+    imports = [
+        record for record in _snapshot_imports(snapshot) if record.source_id != args.source_id
+    ]
+    imports.append(
+        ImportRecord(
+            source_id=args.source_id,
+            adapter=args.adapter,
+            statement=str(Path(args.statement)),
+            mappings=str(mapping_path),
+            imported_at=_utc_timestamp(),
+        )
+    )
+    save_portfolio_snapshot(
+        portfolio_path,
+        plan_path,
+        preserved_investments + imported_investments,
+        imports=imports,
+        created_at=_snapshot_created_at(snapshot),
+    )
+    if replaced_count:
+        print(f"Replaced {replaced_count} existing position(s) for source '{args.source_id}'.")
+    if new_count:
+        print(f"Stored {new_count} new mapping(s) in {mapping_path}.")
+    print(
+        f"Imported {len(imported_investments)} position(s) from {args.statement} "
+        f"into {portfolio_path} as '{args.source_id}'."
+    )
     return 0
 
 
@@ -620,10 +730,7 @@ def cmd_portfolio_report(args: argparse.Namespace) -> int:
     if not portfolio_path.exists():
         raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
     snapshot = load_portfolio_snapshot(portfolio_path)
-    plan_value = snapshot.get("plan", "config/categories.yaml")
-    if not isinstance(plan_value, str):
-        raise ValueError("Stored plan path must be a string")
-    plan_path = Path(args.plan) if args.plan else Path(plan_value)
+    plan_path = Path(args.plan) if args.plan else _snapshot_plan_path(snapshot)
     plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     investments = investments_from_dicts(_snapshot_investments(snapshot))
     total_value, summary = summarize_portfolio(plan, investments)
@@ -665,7 +772,8 @@ def cmd_portfolio_add_instrument(args: argparse.Namespace) -> int:
     portfolio_path = resolve_portfolio_path(args.portfolio)
     if not portfolio_path.exists():
         raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
-    plan_path = Path(args.plan or "config/categories.yaml")
+    snapshot = load_portfolio_snapshot(portfolio_path)
+    plan_path = _snapshot_plan_path(snapshot)
     plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     plan_index = PlanIndex.from_plan(plan)
 
@@ -690,16 +798,27 @@ def cmd_portfolio_add_instrument(args: argparse.Namespace) -> int:
     manual_mappings[args.instrument_id] = mapping
     save_mappings(manual_path, manual_mappings)
 
+    existing_investments = investments_from_dicts(_snapshot_investments(snapshot))
+    imports = _snapshot_imports(snapshot)
     allocations = mapping.normalized_allocations()
     for allocation in allocations:
-        append_manual_investment(
-            portfolio_path,
-            instrument_id=args.instrument_id,
-            description=args.description,
-            market_value=args.market_value * allocation.weight,
-            category_label=allocation.path.label(),
-            source="manual",
+        existing_investments.append(
+            Investment(
+                instrument_id=args.instrument_id,
+                description=args.description,
+                market_value=args.market_value * allocation.weight,
+                category=allocation.path,
+                volatility=mapping.volatility or DEFAULT_LEAF_VOLATILITY,
+                source="manual",
+            )
         )
+    save_portfolio_snapshot(
+        portfolio_path,
+        plan_path,
+        existing_investments,
+        imports=imports,
+        created_at=_snapshot_created_at(snapshot),
+    )
 
     print(f"Added {args.instrument_id} to {portfolio_path} using manual mappings")
     return 0
@@ -728,29 +847,45 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_parser = subparsers.add_parser("portfolio", help="Manage stored portfolios")
     portfolio_sub = portfolio_parser.add_subparsers(dest="portfolio_command", required=True)
 
-    build = portfolio_sub.add_parser("build", help="Construct and persist a portfolio snapshot")
-    build.add_argument(
+    create = portfolio_sub.add_parser("create", help="Create an empty portfolio snapshot")
+    create.add_argument(
         "--plan",
         default="config/categories.yaml",
         help="Path to categories YAML (defaults to config/categories.yaml)",
     )
-    build.add_argument(
+    create.add_argument(
         "--portfolio",
         required=True,
         help="Portfolio name or file path (defaults to portfolios/<name>.json if no extension)",
     )
-    build.add_argument(
-        "--source",
-        action="append",
-        required=True,
-        help="Adapter statement spec: adapter=...,statement=...,mappings=...",
+    create.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite an existing portfolio snapshot",
     )
-    build.add_argument("--overwrite", action="store_true", help="Overwrite existing portfolio file")
-    build.add_argument(
+    create.set_defaults(func=cmd_portfolio_create)
+
+    portfolio_import = portfolio_sub.add_parser(
+        "import",
+        help="Import a single broker statement into an existing portfolio",
+    )
+    portfolio_import.add_argument(
+        "--portfolio",
+        required=True,
+        help="Portfolio name or file path",
+    )
+    portfolio_import.add_argument("--source-id", required=True, help="Stable source identifier")
+    portfolio_import.add_argument("--adapter", required=True, choices=ADAPTERS.keys())
+    portfolio_import.add_argument("--statement", required=True, help="Path to broker CSV statement")
+    portfolio_import.add_argument(
+        "--mappings",
+        help="Path to YAML mapping file (defaults to config/mappings/<adapter>.yaml)",
+    )
+    portfolio_import.add_argument(
         "--fx",
         help="Optional FX rate YAML (base GBP) used to convert non-GBP statements",
     )
-    build.set_defaults(func=cmd_portfolio_build)
+    portfolio_import.set_defaults(func=cmd_portfolio_import)
 
     report = portfolio_sub.add_parser("report", help="Analyze a stored portfolio snapshot")
     report.add_argument(
@@ -790,14 +925,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_manual.add_argument("--market-value", required=True, type=float)
     add_manual.add_argument(
         "--category", help="Optional category path(s); prompt/manual mappings used if omitted"
-    )
-    add_manual.add_argument(
-        "--plan",
-        default="config/categories.yaml",
-        help=(
-            "Path to categories YAML used when capturing manual mappings "
-            "(defaults to config/categories.yaml)"
-        ),
     )
     add_manual.set_defaults(func=cmd_portfolio_add_instrument)
     return parser

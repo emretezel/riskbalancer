@@ -137,21 +137,32 @@ IEF:
       weight: 1.0
 ```
 
-Store one mapping file per broker (e.g., `config/mappings/ajbell.yaml`) and pass it to `categorize` (and the portfolio builders below). Once every instrument is mapped, the build/report steps run without prompts.
+Store one mapping file per broker (e.g., `config/mappings/ajbell.yaml`). `categorize` remains useful for pre-populating mappings, but portfolio imports can now prompt, persist new mappings, and continue in a single command.
 
 ### Portfolio snapshots
 
-Use the `portfolio` command group to combine multiple broker statements (each with its own adapter + mapping config), persist the normalized investments, and revisit the snapshot later without re-parsing CSVs:
+Use the `portfolio` command group to build a snapshot incrementally:
 
-- `riskbalancer portfolio build --plan config/categories.yaml --portfolio my-portfolio --source adapter=ajbell,statement=private/portfolio-AB8LNFS-SIPP.csv,mappings=config/mappings/ajbell.yaml`
-  - Repeat `--source ...` for every broker feed you want to include. The CLI enforces that mappings exist for all instruments, expands each holding into the configured category allocations, and writes the resulting investments to `portfolios/my-portfolio.json` (use `--portfolio` with a path to override the location; JSON under `portfolios/` is gitignored).
-  - When source statements are denominated in other currencies, `config/fx.yaml` (if present) is loaded automatically and applied to convert market values into GBP before they are persisted.
-- `riskbalancer portfolio add --portfolio my-portfolio --instrument-id MANUAL1 --description "Special Holding" --market-value 10000 [--category "Equities / Developed / NAM=60, Equities / Developed / Europe=40"]` appends a manual instrument to an existing snapshot. If `--category` is omitted, the CLI looks up `config/mappings/manual.yaml` (creating/updating it as needed) and prompts you the first time it sees a new manual instrument. Use this to capture holdings that aren’t in a broker CSV (cash, bespoke positions, etc.) while preserving category allocations for future additions.
+1. Create an empty portfolio:
+   - `riskbalancer portfolio create --plan config/categories.yaml --portfolio my-portfolio`
+   - This writes `portfolios/my-portfolio.json` with the stored plan path, timestamps, no imports, and no investments.
+2. Import one broker statement at a time:
+   - `riskbalancer portfolio import --portfolio my-portfolio --source-id ajbell-sipp --adapter ajbell --statement private/portfolio-AB8LNFS-SIPP.csv`
+   - If `--mappings` is omitted, the CLI uses `config/mappings/<adapter>.yaml`.
+   - When unmapped instruments are found, the import prompts for category allocations, saves the new mappings immediately, and continues the import in the same command.
+   - Re-importing the same `--source-id` replaces the positions previously imported for that source without disturbing manual holdings or other broker feeds.
+   - When a statement is not GBP-denominated, pass `--fx config/fx.yaml` so values are converted before they are persisted.
+3. Add manual holdings that do not come from a broker statement:
+   - `riskbalancer portfolio add --portfolio my-portfolio --instrument-id MANUAL1 --description "Special Holding" --market-value 10000 [--category "Equities / Developed / NAM=60, Equities / Developed / Europe=40"]`
+   - If `--category` is omitted, the CLI checks `config/mappings/manual.yaml` and prompts only when it sees a new manual instrument for the first time. This is intended for cash, gold, private investments, and other off-statement positions.
+
+Supporting commands:
+
 - `riskbalancer portfolio list` shows stored snapshots along with their associated plan files and timestamps.
 - `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, and produces (and optionally exports) the risk-parity summary table (category label, raw/normalized risk weights, volatility, cash weights, actual vs. target GBP values, deltas).
 - `riskbalancer portfolio delete --portfolio my-portfolio` removes a snapshot when you no longer need it.
 
-Portfolio files are JSON documents that capture the investments (instrument id, description, category label, market value, quantity, volatility, source) plus metadata such as the plan path and creation timestamp. Keeping them under `portfolios/` separates generated artifacts from configuration and code while preserving the ability to archive or version them if desired.
+Portfolio files are JSON documents that capture normalized investments plus metadata such as the stored plan path, timestamps, and an `imports` list describing which broker statements have been loaded. Imported positions also store an optional `source_id`, which lets the CLI replace a single broker feed deterministically on re-import while leaving manual positions unchanged.
 
 ## Next steps
 

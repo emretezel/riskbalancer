@@ -94,6 +94,7 @@ class Investment:
     volatility: float
     quantity: Optional[float] = None
     source: str = "unknown"
+    source_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.market_value < 0:
