@@ -81,7 +81,7 @@ class SchwabCSVAdapter(StatementAdapter):
         rate = self.fx_rates.get(currency.upper())
         if rate is None:
             raise ValueError(
-                f"Missing FX rate for {currency}. Please ensure config/fx.yaml defines it."
+                f"Missing FX rate for {currency}. Please ensure your FX YAML defines it."
             )
         return value * rate
 

@@ -75,7 +75,7 @@ class CitiCSVAdapter(StatementAdapter):
             return value
         rate = self.fx_rates.get(currency.upper())
         if rate is None:
-            raise ValueError(f"Missing FX rate for {currency}. Please update config/fx.yaml.")
+            raise ValueError(f"Missing FX rate for {currency}. Please update your FX YAML.")
         return value * rate
 
     @staticmethod

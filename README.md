@@ -22,10 +22,10 @@ The package uses the adapter pattern so each broker statement source can provide
 ### Available adapters
 
 - `AJBellCSVAdapter` ingests AJ Bell statement exports and exposes hooks to supply category mappings per ticker.
-- `IBKRCSVAdapter` ingests Interactive Brokers MTM CSV exports (converting to GBP using `config/fx.yaml`).
-- `MS401KCSVAdapter` ingests Morgan Stanley 401(k) CSV exports (the download available from their participant portal) and converts USD balances to GBP using `config/fx.yaml`.
-- `SchwabCSVAdapter` ingests Charles Schwab positions exports (USD) and also converts via `config/fx.yaml`.
-- `CitiCSVAdapter` ingests Citibank holdings exports (USD) and converts using `config/fx.yaml`.
+- `IBKRCSVAdapter` ingests Interactive Brokers MTM CSV exports (converting to GBP using `private/fx.yaml` by default).
+- `MS401KCSVAdapter` ingests Morgan Stanley 401(k) CSV exports (the download available from their participant portal) and converts USD balances to GBP using `private/fx.yaml` by default.
+- `SchwabCSVAdapter` ingests Charles Schwab positions exports (USD) and also converts via `private/fx.yaml` by default.
+- `CitiCSVAdapter` ingests Citibank holdings exports (USD) and converts using `private/fx.yaml` by default.
 
 ## Category configuration (YAML)
 
@@ -99,7 +99,19 @@ RiskBalancer follows the standard `src/` layout and exposes a CLI entry point. T
 
 ### FX rates
 
-Manual FX rates (e.g., USD→GBP) can be maintained in `config/fx.yaml`:
+The live FX file is `private/fx.yaml`, which is git-ignored and treated as mutable runtime data. A checked-in template lives at `config/fx.example.yaml`. Each value means `1 unit of foreign currency in GBP`, so `USD: 0.76` means `1 USD = 0.76 GBP`.
+
+```bash
+riskbalancer fx update
+```
+
+The `fx update` command refreshes `private/fx.yaml` from the European Central Bank daily reference rates. If the private file does not exist yet, the command bootstraps it from the tracked currencies in `config/fx.example.yaml`. Use `--currency` repeatedly to bootstrap or replace the tracked set explicitly.
+
+```bash
+riskbalancer fx update --currency USD --currency EUR --currency CHF
+```
+
+The resulting YAML looks like:
 
 ```yaml
 date: 2025-11-16
@@ -110,17 +122,23 @@ rates:
   CHF: 0.90
 ```
 
-Future CLI work can load this file to convert statements that report market values in non-GBP currencies.
+ECB reference rates are published on working days and are usually updated around 16:00 CET. The CLI stores the provider date from the ECB feed in the `date` field.
 
 ## CLI workflow
 
-The package exposes a CLI entry point `riskbalancer` with two sub-commands:
+The package exposes a CLI entry point `riskbalancer` with three command groups:
 
-1. `riskbalancer categorize --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
+1. `riskbalancer fx update [--fx private/fx.yaml] [--currency USD --currency EUR --currency CHF]`
+   - Downloads the latest ECB daily reference rates and rewrites `private/fx.yaml`.
+   - If `--currency` is omitted, the command refreshes only the currencies already tracked in the file.
+   - If `--currency` is supplied, the tracked set is replaced with exactly those currencies.
+   - If `private/fx.yaml` does not exist yet, the command creates it and seeds the tracked currencies from `config/fx.example.yaml`.
+
+2. `riskbalancer categorize --statement private/portfolio.csv --plan config/categories.yaml --mappings config/mappings/ajbell.yaml`
    - Loads the statement with the AJ Bell adapter.
    - Prompts you to assign any unmapped instruments to one or more categories from the plan. Enter comma-separated category paths with optional weights (e.g., `Equities / Developed / NAM=70, Equities / Developed / Europe=30`). Holdings are split according to the weights supplied (defaults to an even split if weights are omitted). Optionally supply a custom volatility per instrument.
    - Stores the resulting allocations (per ticker) so future ingestions auto-categorize and automatically split holdings across the selected categories.
-   - For non-GBP statements (e.g., IBKR), ensure `config/fx.yaml` contains up-to-date GBP-based conversion rates so holdings are converted automatically.
+   - For non-GBP statements (e.g., IBKR), ensure `private/fx.yaml` contains up-to-date GBP-based conversion rates so holdings are converted automatically.
 
 Instrument mappings are stored in YAML, supporting multiple category allocations per instrument (custom weights are optional; they default to 100% if omitted):
 
@@ -151,7 +169,7 @@ Use the `portfolio` command group to build a snapshot incrementally:
    - If `--mappings` is omitted, the CLI uses `config/mappings/<adapter>.yaml`.
    - When unmapped instruments are found, the import prompts for category allocations, saves the new mappings immediately, and continues the import in the same command.
    - Re-importing the same `--source-id` replaces the positions previously imported for that source without disturbing manual holdings or other broker feeds.
-   - When a statement is not GBP-denominated, pass `--fx config/fx.yaml` so values are converted before they are persisted.
+   - When a statement is not GBP-denominated, pass `--fx private/fx.yaml` so values are converted before they are persisted.
 3. Add manual holdings that do not come from a broker statement:
    - `riskbalancer portfolio add --portfolio my-portfolio --instrument-id MANUAL1 --description "Special Holding" --market-value 10000 [--category "Equities / Developed / NAM=60, Equities / Developed / Europe=40"]`
    - If `--category` is omitted, the CLI checks `config/mappings/manual.yaml` and prompts only when it sees a new manual instrument for the first time. This is intended for cash, gold, private investments, and other off-statement positions.

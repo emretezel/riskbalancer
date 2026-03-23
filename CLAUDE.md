@@ -28,7 +28,7 @@ Keep it concise and practical. Use `README.md` for end-user workflow details ins
 
 ## File Safety
 - Do not modify `private/`, `portfolios/`, or `reports/` unless the user explicitly asks. These paths hold private inputs or generated artifacts.
-- Pause before changing `config/categories.yaml`, `config/fx.yaml`, or files under `config/mappings/` unless the task is specifically about portfolio or category configuration.
+- Pause before changing `config/categories.yaml`, `config/fx.example.yaml`, or files under `config/mappings/` unless the task is specifically about portfolio or category configuration.
 - Documentation, package code, tests, and repo metadata are safe to edit when needed for the task.
 
 ## Build, Test, and Development Commands

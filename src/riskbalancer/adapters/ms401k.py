@@ -70,7 +70,7 @@ class MS401KCSVAdapter(StatementAdapter):
         if rate is None:
             raise ValueError(
                 f"Missing FX rate for {currency}. "
-                "Ensure config/fx.yaml contains entries for the statement currencies."
+                "Ensure your FX YAML contains entries for the statement currencies."
             )
         return value * rate
 

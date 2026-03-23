@@ -10,6 +10,9 @@ import argparse
 import csv
 import json
 import sys
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -32,6 +35,10 @@ DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
 DEFAULT_LEAF_VOLATILITY = 0.15
 PORTFOLIO_DIR = Path("portfolios")
 MANUAL_MAPPINGS_PATH = Path("config/mappings/manual.yaml")
+DEFAULT_FX_PATH = Path("private/fx.yaml")
+FX_TEMPLATE_PATH = Path("config/fx.example.yaml")
+ECB_DAILY_RATES_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+FX_HTTP_USER_AGENT = "riskbalancer/1.0"
 ADAPTERS = {
     "ajbell": AJBellCSVAdapter,
     "citi": CitiCSVAdapter,
@@ -208,7 +215,7 @@ def _utc_timestamp() -> str:
 
 def load_fx_rates(path: Optional[str] = None) -> Dict[str, float]:
     """Load FX rates (currency -> GBP) from YAML."""
-    fx_path = Path(path or "config/fx.yaml")
+    fx_path = Path(path or DEFAULT_FX_PATH)
     if not fx_path.exists():
         return {}
     data = yaml.safe_load(fx_path.read_text(encoding="utf-8"))
@@ -219,6 +226,127 @@ def load_fx_rates(path: Optional[str] = None) -> Dict[str, float]:
         raise ValueError("FX file must use GBP as the base currency")
     rates = data.get("rates", {})
     return {currency.upper(): float(value) for currency, value in rates.items()}
+
+
+def _normalize_currency_codes(currencies: Iterable[str]) -> List[str]:
+    normalized: List[str] = []
+    seen = set()
+    for raw_currency in currencies:
+        currency = raw_currency.strip().upper()
+        if not currency:
+            continue
+        if currency == "GBP":
+            raise ValueError("GBP is the base currency and should not be stored in fx.yaml rates")
+        if currency not in seen:
+            normalized.append(currency)
+            seen.add(currency)
+    return sorted(normalized)
+
+
+def tracked_fx_currencies(path: Path) -> List[str]:
+    """Return the currencies currently tracked in an FX YAML file."""
+    if not path.exists():
+        raise FileNotFoundError(
+            f"FX file {path} not found. Use --currency to bootstrap a new FX file."
+        )
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError("FX file must contain a mapping")
+    base = data.get("base", "GBP")
+    if not isinstance(base, str) or base.upper() != "GBP":
+        raise ValueError("FX file must use GBP as the base currency")
+    rates = data.get("rates")
+    if not isinstance(rates, dict) or not rates:
+        raise ValueError(
+            f"FX file {path} does not contain any tracked rates. Use --currency to bootstrap it."
+        )
+    raw_currencies: List[str] = []
+    for currency in rates:
+        if not isinstance(currency, str):
+            raise ValueError("FX file rate keys must be currency codes")
+        raw_currencies.append(currency)
+    return _normalize_currency_codes(raw_currencies)
+
+
+def resolve_tracked_fx_currencies(path: Path) -> List[str]:
+    """Resolve tracked currencies from the target file or the checked-in template."""
+    if path.exists():
+        return tracked_fx_currencies(path)
+    if path == DEFAULT_FX_PATH and FX_TEMPLATE_PATH.exists():
+        return tracked_fx_currencies(FX_TEMPLATE_PATH)
+    raise FileNotFoundError(f"FX file {path} not found. Use --currency to bootstrap a new FX file.")
+
+
+def parse_ecb_reference_rates_xml(xml_payload: str) -> tuple[str, Dict[str, float]]:
+    """Parse the ECB daily XML feed into a provider date and EUR-based rates."""
+    try:
+        root = ET.fromstring(xml_payload)
+    except ET.ParseError as exc:
+        raise ValueError("Malformed ECB FX payload") from exc
+
+    dated_cube = next((element for element in root.iter() if "time" in element.attrib), None)
+    if dated_cube is None:
+        raise ValueError("ECB FX payload does not contain a dated rates section")
+
+    provider_date = dated_cube.attrib.get("time", "").strip()
+    if not provider_date:
+        raise ValueError("ECB FX payload does not contain a provider date")
+
+    rates: Dict[str, float] = {}
+    for child in dated_cube:
+        currency = child.attrib.get("currency", "").strip().upper()
+        rate_text = child.attrib.get("rate", "").strip()
+        if not currency or not rate_text:
+            continue
+        rates[currency] = float(rate_text)
+
+    if not rates:
+        raise ValueError("ECB FX payload does not contain any rates")
+    return provider_date, rates
+
+
+def fetch_ecb_reference_rates() -> tuple[str, Dict[str, float]]:
+    """Download and parse the latest ECB reference FX rates."""
+    request = urllib.request.Request(
+        ECB_DAILY_RATES_URL,
+        headers={"User-Agent": FX_HTTP_USER_AGENT},
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        xml_payload = response.read().decode("utf-8")
+    return parse_ecb_reference_rates_xml(xml_payload)
+
+
+def derive_gbp_fx_rates(
+    euro_reference_rates: Mapping[str, float],
+    currencies: Iterable[str],
+) -> Dict[str, float]:
+    """Convert ECB EUR-based quotes into GBP-per-currency rates."""
+    gbp_per_eur = euro_reference_rates.get("GBP")
+    if gbp_per_eur is None:
+        raise ValueError("ECB FX payload does not include GBP")
+
+    rates: Dict[str, float] = {}
+    for currency in _normalize_currency_codes(currencies):
+        if currency == "EUR":
+            gbp_per_currency = gbp_per_eur
+        else:
+            eur_to_currency = euro_reference_rates.get(currency)
+            if eur_to_currency is None:
+                raise ValueError(f"ECB FX payload does not include {currency}")
+            gbp_per_currency = gbp_per_eur / eur_to_currency
+        rates[currency] = round(gbp_per_currency, 6)
+    return rates
+
+
+def save_fx_rates(path: Path, *, provider_date: str, rates: Mapping[str, float]) -> None:
+    """Persist GBP-based FX rates to YAML in canonical order."""
+    payload = {
+        "date": provider_date,
+        "base": "GBP",
+        "rates": {currency: float(rates[currency]) for currency in sorted(rates)},
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
 def investment_to_dict(investment: Investment) -> Dict[str, object]:
@@ -637,6 +765,27 @@ def tag_imported_investments(investments: Iterable[Investment], source_id: str) 
     return [replace(investment, source_id=source_id) for investment in investments]
 
 
+def cmd_fx_update(args: argparse.Namespace) -> int:
+    fx_path = Path(args.fx)
+    try:
+        currencies = (
+            _normalize_currency_codes(args.currency)
+            if args.currency
+            else resolve_tracked_fx_currencies(fx_path)
+        )
+        if not currencies:
+            raise ValueError("At least one currency must be specified or already tracked")
+        provider_date, euro_reference_rates = fetch_ecb_reference_rates()
+        gbp_rates = derive_gbp_fx_rates(euro_reference_rates, currencies)
+        save_fx_rates(fx_path, provider_date=provider_date, rates=gbp_rates)
+    except (FileNotFoundError, OSError, urllib.error.URLError, ValueError) as exc:
+        print(f"Failed to update FX rates: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Updated {fx_path} with {len(gbp_rates)} rate(s) dated {provider_date}")
+    return 0
+
+
 def cmd_categorize(args: argparse.Namespace) -> int:
     plan = load_portfolio_plan_from_yaml(args.plan, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     plan_index = PlanIndex.from_plan(plan)
@@ -827,6 +976,22 @@ def cmd_portfolio_add_instrument(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RiskBalancer CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    fx_parser = subparsers.add_parser("fx", help="Manage FX rate data")
+    fx_sub = fx_parser.add_subparsers(dest="fx_command", required=True)
+
+    fx_update = fx_sub.add_parser("update", help="Update private/fx.yaml from ECB reference rates")
+    fx_update.add_argument(
+        "--fx",
+        default=str(DEFAULT_FX_PATH),
+        help="Path to FX YAML (defaults to private/fx.yaml)",
+    )
+    fx_update.add_argument(
+        "--currency",
+        action="append",
+        help="Currency code to track; repeat to overwrite the tracked set",
+    )
+    fx_update.set_defaults(func=cmd_fx_update)
 
     categorize = subparsers.add_parser(
         "categorize", help="Assign categories to unmapped instruments"
