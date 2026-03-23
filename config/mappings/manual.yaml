@@ -1,0 +1,22 @@
+Cash:
+  allocations:
+  - category: Cash
+    weight: 1.0
+Gold:
+  allocations:
+  - category: Alternative / Gold
+    weight: 1.0
+Smart World:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 0.73
+  - category: Equities / Developed / EMEA / Non -UK
+    weight: 0.17
+  - category: Equities / Developed / Asia / Japan
+    weight: 0.07
+  - category: Equities / Developed / Asia / Ex-Japan
+    weight: 0.03
+Systematic:
+  allocations:
+  - category: Alternative / Systematic
+    weight: 1.0

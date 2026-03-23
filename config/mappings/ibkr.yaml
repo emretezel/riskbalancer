@@ -10,6 +10,10 @@ EMIM:
   allocations:
   - category: Equities / EM
     weight: 1.0
+GOOGL:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0
 HY9H:
   allocations:
   - category: Equities / Developed / Asia / Ex-Japan
@@ -41,6 +45,10 @@ ISF:
 IUVF:
   allocations:
   - category: Equities / Developed / NAM
+    weight: 1.0
+JNKE:
+  allocations:
+  - category: Bonds / Developed / Europe / High Yield
     weight: 1.0
 JNKEz:
   allocations:

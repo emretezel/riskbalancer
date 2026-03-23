@@ -18,7 +18,19 @@ EMIM:
   allocations:
   - category: Equities / EM
     weight: 1.0
+ENVA:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 1.0
 ERNS:
+  allocations:
+  - category: Bonds / Developed / UK / Govt
+    weight: 1.0
+GILI:
+  allocations:
+  - category: Bonds / Developed / UK / Inflation
+    weight: 1.0
+GILS:
   allocations:
   - category: Bonds / Developed / UK / Govt
     weight: 1.0
@@ -42,6 +54,14 @@ IGLS:
   allocations:
   - category: Bonds / Developed / UK / Govt
     weight: 1.0
+IGLT:
+  allocations:
+  - category: Bonds / Developed / UK / Govt
+    weight: 1.0
+IHYA:
+  allocations:
+  - category: Bonds / Developed / NAM / High Yield
+    weight: 1.0
 INXG:
   allocations:
   - category: Bonds / Developed / UK / Inflation
@@ -61,6 +81,10 @@ IUVF:
 JPEA:
   allocations:
   - category: Bonds / EM / Foreign / Govt
+    weight: 1.0
+LEMB:
+  allocations:
+  - category: Bonds / EM / Normal / Govt
     weight: 1.0
 LQDA:
   allocations:
@@ -82,14 +106,32 @@ SEML:
   allocations:
   - category: Bonds / EM / Normal / Govt
     weight: 1.0
+SHYG:
+  allocations:
+  - category: Bonds / Developed / NAM / High Yield
+    weight: 1.0
 SHYU:
   allocations:
   - category: Bonds / Developed / NAM / High Yield
+    weight: 1.0
+SLXX:
+  allocations:
+  - category: Bonds / Developed / UK / Corp
     weight: 1.0
 SMEA:
   allocations:
   - category: Equities / Developed / EMEA / Non -UK
     weight: 1.0
+SPAG:
+  allocations:
+  - category: Equities / Developed / NAM
+    weight: 0.62
+  - category: Equities / Developed / EMEA / Non -UK
+    weight: 0.05
+  - category: Equities / Developed / Asia / Japan
+    weight: 0.13
+  - category: Equities / Developed / Asia / Ex-Japan
+    weight: 0.2
 SSLN:
   allocations:
   - category: Alternative / Silver
