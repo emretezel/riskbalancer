@@ -28,7 +28,13 @@ from .adapters import (
     MS401KCSVAdapter,
     SchwabCSVAdapter,
 )
-from .configuration import load_portfolio_plan_from_yaml
+from .configuration import (
+    build_portfolio_plan_from_nodes,
+    collect_category_weight_validation_failures,
+    format_category_weight_validation_failures,
+    load_category_nodes_from_yaml,
+    load_portfolio_plan_from_yaml,
+)
 from .models import CategoryPath, Investment
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
@@ -908,7 +914,15 @@ def cmd_portfolio_report(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
     snapshot = load_portfolio_snapshot(portfolio_path)
     plan_path = Path(args.plan) if args.plan else _snapshot_plan_path(snapshot)
-    plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
+    category_nodes = load_category_nodes_from_yaml(plan_path)
+    validation_failures = collect_category_weight_validation_failures(category_nodes)
+    if validation_failures:
+        print(format_category_weight_validation_failures(validation_failures), file=sys.stderr)
+        return 1
+    plan = build_portfolio_plan_from_nodes(
+        category_nodes,
+        default_leaf_volatility=DEFAULT_LEAF_VOLATILITY,
+    )
     investments = investments_from_dicts(_snapshot_investments(snapshot))
     total_value, summary = summarize_portfolio(plan, investments)
     source_total_value, source_rows = summarize_sources(investments)

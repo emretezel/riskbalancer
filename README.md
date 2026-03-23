@@ -80,7 +80,7 @@ assets:
     adjustment: 1.0
 ```
 
-Use `load_portfolio_plan_from_yaml("config/categories.yaml", default_leaf_volatility=0.2)` to materialise a `PortfolioPlan`. Volatilities can be specified at any level; leaves that omit them fall back to the supplied default. Each leaf may declare an `adjustment` (default `1.0`) to scale its raw risk weight before the loader normalises the weights across all leaves. Every resulting `CategoryTarget` exposes both the raw `risk_weight` (product of weights × adjustment) and the `target_weight` (`normalized_risk_weight`). Weight validations tolerate small rounding errors (e.g., `33%` entries) but can be tightened by providing a smaller `tolerance`.
+Use `load_portfolio_plan_from_yaml("config/categories.yaml", default_leaf_volatility=0.2)` to materialise a `PortfolioPlan`. Volatilities can be specified at any level; leaves that omit them fall back to the supplied default. Each leaf may declare an `adjustment` (default `1.0`) to scale its raw risk weight before the loader normalises the weights across all leaves. Every resulting `CategoryTarget` exposes both the raw `risk_weight` (product of weights × adjustment) and the `target_weight` (`normalized_risk_weight`). Category sibling weights are validated strictly at every level, including the root `assets` list, and the loader reports every invalid total it finds.
 
 ### Installation
 
@@ -177,7 +177,7 @@ Use the `portfolio` command group to build a snapshot incrementally:
 Supporting commands:
 
 - `riskbalancer portfolio list` shows stored snapshots along with their associated plan files and timestamps.
-- `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, and prints both the risk-parity summary table (category label, raw/normalized risk weights, volatility, cash weights, actual vs. target GBP values, deltas) and a terminal-only GBP source breakdown by `source_id` plus aggregated manual holdings. The CSV export still contains only the category summary.
+- `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, validates that every category sibling set in the plan sums to 100%, and then prints both the risk-parity summary table (category label, raw/normalized risk weights, volatility, cash weights, actual vs. target GBP values, deltas) and a terminal-only GBP source breakdown by `source_id` plus aggregated manual holdings. If the plan is invalid, the command prints every weight-total failure and exits without producing the report or CSV export.
 - `riskbalancer portfolio delete --portfolio my-portfolio` removes a snapshot when you no longer need it.
 
 Portfolio files are JSON documents that capture normalized investments plus metadata such as the stored plan path, timestamps, and an `imports` list describing which broker statements have been loaded. Imported positions also store an optional `source_id`, which lets the CLI replace a single broker feed deterministically on re-import while leaving manual positions unchanged.

@@ -427,6 +427,168 @@ def test_cmd_portfolio_report_reads_legacy_snapshot_without_imports(tmp_path, ca
     assert "legacy" in captured.out
 
 
+def test_cmd_portfolio_report_rejects_invalid_top_level_weights(tmp_path, capsys):
+    plan_path = tmp_path / "invalid-root.yaml"
+    plan_path.write_text(
+        """
+assets:
+  - name: Equities
+    weight: 0.6
+    volatility: 0.2
+  - name: Bonds
+    weight: 0.6
+    volatility: 0.1
+""",
+        encoding="utf-8",
+    )
+    portfolio_path = tmp_path / "invalid-root.json"
+    portfolio_path.write_text(
+        json.dumps(
+            {
+                "plan": str(plan_path),
+                "created_at": "2026-03-23T12:00:00Z",
+                "investments": [
+                    {
+                        "instrument_id": "ETF",
+                        "description": "Holding",
+                        "market_value": 1000.0,
+                        "category": "Equities",
+                        "volatility": 0.2,
+                        "source": "legacy",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cmd_portfolio_report(
+        argparse.Namespace(
+            portfolio=str(portfolio_path),
+            plan=None,
+            export=None,
+        )
+    )
+
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Category weight validation failed:" in captured.err
+    assert "root assets totals 120.00%" in captured.err
+    assert "Loaded 1 investments" not in captured.out
+    assert "Source Breakdown (GBP)" not in captured.out
+
+
+def test_cmd_portfolio_report_rejects_invalid_nested_weights_and_skips_export(tmp_path, capsys):
+    plan_path = tmp_path / "invalid-nested.yaml"
+    export_path = tmp_path / "report.csv"
+    plan_path.write_text(
+        """
+assets:
+  - name: Equities
+    weight: 1.0
+    children:
+      - name: Developed
+        weight: 0.7
+        volatility: 0.2
+      - name: EM
+        weight: 0.2
+        volatility: 0.25
+""",
+        encoding="utf-8",
+    )
+    portfolio_path = tmp_path / "invalid-nested.json"
+    portfolio_path.write_text(
+        json.dumps(
+            {
+                "plan": str(plan_path),
+                "created_at": "2026-03-23T12:00:00Z",
+                "investments": [
+                    {
+                        "instrument_id": "ETF",
+                        "description": "Holding",
+                        "market_value": 1000.0,
+                        "category": "Equities / Developed",
+                        "volatility": 0.2,
+                        "source": "legacy",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cmd_portfolio_report(
+        argparse.Namespace(
+            portfolio=str(portfolio_path),
+            plan=None,
+            export=str(export_path),
+        )
+    )
+
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "Category weight validation failed:" in captured.err
+    assert "Equities totals 90.00%" in captured.err
+    assert "Category" not in captured.out
+    assert "Source Breakdown (GBP)" not in captured.out
+    assert not export_path.exists()
+
+
+def test_cmd_portfolio_report_lists_all_validation_failures(tmp_path, capsys):
+    plan_path = tmp_path / "invalid-multiple.yaml"
+    plan_path.write_text(
+        """
+assets:
+  - name: Equities
+    weight: 0.7
+    children:
+      - name: Developed
+        weight: 0.6
+        volatility: 0.2
+      - name: EM
+        weight: 0.2
+        volatility: 0.25
+  - name: Bonds
+    weight: 0.4
+    volatility: 0.1
+""",
+        encoding="utf-8",
+    )
+    portfolio_path = tmp_path / "invalid-multiple.json"
+    portfolio_path.write_text(
+        json.dumps(
+            {
+                "plan": str(plan_path),
+                "created_at": "2026-03-23T12:00:00Z",
+                "investments": [
+                    {
+                        "instrument_id": "ETF",
+                        "description": "Holding",
+                        "market_value": 1000.0,
+                        "category": "Equities / Developed",
+                        "volatility": 0.2,
+                        "source": "legacy",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cmd_portfolio_report(
+        argparse.Namespace(
+            portfolio=str(portfolio_path),
+            plan=None,
+            export=None,
+        )
+    )
+
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "root assets totals 110.00%" in captured.err
+    assert "Equities totals 80.00%" in captured.err
+
+
 def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "legacy.json"
     mapping_path = tmp_path / "broker.yaml"

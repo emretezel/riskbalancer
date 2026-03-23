@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from riskbalancer.configuration import load_portfolio_plan_from_yaml
+from riskbalancer.configuration import (
+    collect_category_weight_validation_failures,
+    format_category_weight_validation_failures,
+    load_category_nodes_from_yaml,
+    load_portfolio_plan_from_yaml,
+)
 
 CONFIG = Path("config") / "categories.yaml"
 
@@ -29,7 +34,7 @@ def test_load_portfolio_plan_from_yaml_generates_targets(tmp_path):
     assert math.isclose(bonds_emea_corp.risk_weight, 0.2 * 0.75 * 0.33 * 0.27 * 0.85)
 
 
-def test_top_level_weights_must_sum_to_one(tmp_path):
+def test_load_portfolio_plan_from_yaml_reports_root_weight_failure(tmp_path):
     bad_config = tmp_path / "bad.yaml"
     bad_config.write_text(
         """
@@ -41,8 +46,60 @@ assets:
 """,
         encoding="utf-8",
     )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="root assets totals 120.00%"):
         load_portfolio_plan_from_yaml(bad_config)
+
+
+def test_load_portfolio_plan_from_yaml_reports_nested_weight_failure(tmp_path):
+    bad_config = tmp_path / "bad-nested.yaml"
+    bad_config.write_text(
+        """
+assets:
+  - name: Equities
+    weight: 1.0
+    children:
+      - name: Developed
+        weight: 0.7
+      - name: EM
+        weight: 0.2
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="Equities totals 90.00%"):
+        load_portfolio_plan_from_yaml(bad_config)
+
+
+def test_collect_category_weight_validation_failures_returns_all_failures(tmp_path):
+    bad_config = tmp_path / "bad-multiple.yaml"
+    bad_config.write_text(
+        """
+assets:
+  - name: Equities
+    weight: 0.7
+    children:
+      - name: Developed
+        weight: 0.6
+      - name: EM
+        weight: 0.2
+  - name: Bonds
+    weight: 0.4
+""",
+        encoding="utf-8",
+    )
+
+    nodes = load_category_nodes_from_yaml(bad_config)
+    failures = collect_category_weight_validation_failures(nodes)
+
+    assert [failure.message() for failure in failures] == [
+        "root assets totals 110.00% (expected 100.00%)",
+        "Equities totals 80.00% (expected 100.00%)",
+    ]
+    assert (
+        format_category_weight_validation_failures(failures)
+        == "Category weight validation failed:\n"
+        "- root assets totals 110.00% (expected 100.00%)\n"
+        "- Equities totals 80.00% (expected 100.00%)"
+    )
 
 
 def test_adjustments_change_normalized_weights(tmp_path):

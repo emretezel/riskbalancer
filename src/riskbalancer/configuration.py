@@ -16,6 +16,7 @@ from .models import CategoryPath, CategoryTarget
 from .portfolio import PortfolioPlan
 
 Scalar = Union[float, int, str]
+WEIGHT_VALIDATION_TOLERANCE = 1e-6
 
 
 class LeafData(TypedDict):
@@ -24,6 +25,20 @@ class LeafData(TypedDict):
     risk_weight: float
     volatility: float
     adjustment: float
+
+
+@dataclass(frozen=True)
+class CategoryWeightValidationFailure:
+    """Describes a category sibling set whose weights do not sum to 100%."""
+
+    location: str
+    total: float
+    expected: float = 1.0
+
+    def message(self) -> str:
+        return (
+            f"{self.location} totals {self.total * 100:.2f}% (expected {self.expected * 100:.2f}%)"
+        )
 
 
 def _parse_weight(raw: Optional[Scalar]) -> float:
@@ -91,15 +106,6 @@ class CategoryNode:
             children=children,
         )
 
-    def validate(self, tolerance: float = 1e-6) -> None:
-        if not self.children:
-            return
-        total = sum(child.weight for child in self.children)
-        if abs(total - 1.0) > tolerance:
-            raise ValueError(f"Children of {self.name} must sum to 1, got {total}")
-        for child in self.children:
-            child.validate(tolerance)
-
     def collect_leaf_data(
         self,
         *,
@@ -137,32 +143,74 @@ class CategoryNode:
             )
 
 
-def load_category_nodes_from_yaml(path: Union[str, Path]) -> list[CategoryNode]:
-    """Load hierarchical category nodes from a YAML file."""
-    with open(path, "r", encoding="utf-8") as handle:
-        data = yaml.safe_load(handle)
-    if not data:
-        raise ValueError("Category configuration YAML is empty")
-    assets_data = data.get("assets", data)
-    if not isinstance(assets_data, list):
-        raise ValueError("Category configuration must define an 'assets' list")
-    nodes = [CategoryNode.from_mapping(entry) for entry in assets_data]
-    return nodes
+def _format_category_location(path: Sequence[str]) -> str:
+    """Render a human-readable location for a category sibling set."""
+    if not path:
+        return "root assets"
+    return " / ".join(path)
 
 
-def load_portfolio_plan_from_yaml(
-    path: Union[str, Path],
+def _collect_category_weight_validation_failures(
+    nodes: Sequence[CategoryNode],
     *,
-    tolerance: float = 2e-2,
+    parent_path: Sequence[str],
+    tolerance: float,
+    failures: List[CategoryWeightValidationFailure],
+) -> None:
+    total = sum(node.weight for node in nodes)
+    if abs(total - 1.0) > tolerance:
+        failures.append(
+            CategoryWeightValidationFailure(
+                location=_format_category_location(parent_path),
+                total=total,
+            )
+        )
+    for node in nodes:
+        if node.children:
+            _collect_category_weight_validation_failures(
+                node.children,
+                parent_path=(*parent_path, node.name),
+                tolerance=tolerance,
+                failures=failures,
+            )
+
+
+def collect_category_weight_validation_failures(
+    nodes: Sequence[CategoryNode],
+    *,
+    tolerance: float = WEIGHT_VALIDATION_TOLERANCE,
+) -> list[CategoryWeightValidationFailure]:
+    """Return all category sibling sets whose weights do not sum to 100%."""
+    failures: List[CategoryWeightValidationFailure] = []
+    _collect_category_weight_validation_failures(
+        nodes,
+        parent_path=(),
+        tolerance=tolerance,
+        failures=failures,
+    )
+    return failures
+
+
+def format_category_weight_validation_failures(
+    failures: Sequence[CategoryWeightValidationFailure],
+) -> str:
+    """Render category-weight failures for CLI and exception output."""
+    lines = ["Category weight validation failed:"]
+    lines.extend(f"- {failure.message()}" for failure in failures)
+    return "\n".join(lines)
+
+
+def build_portfolio_plan_from_nodes(
+    nodes: Sequence[CategoryNode],
+    *,
+    tolerance: float = WEIGHT_VALIDATION_TOLERANCE,
     default_leaf_volatility: float = 0.15,
 ) -> PortfolioPlan:
-    """Build a PortfolioPlan by flattening YAML category definitions."""
-    nodes = load_category_nodes_from_yaml(path)
-    total_top = sum(node.weight for node in nodes)
-    if abs(total_top - 1.0) > tolerance:
-        raise ValueError(f"Top level assets must sum to 1, got {total_top}")
-    for node in nodes:
-        node.validate(tolerance)
+    """Build a PortfolioPlan from already-loaded category nodes."""
+    failures = collect_category_weight_validation_failures(nodes, tolerance=tolerance)
+    if failures:
+        raise ValueError(format_category_weight_validation_failures(failures))
+
     leaf_data: List[LeafData] = []
     for node in nodes:
         node.collect_leaf_data(
@@ -186,3 +234,31 @@ def load_portfolio_plan_from_yaml(
         for item in leaf_data
     ]
     return PortfolioPlan(targets=category_targets, tolerance=tolerance)
+
+
+def load_category_nodes_from_yaml(path: Union[str, Path]) -> list[CategoryNode]:
+    """Load hierarchical category nodes from a YAML file."""
+    with open(path, "r", encoding="utf-8") as handle:
+        data = yaml.safe_load(handle)
+    if not data:
+        raise ValueError("Category configuration YAML is empty")
+    assets_data = data.get("assets", data)
+    if not isinstance(assets_data, list):
+        raise ValueError("Category configuration must define an 'assets' list")
+    nodes = [CategoryNode.from_mapping(entry) for entry in assets_data]
+    return nodes
+
+
+def load_portfolio_plan_from_yaml(
+    path: Union[str, Path],
+    *,
+    tolerance: float = WEIGHT_VALIDATION_TOLERANCE,
+    default_leaf_volatility: float = 0.15,
+) -> PortfolioPlan:
+    """Build a PortfolioPlan by flattening YAML category definitions."""
+    nodes = load_category_nodes_from_yaml(path)
+    return build_portfolio_plan_from_nodes(
+        nodes,
+        tolerance=tolerance,
+        default_leaf_volatility=default_leaf_volatility,
+    )
