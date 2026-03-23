@@ -3,6 +3,7 @@ RiskBalancer core package.
 
 Author: Emre Tezel
 """
+
 from .configuration import CategoryNode, load_portfolio_plan_from_yaml
 from .models import CategoryPath, CategoryStatus, CategoryTarget, Investment
 from .portfolio import Portfolio, PortfolioAnalyzer, PortfolioPlan

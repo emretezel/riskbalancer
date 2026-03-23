@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """
 Morgan Stanley 401(k) CSV adapter for RiskBalancer.
 
 Author: Emre Tezel
 """
+
+from __future__ import annotations
 
 import csv
 from pathlib import Path
@@ -69,7 +69,8 @@ class MS401KCSVAdapter(StatementAdapter):
         rate = self.fx_rates.get(currency)
         if rate is None:
             raise ValueError(
-                f"Missing FX rate for {currency}. Ensure config/fx.yaml contains entries for the statement currencies."
+                f"Missing FX rate for {currency}. "
+                "Ensure config/fx.yaml contains entries for the statement currencies."
             )
         return value * rate
 

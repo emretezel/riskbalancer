@@ -5,16 +5,13 @@ import pytest
 
 from riskbalancer.configuration import load_portfolio_plan_from_yaml
 
-
 CONFIG = Path("config") / "categories.yaml"
 
 
 def test_load_portfolio_plan_from_yaml_generates_targets(tmp_path):
     plan = load_portfolio_plan_from_yaml(CONFIG, default_leaf_volatility=0.25)
     targets = {target.path.label(): target for target in plan.targets}
-    assert math.isclose(
-        sum(target.target_weight for target in targets.values()), 1.0, abs_tol=5e-3
-    )
+    assert math.isclose(sum(target.target_weight for target in targets.values()), 1.0, abs_tol=5e-3)
 
     total_risk = sum(target.risk_weight for target in targets.values())
     equities_nam = targets["Equities / Developed / NAM"]

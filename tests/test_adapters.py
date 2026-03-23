@@ -9,7 +9,6 @@ from riskbalancer.adapters import (
     SchwabCSVAdapter,
 )
 
-
 FIXTURE = Path(__file__).parent / "fixtures" / "aj_bell_sample.csv"
 IBKR_FIXTURE = Path(__file__).parent / "fixtures" / "ibkr_sample.csv"
 MS401K_FIXTURE = Path(__file__).parent / "fixtures" / "ms401k_sample.csv"

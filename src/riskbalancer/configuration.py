@@ -1,22 +1,29 @@
-from __future__ import annotations
-
 """
 Configuration helpers for RiskBalancer category hierarchies.
 
 Author: Emre Tezel
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Mapping, Optional, Sequence, Union
+from typing import List, Mapping, Optional, Sequence, TypedDict, Union
 
 import yaml
 
 from .models import CategoryPath, CategoryTarget
 from .portfolio import PortfolioPlan
 
-
 Scalar = Union[float, int, str]
+
+
+class LeafData(TypedDict):
+    path: tuple[str, ...]
+    weight: float
+    risk_weight: float
+    volatility: float
+    adjustment: float
 
 
 def _parse_weight(raw: Optional[Scalar]) -> float:
@@ -100,7 +107,7 @@ class CategoryNode:
         parent_weight: float = 1.0,
         default_leaf_volatility: float = 0.15,
         inherited_volatility: Optional[float] = None,
-        accumulator: List[dict],
+        accumulator: List[LeafData],
     ) -> None:
         path = tuple(prefix) + (self.name,)
         absolute_weight = parent_weight * self.weight
@@ -156,7 +163,7 @@ def load_portfolio_plan_from_yaml(
         raise ValueError(f"Top level assets must sum to 1, got {total_top}")
     for node in nodes:
         node.validate(tolerance)
-    leaf_data = []
+    leaf_data: List[LeafData] = []
     for node in nodes:
         node.collect_leaf_data(
             prefix=(),

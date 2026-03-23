@@ -1,22 +1,22 @@
-from __future__ import annotations
-
 """
 RiskBalancer command-line interface utilities.
 
 Author: Emre Tezel
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
-import sys
 import json
+import sys
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Mapping
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, cast
 
 import yaml
-from collections import defaultdict
 
 from .adapters import (
     AJBellCSVAdapter,
@@ -248,6 +248,26 @@ def investments_to_dicts(investments: Iterable[Investment]) -> List[Dict[str, ob
     return [investment_to_dict(inv) for inv in investments]
 
 
+def _coerce_float(value: object, *, field_name: str) -> float:
+    """Convert JSON-loaded numeric payloads into floats."""
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise ValueError(f"{field_name} must be numeric")
+
+
+def _snapshot_investments(snapshot: Mapping[str, object]) -> List[Dict[str, object]]:
+    """Return stored investment payloads after validating their shape."""
+    raw_investments = snapshot.get("investments", [])
+    if not isinstance(raw_investments, list):
+        raise ValueError("Stored investments must be a list")
+    investments: List[Dict[str, object]] = []
+    for item in raw_investments:
+        if not isinstance(item, dict):
+            raise ValueError("Each stored investment must be an object")
+        investments.append(cast(Dict[str, object], item))
+    return investments
+
+
 def investment_from_dict(payload: Mapping[str, object]) -> Investment:
     """Hydrate an Investment from stored JSON data."""
     category_label = payload["category"]
@@ -256,9 +276,9 @@ def investment_from_dict(payload: Mapping[str, object]) -> Investment:
     return Investment(
         instrument_id=str(payload["instrument_id"]),
         description=str(payload.get("description", "")),
-        market_value=float(payload.get("market_value", 0.0)),
+        market_value=_coerce_float(payload.get("market_value", 0.0), field_name="market_value"),
         category=_parse_category_label(category_label),
-        volatility=float(payload.get("volatility", 0.0)) or 0.0001,
+        volatility=_coerce_float(payload.get("volatility", 0.0), field_name="volatility") or 0.0001,
         source=str(payload.get("source", "portfolio")),
     )
 
@@ -270,7 +290,7 @@ def investments_from_dicts(items: Iterable[Mapping[str, object]]) -> List[Invest
 
 def summarize_portfolio(plan, investments: List[Investment]):
     """Aggregate the portfolio and compute risk/cash weights + target values."""
-    totals = defaultdict(float)
+    totals: defaultdict[CategoryPath, float] = defaultdict(float)
     for investment in investments:
         totals[investment.category] += investment.market_value
     total_value = sum(totals.values())
@@ -379,6 +399,8 @@ def export_summary_to_csv(path: Path, rows: List[Dict[str, float]]) -> None:
                     row["actual_value"] - row["target_value"],
                 ]
             )
+
+
 def resolve_portfolio_path(value: str) -> Path:
     """Resolve portfolio names into JSON file paths."""
     path = Path(value)
@@ -415,7 +437,7 @@ def append_manual_investment(
     source: str = "manual",
 ) -> None:
     snapshot = load_portfolio_snapshot(path)
-    investments = snapshot.get("investments", [])
+    investments = _snapshot_investments(snapshot)
     investments.append(
         {
             "instrument_id": instrument_id,
@@ -444,7 +466,8 @@ def gather_missing_mappings(
     missing_list = sorted(set(missing))
     print("Assign categories (supports multiple allocations) for the following instruments.")
     print(
-        "Enter comma-separated category paths with optional weights (e.g., 'Equities / Developed / NAM=70, Equities / Developed / Europe=30')."
+        "Enter comma-separated category paths with optional weights "
+        "(e.g., 'Equities / Developed / NAM=70, Equities / Developed / Europe=30')."
     )
     print("Type 'list' to view options or 'quit' to abort.")
     labels = plan_index.available_labels()
@@ -496,7 +519,9 @@ def build_adapter(name: str, fx_rates: Optional[Dict[str, float]] = None):
     return adapter_cls(default_category=DEFAULT_CATEGORY)
 
 
-def parse_statement(statement_path: Path, adapter_name: str, fx_rates: Optional[Dict[str, float]] = None):
+def parse_statement(
+    statement_path: Path, adapter_name: str, fx_rates: Optional[Dict[str, float]] = None
+):
     adapter = build_adapter(adapter_name, fx_rates=fx_rates)
     return adapter.parse_path(statement_path)
 
@@ -557,11 +582,11 @@ def gather_investments_from_sources(
 
 
 def cmd_categorize(args: argparse.Namespace) -> int:
-    plan = load_portfolio_plan_from_yaml(
-        args.plan, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY
-    )
+    plan = load_portfolio_plan_from_yaml(args.plan, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     plan_index = PlanIndex.from_plan(plan)
-    mapping_path = Path(args.mappings) if args.mappings else Path(f"config/mappings/{args.adapter}.yaml")
+    mapping_path = (
+        Path(args.mappings) if args.mappings else Path(f"config/mappings/{args.adapter}.yaml")
+    )
     mapping_path.parent.mkdir(parents=True, exist_ok=True)
     mappings = load_mappings(mapping_path)
     fx_rates = load_fx_rates()
@@ -595,11 +620,12 @@ def cmd_portfolio_report(args: argparse.Namespace) -> int:
     if not portfolio_path.exists():
         raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
     snapshot = load_portfolio_snapshot(portfolio_path)
-    plan_path = Path(args.plan) if args.plan else Path(snapshot.get("plan", "config/categories.yaml"))
-    plan = load_portfolio_plan_from_yaml(
-        plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY
-    )
-    investments = investments_from_dicts(snapshot["investments"])
+    plan_value = snapshot.get("plan", "config/categories.yaml")
+    if not isinstance(plan_value, str):
+        raise ValueError("Stored plan path must be a string")
+    plan_path = Path(args.plan) if args.plan else Path(plan_value)
+    plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
+    investments = investments_from_dicts(_snapshot_investments(snapshot))
     total_value, summary = summarize_portfolio(plan, investments)
     print(f"Loaded {len(investments)} investments from {portfolio_path}")
     print_summary_table(total_value, summary)
@@ -683,7 +709,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RiskBalancer CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    categorize = subparsers.add_parser("categorize", help="Assign categories to unmapped instruments")
+    categorize = subparsers.add_parser(
+        "categorize", help="Assign categories to unmapped instruments"
+    )
     categorize.add_argument("--adapter", default="ajbell", choices=ADAPTERS.keys())
     categorize.add_argument("--statement", required=True, help="Path to broker CSV statement")
     categorize.add_argument(
@@ -732,7 +760,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     report.add_argument(
         "--plan",
-        help="Optional plan path override (defaults to plan stored with the portfolio or config/categories.yaml)",
+        help=(
+            "Optional plan path override "
+            "(defaults to the plan stored with the portfolio or config/categories.yaml)"
+        ),
     )
     report.add_argument(
         "--export", help="Optional CSV path to export the summary for Excel/analysis"
@@ -750,16 +781,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     delete.set_defaults(func=cmd_portfolio_delete)
 
-    add_manual = portfolio_sub.add_parser("add", help="Manually append an instrument to a portfolio")
+    add_manual = portfolio_sub.add_parser(
+        "add", help="Manually append an instrument to a portfolio"
+    )
     add_manual.add_argument("--portfolio", required=True, help="Portfolio name or path")
     add_manual.add_argument("--instrument-id", required=True)
     add_manual.add_argument("--description", required=True)
     add_manual.add_argument("--market-value", required=True, type=float)
-    add_manual.add_argument("--category", help="Optional category path(s); prompt/manual mappings used if omitted")
+    add_manual.add_argument(
+        "--category", help="Optional category path(s); prompt/manual mappings used if omitted"
+    )
     add_manual.add_argument(
         "--plan",
         default="config/categories.yaml",
-        help="Path to categories YAML used when capturing manual mappings (defaults to config/categories.yaml)",
+        help=(
+            "Path to categories YAML used when capturing manual mappings "
+            "(defaults to config/categories.yaml)"
+        ),
     )
     add_manual.set_defaults(func=cmd_portfolio_add_instrument)
     return parser

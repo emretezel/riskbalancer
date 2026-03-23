@@ -1,14 +1,14 @@
-from __future__ import annotations
-
 """
 Interactive Brokers CSV adapter for RiskBalancer.
 
 Author: Emre Tezel
 """
 
+from __future__ import annotations
+
 import csv
 from pathlib import Path
-from typing import Iterable, Mapping, Optional, Sequence, TextIO, Union
+from typing import Mapping, Optional, Sequence, TextIO, Union
 
 from ..models import CategoryPath, Investment
 from .base import StatementAdapter
@@ -36,7 +36,6 @@ class IBKRCSVAdapter(StatementAdapter):
     def parse_file(self, handle: TextIO) -> Sequence[Investment]:
         reader = csv.reader(handle)
         in_positions = False
-        header: Sequence[str] | None = None
         investments: list[Investment] = []
         rows = list(reader)
         idx = 0
@@ -47,7 +46,6 @@ class IBKRCSVAdapter(StatementAdapter):
             if section == "Positions and Mark-to-Market Profit and Loss":
                 kind = row[1]
                 if kind == "Header":
-                    header = row
                     in_positions = True
                     idx += 1
                     continue
@@ -58,7 +56,6 @@ class IBKRCSVAdapter(StatementAdapter):
                         investments.append(entry)
             else:
                 in_positions = False
-                header = None
             idx += 1
         return investments
 
@@ -66,7 +63,6 @@ class IBKRCSVAdapter(StatementAdapter):
         if len(row) < 18:
             return None
         discriminator = row[2]
-        asset_class = row[3]
         currency = (row[4] or "").strip().upper()
         symbol = (row[5] or "").strip()
         description = (row[6] or "").strip()
@@ -91,7 +87,8 @@ class IBKRCSVAdapter(StatementAdapter):
             return value
         if not self.fx_rates:
             raise ValueError(
-                f"FX rates are required to convert {currency} to GBP. Supply --fx when building the portfolio."
+                f"FX rates are required to convert {currency} to GBP. "
+                "Supply --fx when building the portfolio."
             )
         rate = self.fx_rates.get(currency)
         if rate is None:

@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from riskbalancer import CategoryPath
 from riskbalancer.cli import (
     CategoryAllocation,
@@ -46,7 +44,9 @@ def test_gather_missing_mappings_validates_inputs(monkeypatch, tmp_path):
             "0.3",
         ]
     )
-    result = gather_missing_mappings(["AMD"], plan_index=plan_index, input_func=lambda prompt="": next(inputs))
+    result = gather_missing_mappings(
+        ["AMD"], plan_index=plan_index, input_func=lambda prompt="": next(inputs)
+    )
     mapping = result["AMD"]
     assert len(mapping.allocations) == 1
     assert mapping.allocations[0].path.levels() == ("Equities", "Developed", "NAM")

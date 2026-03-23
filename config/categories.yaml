@@ -42,7 +42,7 @@ assets:
     weight: 0.75
     children:
     - name: NAM
-      weight: 0.33
+      weight: 0.34
       children:
       - name: Govt
         weight: 0.36

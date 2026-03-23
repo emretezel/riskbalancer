@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """
 AJ Bell statement adapter for RiskBalancer.
 
 Author: Emre Tezel
 """
+
+from __future__ import annotations
 
 import csv
 from pathlib import Path
@@ -24,9 +24,7 @@ class AJBellCSVAdapter(StatementAdapter):
         default_volatility: float = 0.2,
     ):
         super().__init__("AJ Bell CSV")
-        self.default_category = default_category or CategoryPath(
-            "Uncategorized", "Pending Review"
-        )
+        self.default_category = default_category or CategoryPath("Uncategorized", "Pending Review")
         self.default_volatility = default_volatility
 
     def parse_path(self, path: Union[str, Path]) -> Sequence[Investment]:

@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """
 Abstract base classes for RiskBalancer statement adapters.
 
 Author: Emre Tezel
 """
+
+from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path

@@ -1,10 +1,10 @@
-from __future__ import annotations
-
 """
 Charles Schwab positions CSV adapter for RiskBalancer.
 
 Author: Emre Tezel
 """
+
+from __future__ import annotations
 
 import csv
 from pathlib import Path
