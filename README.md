@@ -177,7 +177,7 @@ Use the `portfolio` command group to build a snapshot incrementally:
 Supporting commands:
 
 - `riskbalancer portfolio list` shows stored snapshots along with their associated plan files and timestamps.
-- `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, and produces (and optionally exports) the risk-parity summary table (category label, raw/normalized risk weights, volatility, cash weights, actual vs. target GBP values, deltas).
+- `riskbalancer portfolio report --portfolio my-portfolio [--plan config/categories.yaml] [--export reports/my-portfolio.csv]` reloads the stored investments, optionally overrides the plan path, and prints both the risk-parity summary table (category label, raw/normalized risk weights, volatility, cash weights, actual vs. target GBP values, deltas) and a terminal-only GBP source breakdown by `source_id` plus aggregated manual holdings. The CSV export still contains only the category summary.
 - `riskbalancer portfolio delete --portfolio my-portfolio` removes a snapshot when you no longer need it.
 
 Portfolio files are JSON documents that capture normalized investments plus metadata such as the stored plan path, timestamps, and an `imports` list describing which broker statements have been loaded. Imported positions also store an optional `source_id`, which lets the CLI replace a single broker feed deterministically on re-import while leaving manual positions unchanged.

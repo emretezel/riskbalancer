@@ -561,6 +561,34 @@ def print_summary_table(total_value: float, rows: List[Dict[str, float]]) -> Non
     print(f"{'Total Portfolio Value:':>110} {total_value:14,.2f}")
 
 
+def summarize_sources(investments: Iterable[Investment]) -> tuple[float, List[tuple[str, float]]]:
+    """Aggregate GBP market values by source label for terminal reporting."""
+    totals: defaultdict[str, float] = defaultdict(float)
+    total_value = 0.0
+    for investment in investments:
+        if investment.source == "manual":
+            label = "manual"
+        elif investment.source_id:
+            label = investment.source_id
+        else:
+            label = investment.source or "unknown"
+        totals[label] += investment.market_value
+        total_value += investment.market_value
+
+    rows = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+    return total_value, rows
+
+
+def print_source_breakdown(total_value: float, rows: List[tuple[str, float]]) -> None:
+    header = f"{'Source Breakdown (GBP)':40}{'Market Value £':>18}"
+    print(header)
+    print("-" * len(header))
+    for label, market_value in rows:
+        print(f"{label:40}{market_value:18,.2f}")
+    print("-" * len(header))
+    print(f"{'Total':40}{total_value:18,.2f}")
+
+
 def export_summary_to_csv(path: Path, rows: List[Dict[str, float]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as handle:
@@ -883,8 +911,11 @@ def cmd_portfolio_report(args: argparse.Namespace) -> int:
     plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     investments = investments_from_dicts(_snapshot_investments(snapshot))
     total_value, summary = summarize_portfolio(plan, investments)
+    source_total_value, source_rows = summarize_sources(investments)
     print(f"Loaded {len(investments)} investments from {portfolio_path}")
     print_summary_table(total_value, summary)
+    print()
+    print_source_breakdown(source_total_value, source_rows)
     if args.export:
         export_summary_to_csv(Path(args.export), summary)
         print(f"Wrote summary to {args.export}")
@@ -1089,7 +1120,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_manual.add_argument("--description", required=True)
     add_manual.add_argument("--market-value", required=True, type=float)
     add_manual.add_argument(
-        "--category", help="Optional category path(s); prompt/manual mappings used if omitted"
+        "--category",
+        help="Optional category path(s); prompt/manual mappings used if omitted",
     )
     add_manual.set_defaults(func=cmd_portfolio_add_instrument)
     return parser

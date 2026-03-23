@@ -92,6 +92,22 @@ def test_build_parser_replaces_build_with_create_and_import():
     )
     assert import_args.source_id == "ajbell-sipp"
 
+    add_args = parser.parse_args(
+        [
+            "portfolio",
+            "add",
+            "--portfolio",
+            "demo",
+            "--instrument-id",
+            "CASH_GBP",
+            "--description",
+            "GBP Cash",
+            "--market-value",
+            "1000",
+        ]
+    )
+    assert add_args.category is None
+
     try:
         parser.parse_args(["portfolio", "build"])
     except SystemExit as exc:
@@ -407,6 +423,8 @@ def test_cmd_portfolio_report_reads_legacy_snapshot_without_imports(tmp_path, ca
     assert result == 0
     captured = capsys.readouterr()
     assert "Loaded 1 investments" in captured.out
+    assert "Source Breakdown (GBP)" in captured.out
+    assert "legacy" in captured.out
 
 
 def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, monkeypatch):
@@ -476,6 +494,147 @@ def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, 
     assert snapshot["imports"][0]["source_id"] == "ajbell-sipp"
     assert {entry["source"] for entry in snapshot["investments"]} == {"manual", "ajbell"}
     assert {entry.get("source_id") for entry in snapshot["investments"]} == {None, "ajbell-sipp"}
+
+
+def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tmp_path, capsys):
+    portfolio_path = tmp_path / "report.json"
+    export_path = tmp_path / "report.csv"
+    portfolio_path.write_text(
+        json.dumps(
+            {
+                "plan": "config/categories.yaml",
+                "created_at": "2026-03-23T12:00:00Z",
+                "imports": [
+                    {
+                        "source_id": "ibkr-taxable",
+                        "adapter": "ibkr",
+                        "statement": "ibkr.csv",
+                        "mappings": "config/mappings/ibkr.yaml",
+                        "imported_at": "2026-03-23T12:00:00Z",
+                    },
+                    {
+                        "source_id": "ajbell-sipp",
+                        "adapter": "ajbell",
+                        "statement": "ajbell.csv",
+                        "mappings": "config/mappings/ajbell.yaml",
+                        "imported_at": "2026-03-23T12:01:00Z",
+                    },
+                ],
+                "investments": [
+                    {
+                        "instrument_id": "AAA",
+                        "description": "IBKR Holding",
+                        "market_value": 700.0,
+                        "category": "Equities / Developed / NAM",
+                        "volatility": 0.2,
+                        "source": "ibkr",
+                        "source_id": "ibkr-taxable",
+                    },
+                    {
+                        "instrument_id": "BBB",
+                        "description": "AJ Bell Holding",
+                        "market_value": 500.0,
+                        "category": "Equities / Developed / Europe",
+                        "volatility": 0.25,
+                        "source": "aj_bell",
+                        "source_id": "ajbell-sipp",
+                    },
+                    {
+                        "instrument_id": "CASH1",
+                        "description": "Manual Cash",
+                        "market_value": 300.0,
+                        "category": "Cash",
+                        "volatility": 0.15,
+                        "source": "manual",
+                    },
+                    {
+                        "instrument_id": "GOLD",
+                        "description": "Manual Gold",
+                        "market_value": 200.0,
+                        "category": "Alternative / Gold",
+                        "volatility": 0.15,
+                        "source": "manual",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cmd_portfolio_report(
+        argparse.Namespace(
+            portfolio=str(portfolio_path),
+            plan=None,
+            export=str(export_path),
+        )
+    )
+
+    assert result == 0
+    captured = capsys.readouterr()
+    assert "Source Breakdown (GBP)" in captured.out
+    assert "ibkr-taxable" in captured.out
+    assert "ajbell-sipp" in captured.out
+    assert "manual" in captured.out
+    assert "1,700.00" in captured.out
+    csv_output = export_path.read_text(encoding="utf-8")
+    assert "Category,RiskWeightRaw" in csv_output
+    assert "Source Breakdown" not in csv_output
+
+
+def test_cmd_portfolio_report_source_breakdown_sorts_by_value(tmp_path, capsys):
+    portfolio_path = tmp_path / "sorting.json"
+    portfolio_path.write_text(
+        json.dumps(
+            {
+                "plan": "config/categories.yaml",
+                "created_at": "2026-03-23T12:00:00Z",
+                "investments": [
+                    {
+                        "instrument_id": "AAA",
+                        "description": "Small Imported",
+                        "market_value": 100.0,
+                        "category": "Equities / Developed / NAM",
+                        "volatility": 0.2,
+                        "source": "ajbell",
+                        "source_id": "small-source",
+                    },
+                    {
+                        "instrument_id": "BBB",
+                        "description": "Large Imported",
+                        "market_value": 900.0,
+                        "category": "Equities / Developed / Europe",
+                        "volatility": 0.25,
+                        "source": "ibkr",
+                        "source_id": "large-source",
+                    },
+                    {
+                        "instrument_id": "CCC",
+                        "description": "Manual Cash",
+                        "market_value": 400.0,
+                        "category": "Cash",
+                        "volatility": 0.15,
+                        "source": "manual",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = cmd_portfolio_report(
+        argparse.Namespace(
+            portfolio=str(portfolio_path),
+            plan=None,
+            export=None,
+        )
+    )
+
+    assert result == 0
+    captured = capsys.readouterr()
+    large_idx = captured.out.index("large-source")
+    manual_idx = captured.out.index("manual")
+    small_idx = captured.out.index("small-source")
+    assert large_idx < manual_idx < small_idx
 
 
 def test_summarize_portfolio_calculates_cash_and_targets():
