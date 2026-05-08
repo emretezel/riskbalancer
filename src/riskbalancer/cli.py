@@ -1258,19 +1258,49 @@ def cmd_user_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -
     if not root.exists():
         print("No stored users.")
         return 0
+    # Each subdirectory of `private/users/` is a user. We deliberately do not
+    # filter by `portfolio.json` here: a user created via `user create` (or one
+    # that has only had `plan create` run against them) should still be
+    # discoverable, otherwise the freshly-bootstrapped user is invisible.
     candidates = sorted(child for child in root.iterdir() if child.is_dir())
-    listed = 0
+    if not candidates:
+        print("No stored users.")
+        return 0
     for user_dir in candidates:
         portfolio_file = user_dir / "portfolio.json"
-        if not portfolio_file.exists():
-            continue
-        snapshot = load_portfolio_snapshot(portfolio_file)
-        created = snapshot.get("created_at", "?")
-        plan = snapshot.get("plan", "?")
-        print(f"{user_dir.name:<25} plan={plan} created={created}")
-        listed += 1
-    if listed == 0:
-        print("No stored users.")
+        if portfolio_file.exists():
+            snapshot = load_portfolio_snapshot(portfolio_file)
+            created = snapshot.get("created_at", "?")
+            plan = snapshot.get("plan", "?")
+            print(f"{user_dir.name:<25} plan={plan} created={created}")
+        else:
+            print(f"{user_dir.name:<25} (no portfolio yet)")
+    return 0
+
+
+def cmd_user_create(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """Create an empty user directory under `private/users/`.
+
+    Plan bootstrap is intentionally not part of this command — `plan create`
+    owns that flow. The `user create` step is the explicit on-ramp that gives
+    a household member a home on disk before any other per-user command runs.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
+    if paths.user_dir.exists():
+        print(
+            f"User directory {paths.user_dir} already exists. "
+            f"Use `riskbalancer user delete --user {paths.user} --confirm` first "
+            "if you really want to start over.",
+            file=sys.stderr,
+        )
+        return 1
+    # Only the user dir itself — `statements/`, `mappings/`, `reports/` are
+    # created lazily by their owning commands, matching the rest of the CLI.
+    paths.user_dir.mkdir(parents=True, exist_ok=False)
+    print(f"Created {paths.user_dir}")
+    print(f"Next: riskbalancer plan create --user {paths.user} (or --from <peer>)")
     return 0
 
 
@@ -1516,6 +1546,12 @@ def build_parser() -> argparse.ArgumentParser:
     user_sub = user_parser.add_subparsers(dest="user_command", required=True)
     user_list = user_sub.add_parser("list", help="List stored users")
     user_list.set_defaults(func=cmd_user_list)
+    user_create = user_sub.add_parser(
+        "create",
+        parents=[user_parent],
+        help="Create an empty user directory under private/users/",
+    )
+    user_create.set_defaults(func=cmd_user_create)
     user_delete = user_sub.add_parser(
         "delete",
         parents=[user_parent],

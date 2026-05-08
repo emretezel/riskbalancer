@@ -66,13 +66,16 @@ message asking for `--user`; `fx update` and `user list` still work.
 Onboarding a new household member from zero to first report:
 
 ```bash
-# 1. Bootstrap their plan. Either clone an existing one as a starting point
+# 1. Register the user on disk.
+riskbalancer user create --user wife
+
+# 2. Bootstrap their plan. Either clone an existing one as a starting point
 #    or walk the catalog interactively.
 riskbalancer plan create --user wife --from emre
 # OR
 riskbalancer plan create --user wife
 
-# 2. Drop a broker statement anywhere on disk (download, inbox, etc.) and
+# 3. Drop a broker statement anywhere on disk (download, inbox, etc.) and
 #    import it. The CLI auto-files the statement under
 #    private/users/wife/statements/<adapter>/<account>/<YYYY>/<MM>/ using
 #    today's date and creates private/users/wife/portfolio.json on first
@@ -84,7 +87,7 @@ riskbalancer portfolio import \
   --account isa \
   --statement ~/Downloads/wife-isa-snapshot.csv
 
-# 3. Optional: add manual holdings (cash, gold, alternatives).
+# 4. Optional: add manual holdings (cash, gold, alternatives).
 riskbalancer portfolio add \
   --user wife \
   --instrument-id GOLD \
@@ -92,7 +95,7 @@ riskbalancer portfolio add \
   --market-value 5000 \
   --category "Alternative / Gold"
 
-# 4. Run the report (use bare --export to land at
+# 5. Run the report (use bare --export to land at
 #    private/users/wife/reports/<today>.csv).
 riskbalancer portfolio report --user wife --export
 ```
@@ -204,6 +207,7 @@ override.
 ## Supporting Commands
 
 ```bash
-riskbalancer user list                           # list all users with portfolios
+riskbalancer user create --user wife             # register a new user on disk
+riskbalancer user list                           # list every user under private/users/
 riskbalancer user delete --user wife --confirm   # wipe a user's directory
 ```
