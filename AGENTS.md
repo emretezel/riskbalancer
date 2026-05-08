@@ -39,7 +39,6 @@ The current top-level shape of the codebase is:
   - `fx.example.yaml` — FX template.
 - `private/` — gitignored local data:
   - `fx.yaml` — shared GBP FX rates.
-  - `inbox/` — shared landing zone for unfiled statements.
   - `users/<user>/` — per-user `plan.yaml`, `portfolio.json`, `mappings/`,
     `statements/`, `reports/`.
 - `tests/` — pytest suite mirroring the source tree.
@@ -158,7 +157,6 @@ This project has no database. All persistent state is stored in human-readable f
 | Per-user statements | `private/users/<user>/statements/<broker>/...` | broker-native, **gitignored** |
 | Per-user reports | `private/users/<user>/reports/<YYYY-MM-DD>.csv` | CSV, **gitignored** |
 | Shared FX rates | `private/fx.yaml` | YAML, **gitignored** |
-| Statements awaiting triage | `private/inbox/` | broker-native, **gitignored** |
 
 Persistence rules:
 

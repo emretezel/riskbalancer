@@ -16,7 +16,6 @@ The on-disk layout is:
 
     private/                         (gitignored)
         fx.yaml                      # SHARED FX rates across all users
-        inbox/                       # SHARED landing zone for unfiled statements
         users/<user>/
             plan.yaml                # this user's category plan
             portfolio.json           # this user's portfolio snapshot

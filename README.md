@@ -17,7 +17,6 @@ when needed, and compares actual holdings against risk-parity targets.
 │   └── fx.example.yaml                  # FX template
 ├── private/                             # gitignored
 │   ├── fx.yaml                          # shared GBP FX rates (one file across all users)
-│   ├── inbox/                           # shared landing zone for unfiled statements
 │   └── users/<user>/
 │       ├── plan.yaml                    # this user's category plan (target weights)
 │       ├── portfolio.json               # this user's portfolio snapshot
@@ -75,8 +74,8 @@ riskbalancer plan create --user wife --from emre
 # OR
 riskbalancer plan create --user wife
 
-# 3. Drop a broker statement anywhere on disk (download, inbox, etc.) and
-#    import it. The CLI auto-files the statement under
+# 3. Drop a broker statement anywhere on disk and import it. The CLI
+#    auto-files the statement under
 #    private/users/wife/statements/<adapter>/<account>/<YYYY>/<MM>/ using
 #    today's date and creates private/users/wife/portfolio.json on first
 #    run. The source file stays put unless you pass --move.
@@ -143,8 +142,7 @@ FX is not per-user — exchange rates are the same for everyone. This writes
 ### 3. Import each statement (auto-files into the user's directory)
 
 Point `--statement` at any path on disk — typically wherever your broker
-left it (`~/Downloads/...`) or your shared `private/inbox/` triage area.
-The CLI copies the statement under
+left it (`~/Downloads/...`). The CLI copies the statement under
 `private/users/<user>/statements/<adapter>/<account>/<YYYY>/<MM>/` using
 today's date as the year/month folder, creating directories as needed:
 
