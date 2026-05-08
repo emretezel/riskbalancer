@@ -32,7 +32,9 @@ The current top-level shape of the codebase is:
   construction and the `plan create` interactive walker).
 - `config/` — committed configuration:
   - `seed_plan.yaml` — catalog floor for the very first user.
-  - `riskbalancer.yaml` — holds `default_user`.
+  - `riskbalancer.example.yaml` — committed template for
+    `riskbalancer.yaml`. The runtime file (`config/riskbalancer.yaml`)
+    is gitignored so personal defaults never leave the local clone.
   - `mappings/<adapter>.yaml` — shared adapter mappings.
   - `fx.example.yaml` — FX template.
 - `private/` — gitignored local data:
@@ -145,7 +147,8 @@ This project has no database. All persistent state is stored in human-readable f
 | Concern | Location | Format |
 |---|---|---|
 | Catalog floor (committed default plan) | `config/seed_plan.yaml` | YAML, committed |
-| Default-user pointer | `config/riskbalancer.yaml` | YAML, committed |
+| Default-user template (committed) | `config/riskbalancer.example.yaml` | YAML, committed |
+| Default-user pointer (local) | `config/riskbalancer.yaml` | YAML, **gitignored** |
 | Shared adapter mappings | `config/mappings/<adapter>.yaml` | YAML, committed |
 | FX template | `config/fx.example.yaml` | YAML, committed |
 | Per-user category plan | `private/users/<user>/plan.yaml` | YAML, **gitignored** |

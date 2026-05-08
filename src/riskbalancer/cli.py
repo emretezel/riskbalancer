@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
 import sys
 import urllib.error
 import urllib.request
@@ -70,6 +71,78 @@ def _default_paths() -> UserPaths:
     """Fallback `UserPaths` for tests that do not pass an explicit `paths`."""
     user = resolve_default_user() or ""
     return UserPaths.for_user(user)
+
+
+def _ingestion_now() -> datetime:
+    """The "current" time used for statement filing.
+
+    Wrapped in a function so tests can monkeypatch it to a frozen value
+    without freezing every other clock in the module.
+    """
+    return datetime.now(UTC)
+
+
+def _autofile_statement(
+    source: Path,
+    paths: UserPaths,
+    *,
+    adapter: str,
+    account: str,
+    move: bool = False,
+) -> Path:
+    """File a statement under `<statements_dir>/<adapter>/<account>/<YYYY>/<MM>/`.
+
+    Returns the canonical path the import workflow should use. When the
+    source already lives under `paths.statements_dir`, it is left alone and
+    returned as-is (the user pre-filed it manually). Otherwise the source
+    is copied (or moved when `move=True`) into a year/month folder named
+    after the current ingestion date, with a numeric suffix appended on
+    filename conflict.
+    """
+    source = source.resolve()
+    statements_root = paths.statements_dir.resolve()
+    try:
+        source.relative_to(statements_root)
+        return source
+    except ValueError:
+        pass  # source is outside the user's statements tree → file it.
+
+    now = _ingestion_now()
+    dest_dir = paths.statements_dir / adapter / account / f"{now.year:04d}" / f"{now.month:02d}"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    destination = dest_dir / source.name
+    counter = 2
+    while destination.exists():
+        destination = dest_dir / f"{source.stem}-{counter}{source.suffix}"
+        counter += 1
+        if counter > 1000:
+            raise RuntimeError(f"Refusing to find a free name in {dest_dir} after 1000 attempts")
+
+    if move:
+        shutil.move(str(source), str(destination))
+    else:
+        shutil.copy2(str(source), str(destination))
+    return destination
+
+
+def _require_user(paths: UserPaths) -> bool:
+    """Return True when `paths.user` is set, otherwise print a clear error.
+
+    Every user-keyed command must call this before touching per-user paths.
+    With an empty user, `UserPaths` produces nonsensical paths that resolve
+    to `private/users` itself — running into one of those produces either a
+    confusing FileNotFoundError or, worse, silent writes to the users root.
+    """
+    if paths.user:
+        return True
+    print(
+        "No user resolved. Pass --user <name>, set RISKBALANCER_USER, or copy "
+        "config/riskbalancer.example.yaml to config/riskbalancer.yaml and set "
+        "default_user.",
+        file=sys.stderr,
+    )
+    return False
 
 
 ADAPTERS = {
@@ -940,6 +1013,8 @@ def cmd_fx_update(args: argparse.Namespace, paths: Optional[UserPaths] = None) -
 
 def cmd_categorize(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
     plan_arg = getattr(args, "plan", None)
     plan_path = Path(plan_arg) if plan_arg else _resolve_user_plan_path(paths)
     plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
@@ -995,17 +1070,30 @@ def _ensure_portfolio_exists(paths: UserPaths) -> None:
 
 def cmd_portfolio_import(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
     _ensure_portfolio_exists(paths)
     snapshot = load_portfolio_snapshot(paths.portfolio)
     plan_path = _snapshot_plan_path(snapshot, fallback=_resolve_user_plan_path(paths))
     plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     plan_index = PlanIndex.from_plan(plan)
 
+    canonical_statement = _autofile_statement(
+        Path(args.statement),
+        paths,
+        adapter=args.adapter,
+        account=args.account,
+        move=bool(getattr(args, "move", False)),
+    )
+    if canonical_statement != Path(args.statement).resolve():
+        action = "Moved" if getattr(args, "move", False) else "Copied"
+        print(f"{action} statement to {canonical_statement}")
+
     mappings, write_path = resolve_mapping_sources(
         args.adapter, args.mappings, paths, log_overrides=True
     )
     fx_rates = load_fx_rates(args.fx, paths=paths)
-    parsed_investments = parse_statement(Path(args.statement), args.adapter, fx_rates=fx_rates)
+    parsed_investments = parse_statement(canonical_statement, args.adapter, fx_rates=fx_rates)
     mappings, new_count = ensure_mappings_for_investments(
         parsed_investments,
         write_path,
@@ -1030,7 +1118,7 @@ def cmd_portfolio_import(args: argparse.Namespace, paths: Optional[UserPaths] = 
         ImportRecord(
             source_id=args.source_id,
             adapter=args.adapter,
-            statement=str(Path(args.statement)),
+            statement=str(canonical_statement),
             mappings=str(write_path),
             imported_at=_utc_timestamp(),
         )
@@ -1047,7 +1135,7 @@ def cmd_portfolio_import(args: argparse.Namespace, paths: Optional[UserPaths] = 
     if new_count:
         print(f"Stored {new_count} new mapping(s) in {write_path}.")
     print(
-        f"Imported {len(imported_investments)} position(s) from {args.statement} "
+        f"Imported {len(imported_investments)} position(s) from {canonical_statement} "
         f"into {paths.portfolio} as '{args.source_id}'."
     )
     return 0
@@ -1071,6 +1159,8 @@ def _resolve_export_path(args: argparse.Namespace, paths: UserPaths) -> Optional
 
 def cmd_portfolio_report(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
     if not paths.portfolio.exists():
         raise FileNotFoundError(f"Portfolio file {paths.portfolio} not found")
     snapshot = load_portfolio_snapshot(paths.portfolio)
@@ -1105,11 +1195,7 @@ def cmd_portfolio_report(args: argparse.Namespace, paths: Optional[UserPaths] = 
 
 def cmd_plan_create(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     paths = paths if paths is not None else _paths_from_args(args)
-    if not paths.user:
-        print(
-            "plan create requires a --user (or RISKBALANCER_USER / default_user)",
-            file=sys.stderr,
-        )
+    if not _require_user(paths):
         return 1
     overwrite = bool(getattr(args, "overwrite", False))
     if paths.plan.exists() and not overwrite:
@@ -1151,6 +1237,8 @@ def _iter_leaves(nodes: Iterable) -> Iterable:
 def cmd_plan_validate(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     paths = paths if paths is not None else _paths_from_args(args)
     explicit = getattr(args, "path", None)
+    if not explicit and not _require_user(paths):
+        return 1
     plan_path = Path(explicit) if explicit else paths.plan
     if not plan_path.exists():
         print(f"Plan file {plan_path} not found", file=sys.stderr)
@@ -1188,6 +1276,8 @@ def cmd_user_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -
 
 def cmd_user_delete(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
     if not paths.user_dir.exists():
         raise FileNotFoundError(f"User directory {paths.user_dir} not found")
     if not getattr(args, "confirm", False):
@@ -1206,6 +1296,8 @@ def cmd_portfolio_add_instrument(
     args: argparse.Namespace, paths: Optional[UserPaths] = None
 ) -> int:
     paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
     _ensure_portfolio_exists(paths)
     snapshot = load_portfolio_snapshot(paths.portfolio)
     plan_path = _snapshot_plan_path(snapshot, fallback=_resolve_user_plan_path(paths))
@@ -1325,7 +1417,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     portfolio_import.add_argument("--source-id", required=True, help="Stable source identifier")
     portfolio_import.add_argument("--adapter", required=True, choices=ADAPTERS.keys())
+    portfolio_import.add_argument(
+        "--account",
+        required=True,
+        help=(
+            "Account name (the second path segment under <broker>, e.g. sipp/isa/taxable). "
+            "Used to file the statement under "
+            "private/users/<user>/statements/<adapter>/<account>/<YYYY>/<MM>/."
+        ),
+    )
     portfolio_import.add_argument("--statement", required=True, help="Path to broker CSV statement")
+    portfolio_import.add_argument(
+        "--move",
+        action="store_true",
+        help=(
+            "Remove the source statement after copying it into the user's "
+            "statements tree. Default is to keep the source intact."
+        ),
+    )
     portfolio_import.add_argument(
         "--mappings",
         help=(

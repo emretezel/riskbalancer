@@ -1,6 +1,0 @@
-# Project-level riskbalancer configuration. Committed.
-#
-# default_user: name of the user that commands act on when --user is not
-#   passed and the RISKBALANCER_USER environment variable is not set.
-
-default_user: emre

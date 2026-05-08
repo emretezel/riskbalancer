@@ -11,7 +11,8 @@ when needed, and compares actual holdings against risk-parity targets.
 ├── pyproject.toml                       # packaging, tooling, pytest config
 ├── config/                              # committed
 │   ├── seed_plan.yaml                   # catalog floor (the first user's starting point)
-│   ├── riskbalancer.yaml                # holds default_user
+│   ├── riskbalancer.example.yaml        # template for the local default-user config
+│   ├── riskbalancer.yaml                # local-only override, gitignored (holds default_user)
 │   ├── mappings/<adapter>.yaml          # shared adapter mappings
 │   └── fx.example.yaml                  # FX template
 ├── private/                             # gitignored
@@ -23,7 +24,7 @@ when needed, and compares actual holdings against risk-parity targets.
 │       ├── mappings/                    # per-user override directory
 │       │   ├── manual.yaml              # always per-user
 │       │   └── <adapter>.yaml           # optional override of shared mappings
-│       ├── statements/<broker>/...
+│       ├── statements/<broker>/<account>/<YYYY>/<MM>/...
 │       └── reports/<YYYY-MM-DD>.csv
 ├── src/riskbalancer/                    # CLI, adapters, models, portfolio logic
 └── tests/                               # pytest suite
@@ -48,9 +49,56 @@ Every per-user command takes `--user <name>`. The flag falls back to:
 1. the `RISKBALANCER_USER` environment variable, then
 2. the `default_user` field in `config/riskbalancer.yaml`.
 
-The committed default is `default_user: emre`, so omitting `--user` runs
-commands against `emre`. Override per-command with `--user wife`,
-`--user kid1`, etc.
+The repository ships only `config/riskbalancer.example.yaml` (no personal
+defaults committed). To set a default user on your machine:
+
+```bash
+cp config/riskbalancer.example.yaml config/riskbalancer.yaml
+# then edit the file and uncomment `default_user: your_name`
+```
+
+Or skip the file and `export RISKBALANCER_USER=your_name` in your shell
+rc. With no default set, every per-user command exits 1 with a clear
+message asking for `--user`; `fx update` and `user list` still work.
+
+## Setting up a new user
+
+Onboarding a new household member from zero to first report:
+
+```bash
+# 1. Bootstrap their plan. Either clone an existing one as a starting point
+#    or walk the catalog interactively.
+riskbalancer plan create --user wife --from emre
+# OR
+riskbalancer plan create --user wife
+
+# 2. Drop a broker statement anywhere on disk (download, inbox, etc.) and
+#    import it. The CLI auto-files the statement under
+#    private/users/wife/statements/<adapter>/<account>/<YYYY>/<MM>/ using
+#    today's date and creates private/users/wife/portfolio.json on first
+#    run. The source file stays put unless you pass --move.
+riskbalancer portfolio import \
+  --user wife \
+  --source-id ajbell-isa \
+  --adapter ajbell \
+  --account isa \
+  --statement ~/Downloads/wife-isa-snapshot.csv
+
+# 3. Optional: add manual holdings (cash, gold, alternatives).
+riskbalancer portfolio add \
+  --user wife \
+  --instrument-id GOLD \
+  --description "Physical Gold" \
+  --market-value 5000 \
+  --category "Alternative / Gold"
+
+# 4. Run the report (use bare --export to land at
+#    private/users/wife/reports/<today>.csv).
+riskbalancer portfolio report --user wife --export
+```
+
+The "Main Workflow" section below covers the same commands in steady-state
+form once the user already exists.
 
 ## Main Workflow
 
@@ -89,29 +137,28 @@ riskbalancer fx update --currency USD --currency EUR --currency CHF
 FX is not per-user — exchange rates are the same for everyone. This writes
 `private/fx.yaml`.
 
-### 3. Drop broker statements into the user's directory
+### 3. Import each statement (auto-files into the user's directory)
 
-Statements live under `private/users/<user>/statements/<broker>/<account>/<year>/`.
-For example:
-
-```text
-private/users/emre/statements/ajbell/sipp/2026/2026-03-23-positions.csv
-private/users/emre/statements/ibkr/taxable/2026/U10049818_20260320.csv
-private/users/wife/statements/ajbell/isa/2026/portfolio-AB8LNFI-ISA.csv
-```
-
-Use `private/inbox/` as a shared landing zone if you need to triage a file
-before deciding which user it belongs to.
-
-### 4. Import each statement
+Point `--statement` at any path on disk — typically wherever your broker
+left it (`~/Downloads/...`) or your shared `private/inbox/` triage area.
+The CLI copies the statement under
+`private/users/<user>/statements/<adapter>/<account>/<YYYY>/<MM>/` using
+today's date as the year/month folder, creating directories as needed:
 
 ```bash
 riskbalancer portfolio import \
   --user emre \
   --source-id ajbell-sipp \
   --adapter ajbell \
-  --statement private/users/emre/statements/ajbell/sipp/2026/2026-03-23-positions.csv
+  --account sipp \
+  --statement ~/Downloads/2026-03-23-positions.csv
 ```
+
+Pass `--move` to remove the source after copying. If a file with the same
+name already exists at the destination, the new copy is suffixed
+(`foo.csv` → `foo-2.csv`) so prior statements are never overwritten. If
+your `--statement` is already inside the user's `statements/` tree, the
+file is left exactly where it is.
 
 Mapping resolution is layered: the shared file at
 `config/mappings/<adapter>.yaml` is read first, then the per-user override
@@ -119,12 +166,13 @@ at `private/users/<user>/mappings/<adapter>.yaml` replaces individual
 entries by instrument id. New mappings learned interactively are written
 only to the override file so the shared catalog stays curated.
 
-`portfolio import` re-imports replace by `--source-id` so re-running with the
-same source updates that source's positions and leaves other sources alone.
+`portfolio import` re-imports replace by `--source-id` so re-running with
+the same source updates that source's positions and leaves other sources
+alone.
 
 Supported adapters: `ajbell`, `citi`, `ibkr`, `ms401k`, `schwab`.
 
-### 5. Add manual investments
+### 4. Add manual investments
 
 ```bash
 riskbalancer portfolio add \
@@ -137,7 +185,7 @@ riskbalancer portfolio add \
 
 Manual mappings live in `private/users/<user>/mappings/manual.yaml`.
 
-### 6. Run the report
+### 5. Run the report
 
 ```bash
 riskbalancer portfolio report --user emre

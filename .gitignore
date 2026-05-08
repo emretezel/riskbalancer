@@ -74,6 +74,9 @@ Icon?
 # Private workspace
 private/
 
+# Per-clone runtime config (committed template lives at riskbalancer.example.yaml)
+config/riskbalancer.yaml
+
 # Logs
 *.log
 

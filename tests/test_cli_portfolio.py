@@ -32,12 +32,216 @@ def load_snapshot(path: Path) -> dict:
 
 
 def _paths_with(**overrides) -> UserPaths:
-    return replace(UserPaths.for_user(""), **overrides)
+    """Build a UserPaths for tests; defaults to a placeholder user so the
+    user-keyed CLI guard does not refuse to run."""
+    return replace(UserPaths.for_user("testuser"), **overrides)
 
 
 def test_resolve_mapping_path_defaults_by_adapter():
     path = resolve_mapping_path("ajbell")
     assert path == Path("config/mappings/ajbell.yaml")
+
+
+def _set_frozen_ingestion_date(monkeypatch, year: int, month: int) -> None:
+    """Pin `_ingestion_now` so auto-filed paths are deterministic in tests."""
+    from datetime import UTC as UTCMOD
+    from datetime import datetime as dt
+
+    frozen = dt(year, month, 1, 12, 0, 0, tzinfo=UTCMOD)
+    monkeypatch.setattr(cli_module, "_ingestion_now", lambda: frozen)
+
+
+def test_cmd_portfolio_import_autofiles_external_source_and_handles_conflict(tmp_path, monkeypatch):
+    _set_frozen_ingestion_date(monkeypatch, 2026, 5)
+
+    # Source lives outside the user's statements_dir.
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    source = inbox / "snapshot.csv"
+    source.write_bytes(AJ_BELL_FIXTURE.read_bytes())
+
+    # Plan + portfolio set up under tmp_path so the import has somewhere to land.
+    user_dir = tmp_path / "users" / "wife"
+    user_dir.mkdir(parents=True)
+    (user_dir / "plan.yaml").write_text(
+        Path("config/seed_plan.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    paths = _paths_with(
+        user="wife",
+        user_dir=user_dir,
+        plan=user_dir / "plan.yaml",
+        portfolio=user_dir / "portfolio.json",
+        statements_dir=user_dir / "statements",
+        overrides_dir=user_dir / "mappings",
+        manual_mappings=user_dir / "mappings" / "manual.yaml",
+    )
+
+    # Pre-populate the override mapping file so the import doesn't try to prompt.
+    paths.overrides_dir.mkdir(parents=True, exist_ok=True)
+    save_mappings(
+        paths.adapter_overrides_path("ajbell"),
+        {
+            "ABCDEF": InstrumentMapping(
+                allocations=[
+                    CategoryAllocation(
+                        path=CategoryPath("Equities", "Developed", "NAM"), weight=1.0
+                    )
+                ]
+            ),
+            "GHIJKL": InstrumentMapping(
+                allocations=[
+                    CategoryAllocation(
+                        path=CategoryPath("Equities", "Developed", "NAM"), weight=1.0
+                    )
+                ]
+            ),
+            "MNOPQR": InstrumentMapping(
+                allocations=[
+                    CategoryAllocation(
+                        path=CategoryPath("Equities", "Developed", "NAM"), weight=1.0
+                    )
+                ]
+            ),
+        },
+    )
+
+    # First import — file lands under YYYY/MM, source untouched (default copy).
+    result = cmd_portfolio_import(
+        argparse.Namespace(
+            source_id="ajbell-isa",
+            adapter="ajbell",
+            account="isa",
+            statement=str(source),
+            mappings=None,
+            move=False,
+            fx=None,
+        ),
+        paths=paths,
+    )
+    assert result == 0
+    canonical = paths.statements_dir / "ajbell" / "isa" / "2026" / "05" / "snapshot.csv"
+    assert canonical.exists()
+    assert source.exists()  # default copy keeps the source
+
+    snapshot = load_snapshot(paths.portfolio)
+    assert snapshot["imports"][0]["statement"] == str(canonical)
+
+    # Second import with same source filename → -2 suffix.
+    result = cmd_portfolio_import(
+        argparse.Namespace(
+            source_id="ajbell-isa-second",
+            adapter="ajbell",
+            account="isa",
+            statement=str(source),
+            mappings=None,
+            move=False,
+            fx=None,
+        ),
+        paths=paths,
+    )
+    assert result == 0
+    suffixed = paths.statements_dir / "ajbell" / "isa" / "2026" / "05" / "snapshot-2.csv"
+    assert suffixed.exists()
+    assert canonical.exists()  # first import not overwritten
+
+
+def test_cmd_portfolio_import_move_removes_source_and_prefiled_path_stays(tmp_path, monkeypatch):
+    _set_frozen_ingestion_date(monkeypatch, 2026, 5)
+
+    user_dir = tmp_path / "users" / "wife"
+    user_dir.mkdir(parents=True)
+    (user_dir / "plan.yaml").write_text(
+        Path("config/seed_plan.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    paths = _paths_with(
+        user="wife",
+        user_dir=user_dir,
+        plan=user_dir / "plan.yaml",
+        portfolio=user_dir / "portfolio.json",
+        statements_dir=user_dir / "statements",
+        overrides_dir=user_dir / "mappings",
+        manual_mappings=user_dir / "mappings" / "manual.yaml",
+    )
+    paths.overrides_dir.mkdir(parents=True, exist_ok=True)
+    save_mappings(
+        paths.adapter_overrides_path("ajbell"),
+        {
+            sym: InstrumentMapping(
+                allocations=[
+                    CategoryAllocation(
+                        path=CategoryPath("Equities", "Developed", "NAM"), weight=1.0
+                    )
+                ]
+            )
+            for sym in ("ABCDEF", "GHIJKL", "MNOPQR")
+        },
+    )
+
+    # --- Branch A: --move removes the source after copying.
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    source = inbox / "moved.csv"
+    source.write_bytes(AJ_BELL_FIXTURE.read_bytes())
+
+    cmd_portfolio_import(
+        argparse.Namespace(
+            source_id="moveA",
+            adapter="ajbell",
+            account="isa",
+            statement=str(source),
+            mappings=None,
+            move=True,
+            fx=None,
+        ),
+        paths=paths,
+    )
+    canonical = paths.statements_dir / "ajbell" / "isa" / "2026" / "05" / "moved.csv"
+    assert canonical.exists()
+    assert not source.exists()  # moved away from the inbox
+
+    # --- Branch B: source already under statements_dir is left alone.
+    prefiled_dir = paths.statements_dir / "ajbell" / "isa" / "2026" / "03"
+    prefiled_dir.mkdir(parents=True, exist_ok=True)
+    prefiled = prefiled_dir / "old.csv"
+    prefiled.write_bytes(AJ_BELL_FIXTURE.read_bytes())
+
+    cmd_portfolio_import(
+        argparse.Namespace(
+            source_id="prefiled",
+            adapter="ajbell",
+            account="isa",
+            statement=str(prefiled),
+            mappings=None,
+            move=False,
+            fx=None,
+        ),
+        paths=paths,
+    )
+    # No copy — file is exactly where it was.
+    assert prefiled.exists()
+    snapshot = load_snapshot(paths.portfolio)
+    prefiled_record = next(rec for rec in snapshot["imports"] if rec["source_id"] == "prefiled")
+    assert prefiled_record["statement"] == str(prefiled.resolve())
+    # No copy made into the May folder for this source.
+    assert not (paths.statements_dir / "ajbell" / "isa" / "2026" / "05" / "old.csv").exists()
+
+
+def test_cmd_portfolio_report_without_user_prints_clean_error(tmp_path, capsys):
+    # paths.user is empty, simulating "no --user, no env, no riskbalancer.yaml".
+    portfolio_path = tmp_path / "noop.json"  # never read
+    paths = replace(UserPaths.for_user(""), portfolio=portfolio_path)
+    assert paths.user == ""
+
+    result = cmd_portfolio_report(
+        argparse.Namespace(plan=None, export=None),
+        paths=paths,
+    )
+
+    assert result == 1
+    captured = capsys.readouterr()
+    assert "No user resolved" in captured.err
+    assert "FileNotFoundError" not in captured.out
+    assert not portfolio_path.exists()  # nothing written
 
 
 def test_load_layered_mappings_user_override_wins(tmp_path, capsys):
@@ -133,12 +337,16 @@ def test_build_parser_uses_user_flag_and_drops_portfolio():
             "ajbell-sipp",
             "--adapter",
             "ajbell",
+            "--account",
+            "sipp",
             "--statement",
             str(AJ_BELL_FIXTURE),
         ]
     )
     assert import_args.source_id == "ajbell-sipp"
     assert import_args.user == "demo"
+    assert import_args.account == "sipp"
+    assert import_args.move is False
 
     add_args = parser.parse_args(
         [
@@ -205,8 +413,10 @@ def test_cmd_portfolio_import_prompts_and_persists_missing_mappings(tmp_path, mo
         argparse.Namespace(
             source_id="ajbell-sipp",
             adapter="ajbell",
+            account="sipp",
             statement=str(AJ_BELL_FIXTURE),
             mappings=str(mapping_path),
+            move=False,
             fx=None,
         ),
         paths=paths,
@@ -275,12 +485,16 @@ def test_cmd_portfolio_import_replaces_existing_source_id(tmp_path, monkeypatch)
         "parse_statement",
         lambda statement_path, adapter_name, fx_rates=None: next(statements),
     )
+    # The fake statement path never exists on disk; bypass auto-filing.
+    monkeypatch.setattr(cli_module, "_autofile_statement", lambda source, paths, **kwargs: source)
 
     args = argparse.Namespace(
         source_id="ajbell-sipp",
         adapter="ajbell",
+        account="sipp",
         statement="statement.csv",
         mappings=str(mapping_path),
+        move=False,
         fx=None,
     )
     cmd_portfolio_import(args, paths=paths)
@@ -353,13 +567,16 @@ def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
         "parse_statement",
         lambda statement_path, adapter_name, fx_rates=None: next(statements),
     )
+    monkeypatch.setattr(cli_module, "_autofile_statement", lambda source, paths, **kwargs: source)
 
     cmd_portfolio_import(
         argparse.Namespace(
             source_id="source-a",
             adapter="ajbell",
+            account="sipp",
             statement="a.csv",
             mappings=str(mapping_path),
+            move=False,
             fx=None,
         ),
         paths=paths,
@@ -368,8 +585,10 @@ def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
         argparse.Namespace(
             source_id="source-b",
             adapter="ibkr",
+            account="taxable",
             statement="b.csv",
             mappings=str(mapping_path),
+            move=False,
             fx=None,
         ),
         paths=paths,
@@ -678,13 +897,16 @@ def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, 
             )
         ],
     )
+    monkeypatch.setattr(cli_module, "_autofile_statement", lambda source, paths, **kwargs: source)
 
     result = cmd_portfolio_import(
         argparse.Namespace(
             source_id="ajbell-sipp",
             adapter="ajbell",
+            account="sipp",
             statement="statement.csv",
             mappings=str(mapping_path),
+            move=False,
             fx=None,
         ),
         paths=_paths_with(portfolio=portfolio_path),

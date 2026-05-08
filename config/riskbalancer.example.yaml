@@ -1,0 +1,16 @@
+# Project-level riskbalancer configuration. Committed template.
+#
+# Copy this file to `config/riskbalancer.yaml` (which is gitignored) and edit
+# the value below to set the default user that commands act on when neither
+# `--user` nor the `RISKBALANCER_USER` environment variable is set.
+#
+# Lookup order:
+#   1. `--user <name>` argument on the command line
+#   2. `RISKBALANCER_USER` environment variable
+#   3. `default_user` in config/riskbalancer.yaml (this file, once copied)
+#
+# If none of the three is set, every per-user command exits 1 with a clear
+# message. `riskbalancer fx update` and `riskbalancer user list` work
+# regardless because they do not depend on a specific user.
+
+# default_user: your_username
