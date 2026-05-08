@@ -39,13 +39,14 @@ from .configuration import (
 from .models import CategoryPath, Investment
 from .paths import UserPaths, resolve_default_user
 from .plan_bootstrap import (
+    PlanCreationAborted,
     StdIO,
     build_catalog,
     clone_plan,
+    confirm_and_write_plan,
     count_unique_categories,
     describe_catalog_sources,
     walk_catalog_interactive,
-    write_plan_yaml,
 )
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
@@ -1215,12 +1216,20 @@ def cmd_plan_create(args: argparse.Namespace, paths: Optional[UserPaths] = None)
     catalog = build_catalog(paths)
     print(describe_catalog_sources(paths))
     print(f"Catalog contains {count_unique_categories(catalog)} unique categories.")
-    plan_nodes = walk_catalog_interactive(catalog, StdIO())
-    failures = collect_category_weight_validation_failures(plan_nodes)
-    if failures:
-        print(format_category_weight_validation_failures(failures), file=sys.stderr)
+    io = StdIO()
+    try:
+        plan_nodes = walk_catalog_interactive(catalog, io)
+        failures = collect_category_weight_validation_failures(plan_nodes)
+        if failures:
+            print(format_category_weight_validation_failures(failures), file=sys.stderr)
+            return 1
+        confirm_and_write_plan(paths.plan, plan_nodes, io)
+    except PlanCreationAborted as exc:
+        # User typed quit/exit, pressed Ctrl+C, sent EOF, or declined the
+        # final confirmation. Nothing is written; surface a single-line
+        # message and exit non-zero so scripts can detect the abort.
+        print(f"plan create aborted: {exc}", file=sys.stderr)
         return 1
-    write_plan_yaml(paths.plan, plan_nodes)
     leaf_count = sum(1 for _ in _iter_leaves(plan_nodes))
     print(f"Wrote plan to {paths.plan} ({leaf_count} leaf categories).")
     return 0

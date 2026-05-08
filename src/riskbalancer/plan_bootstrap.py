@@ -32,6 +32,22 @@ from .paths import UserPaths
 DEFAULT_LEAF_VOLATILITY = 0.15
 DEFAULT_ADJUSTMENT = 1.0
 
+# Sentinel used at every pick prompt so the user can introduce categories that
+# don't yet exist in the catalog. Accepted in either form (`+ new` or `new`).
+NEW_CATEGORY_SENTINEL = "+ new"
+_NEW_CATEGORY_KEYWORDS = {NEW_CATEGORY_SENTINEL, "new"}
+_EXIT_KEYWORDS = {"quit", "exit"}
+
+
+class PlanCreationAborted(Exception):
+    """Raised when the user asks to abandon the interactive walker.
+
+    Triggered by typing `quit` or `exit` at any prompt, by Ctrl+C
+    (KeyboardInterrupt), by EOF on stdin, or by declining the final save
+    confirmation. The CLI catches this and exits cleanly without writing
+    anything to disk.
+    """
+
 
 @dataclass
 class CatalogNode:
@@ -42,6 +58,9 @@ class CatalogNode:
     `suggested_volatility`, and `suggested_adjustment` are informational hints
     drawn from whichever source the node was first seen in. `from_mappings`
     flags leaves that exist only because a mapping file references them.
+    `is_branch` marks user-added synthetic branches whose children will be
+    collected interactively (their `children` list starts empty but they must
+    still recurse, not be treated as leaves).
     """
 
     name: str
@@ -50,6 +69,7 @@ class CatalogNode:
     suggested_adjustment: Optional[float] = None
     children: list["CatalogNode"] = field(default_factory=list)
     from_mappings: bool = False
+    is_branch: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +245,41 @@ class ScriptedIO:
         self.warn_log.append(message)
 
 
+def _ask(io: IO, message: str) -> str:
+    """Wrap `io.prompt` so every walker prompt can be aborted uniformly.
+
+    Raises `PlanCreationAborted` when the user types `quit` / `exit`
+    (case-insensitive, leading/trailing whitespace ignored), presses Ctrl+C,
+    or sends EOF. Otherwise returns the raw answer untouched so each caller
+    can apply its own parsing (`.strip()`, `.lower()`, regex, etc.) just as
+    it did when prompts went directly through `io.prompt`.
+    """
+    try:
+        raw = io.prompt(message)
+    except (KeyboardInterrupt, EOFError) as exc:
+        raise PlanCreationAborted("interrupted by user") from exc
+    if raw.strip().lower() in _EXIT_KEYWORDS:
+        raise PlanCreationAborted("user requested exit")
+    return raw
+
+
+def _prompt_yes_no(io: IO, message: str, *, default: bool) -> bool:
+    """Tiny y/N prompt that routes through `_ask` so quit/Ctrl+C still abort.
+
+    Empty input returns `default`. Anything other than y/yes/n/no/empty
+    re-prompts with a warning.
+    """
+    while True:
+        raw = _ask(io, message).strip().lower()
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        if raw == "":
+            return default
+        io.warn("Please answer y or n.")
+
+
 def walk_catalog_interactive(
     catalog: Sequence[CatalogNode],
     io: IO,
@@ -237,6 +292,7 @@ def walk_catalog_interactive(
             "Catalog is empty: no plan files or mappings are visible. "
             "Add at least one plan or seed_plan.yaml before running plan create."
         )
+    io.info("Type 'quit' or 'exit' (or press Ctrl+C) at any prompt to abort without saving.")
     return _walk_level(
         list(catalog),
         io,
@@ -257,11 +313,13 @@ def _walk_level(
 ) -> list[CategoryNode]:
     io.info(f"\n—— {level_label} ——")
     picked: list[tuple[CatalogNode, float]] = []
+    # Loop without an early break on empty `remaining`: the `+ new` sentinel
+    # is always offered, so a level with no catalog options (e.g. children of
+    # a user-added synthetic branch) is still reachable. The user controls
+    # when the loop ends via the "add another?" prompt.
     while True:
         picked_ids = {id(node) for node, _ in picked}
         remaining = [node for node in options if id(node) not in picked_ids]
-        if not remaining:
-            break
         chosen = _prompt_pick_one(io, remaining, level_label, picked)
         weight = _prompt_weight(io, chosen, level_label)
         picked.append((chosen, weight))
@@ -276,7 +334,11 @@ def _walk_level(
         node_path = path_prefix + (catalog_node.name,)
         node_label = " / ".join(node_path)
         next_inherited = catalog_node.suggested_volatility or inherited_volatility
-        if catalog_node.children:
+        # A node is a branch if it already has catalog children OR if the user
+        # explicitly declared it a branch when adding it (synthetic branches
+        # start with empty children but must recurse).
+        treat_as_branch = bool(catalog_node.children) or catalog_node.is_branch
+        if treat_as_branch:
             child_plan = _walk_level(
                 list(catalog_node.children),
                 io,
@@ -320,22 +382,67 @@ def _prompt_pick_one(
     level_label: str,
     picked: list[tuple[CatalogNode, float]],
 ) -> CatalogNode:
+    """Prompt the user to pick a category at the current level.
+
+    The displayed options are the remaining catalog nodes plus the sentinel
+    `+ new` so the user can always introduce a category that doesn't yet
+    exist. Catalog matches take precedence over the sentinel: if a catalog
+    category happens to be named "new", typing `new` will pick it; the
+    sentinel is reachable as `+ new` in that case.
+    """
     labels = [_decorate_label(node) for node in remaining]
+    labels.append(NEW_CATEGORY_SENTINEL)
     name_to_node = {node.name.lower(): node for node in remaining}
+    # Sibling names guard the "+ new" sub-flow so a synthetic node can't
+    # collide with another sibling — already-picked or still-available.
+    sibling_names = {node.name.lower() for node, _ in picked} | set(name_to_node.keys())
     progress = (
         ", ".join(f"{node.name}={int(round(weight * 100))}%" for node, weight in picked)
         if picked
         else "none yet"
     )
     while True:
-        raw = io.prompt(
+        raw = _ask(
+            io,
             f"Select an asset class to add to {level_label} "
-            f"[{', '.join(labels)}] (assigned so far: {progress}): "
+            f"[{', '.join(labels)}] (assigned so far: {progress}): ",
         )
         cleaned = raw.strip().lower()
         if cleaned in name_to_node:
             return name_to_node[cleaned]
+        if cleaned in _NEW_CATEGORY_KEYWORDS:
+            return _prompt_new_category(io, level_label, sibling_names)
         io.warn(f"Unknown asset class '{raw.strip()}'. Choose one of the listed options.")
+
+
+def _prompt_new_category(
+    io: IO,
+    level_label: str,
+    sibling_names: set[str],
+) -> CatalogNode:
+    """Collect a brand-new category from the user and return a synthetic node.
+
+    Asks for a name (rejecting empty input, the reserved `new` / `+ new`
+    keywords, and collisions with sibling names already at this level), then
+    asks whether the new category has sub-categories. A "yes" answer marks
+    the returned `CatalogNode` as a branch (`is_branch=True`) so the walker
+    will recurse into it; "no" leaves it as a leaf so the walker prompts for
+    volatility and adjustment.
+    """
+    while True:
+        raw = _ask(io, f"Name for new category at {level_label}: ").strip()
+        if not raw:
+            io.warn("Name cannot be empty.")
+            continue
+        if raw.lower() in _NEW_CATEGORY_KEYWORDS:
+            io.warn("'new' / '+ new' is a reserved keyword — pick another name.")
+            continue
+        if raw.lower() in sibling_names:
+            io.warn(f"'{raw}' already exists at this level.")
+            continue
+        break
+    has_children = _prompt_yes_no(io, f"Does {raw} have sub-categories? [y/N]: ", default=False)
+    return CatalogNode(name=raw, is_branch=has_children)
 
 
 def _decorate_label(node: CatalogNode) -> str:
@@ -351,7 +458,7 @@ def _prompt_weight(io: IO, chosen: CatalogNode, level_label: str) -> float:
         else ""
     )
     while True:
-        raw = io.prompt(f"Risk weight for {chosen.name} at {level_label}{suggestion}: ")
+        raw = _ask(io, f"Risk weight for {chosen.name} at {level_label}{suggestion}: ")
         try:
             return _parse_weight_input(raw)
         except ValueError as exc:
@@ -359,13 +466,7 @@ def _prompt_weight(io: IO, chosen: CatalogNode, level_label: str) -> float:
 
 
 def _prompt_add_another(io: IO, level_label: str, only_one_so_far: bool) -> bool:
-    raw = io.prompt(f"Add another asset class to {level_label}? [y/N]: ").strip().lower()
-    if raw in {"y", "yes"}:
-        return True
-    if raw in {"", "n", "no"}:
-        return False
-    io.warn("Please answer y or n.")
-    return _prompt_add_another(io, level_label, only_one_so_far)
+    return _prompt_yes_no(io, f"Add another asset class to {level_label}? [y/N]: ", default=False)
 
 
 def _validate_level_weights(
@@ -426,7 +527,7 @@ def _prompt_leaf_metadata(
 
 def _prompt_positive_float(io: IO, message: str, *, default: float) -> float:
     while True:
-        raw = io.prompt(message).strip()
+        raw = _ask(io, message).strip()
         if not raw:
             return default
         try:
@@ -467,6 +568,51 @@ def write_plan_yaml(path: Path, nodes: Sequence[CategoryNode]) -> None:
     payload = {"assets": [_node_to_dict(node) for node in nodes]}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+
+
+def _render_plan_tree(nodes: Sequence[CategoryNode]) -> str:
+    """Render a plan tree as an indented multi-line summary for confirmation.
+
+    Each line is `<indent><name>` padded to a column, followed by the weight
+    as a percentage. Leaves additionally show `vol=<v>  adj=<a>` so the user
+    can verify the values they entered before the plan lands on disk.
+    """
+    out: list[str] = []
+    _append_tree_lines(nodes, indent=0, out=out)
+    return "\n".join(out)
+
+
+def _append_tree_lines(nodes: Sequence[CategoryNode], *, indent: int, out: list[str]) -> None:
+    for node in nodes:
+        prefix = "  " * indent
+        weight_pct = f"{int(round(node.weight * 100))}%"
+        name_field = f"{prefix}{node.name}"
+        if node.children:
+            out.append(f"{name_field:<40} {weight_pct:>5}")
+            _append_tree_lines(node.children, indent=indent + 1, out=out)
+        else:
+            vol_text = f"{node.volatility}" if node.volatility is not None else "—"
+            details = f"vol={vol_text}  adj={node.adjustment}"
+            out.append(f"{name_field:<40} {weight_pct:>5}   {details}")
+
+
+def confirm_and_write_plan(
+    plan_path: Path,
+    nodes: Sequence[CategoryNode],
+    io: IO,
+) -> None:
+    """Show a tree summary and write `nodes` to `plan_path` only on confirm.
+
+    Raises `PlanCreationAborted` if the user declines the save prompt, types
+    `quit` / `exit`, presses Ctrl+C, or sends EOF — same abort path as any
+    other prompt in the walker. Nothing is written to disk on the abort
+    path.
+    """
+    io.info("\n—— Plan summary ——")
+    io.info(_render_plan_tree(nodes))
+    if not _prompt_yes_no(io, f"\nSave this plan to {plan_path}? [y/N]: ", default=False):
+        raise PlanCreationAborted("user declined to save plan")
+    write_plan_yaml(plan_path, nodes)
 
 
 def _node_to_dict(node: CategoryNode) -> dict:

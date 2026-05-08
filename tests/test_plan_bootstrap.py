@@ -6,21 +6,25 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
-from dataclasses import replace
+import argparse
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
 import yaml
 
+from riskbalancer.cli import cmd_plan_create
 from riskbalancer.configuration import (
     collect_category_weight_validation_failures,
     load_category_nodes_from_yaml,
 )
 from riskbalancer.paths import UserPaths
 from riskbalancer.plan_bootstrap import (
+    PlanCreationAborted,
     ScriptedIO,
     build_catalog,
     clone_plan,
+    confirm_and_write_plan,
     walk_catalog_interactive,
     write_plan_yaml,
 )
@@ -330,3 +334,242 @@ def test_user_paths_replace_supports_field_overrides(tmp_path):
     override = replace(base, plan=tmp_path / "alt.yaml")
     assert override.plan == tmp_path / "alt.yaml"
     assert override.user == "test"
+
+
+# ---------------------------------------------------------------------------
+# `+ new` sentinel: adding categories that aren't in the catalog
+# ---------------------------------------------------------------------------
+
+
+def test_walk_catalog_supports_added_leaf_at_top_level(tmp_path):
+    """User picks `+ new`, names a brand-new leaf, supplies vol/adj."""
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    answers = [
+        # Top level: pick the sentinel, name "Crypto", no sub-categories,
+        # weight 100%, then explicit vol/adj for the leaf.
+        "+ new",
+        "Crypto",
+        "n",  # no sub-categories
+        "100",
+        "n",  # don't add another at top level
+        "0.6",  # volatility
+        "1.0",  # adjustment
+    ]
+    plan = walk_catalog_interactive(catalog, ScriptedIO(answers))
+    assert [n.name for n in plan] == ["Crypto"]
+    assert plan[0].volatility == pytest.approx(0.6)
+    assert plan[0].adjustment == pytest.approx(1.0)
+    assert plan[0].children == []
+
+
+def test_walk_catalog_supports_added_branch_with_added_children(tmp_path):
+    """`+ new` branch with sub-categories recurses into a level whose only
+    available option is itself `+ new` — the user adds two synthetic leaves."""
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    answers = [
+        # Top level: `+ new` named "Alternative", branch with sub-categories.
+        "+ new",
+        "Alternative",
+        "y",  # has sub-categories
+        "100",  # weight
+        "n",  # don't add another at top level
+        # Sub-level (Alternative): only `+ new` is available. Add two leaves.
+        "+ new",
+        "Crypto",
+        "n",  # leaf
+        "60",
+        "y",  # add another
+        "+ new",
+        "RealEstate",
+        "n",  # leaf
+        "40",
+        "n",  # done
+        # Leaf metadata for Crypto, then RealEstate.
+        "0.6",
+        "1.0",
+        "0.15",
+        "1.0",
+    ]
+    plan = walk_catalog_interactive(catalog, ScriptedIO(answers))
+    assert [n.name for n in plan] == ["Alternative"]
+    children = plan[0].children
+    assert [c.name for c in children] == ["Crypto", "RealEstate"]
+    assert children[0].volatility == pytest.approx(0.6)
+    assert children[1].volatility == pytest.approx(0.15)
+    failures = collect_category_weight_validation_failures(plan)
+    assert failures == []
+
+
+def test_walk_catalog_rejects_new_category_name_collision(tmp_path):
+    """A synthetic category cannot collide with a sibling at the same level."""
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    answers = [
+        # Try to name the new category "Bonds" — collides with a remaining
+        # catalog sibling — re-prompt; then "Equities" — also collides; then
+        # accept "Crypto".
+        "+ new",
+        "Bonds",
+        "Equities",
+        "Crypto",
+        "n",  # leaf
+        "100",
+        "n",  # don't add another
+        "0.5",
+        "1.0",
+    ]
+    io = ScriptedIO(answers)
+    plan = walk_catalog_interactive(catalog, io)
+    assert [n.name for n in plan] == ["Crypto"]
+    # Two collision warnings should have been surfaced.
+    assert sum(1 for msg in io.warn_log if "already exists" in msg) == 2
+
+
+# ---------------------------------------------------------------------------
+# Exit at any prompt: quit / exit / Ctrl+C
+# ---------------------------------------------------------------------------
+
+
+def test_walk_catalog_aborts_on_quit_at_first_pick(tmp_path):
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    answers = ["quit"]
+    with pytest.raises(PlanCreationAborted):
+        walk_catalog_interactive(catalog, ScriptedIO(answers))
+
+
+def test_walk_catalog_aborts_on_exit_during_new_category_name(tmp_path):
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    answers = ["+ new", "exit"]
+    with pytest.raises(PlanCreationAborted):
+        walk_catalog_interactive(catalog, ScriptedIO(answers))
+
+
+@dataclass
+class _RaisingIO:
+    """Test IO that raises a configured exception on the Nth prompt call.
+
+    Used to simulate Ctrl+C (KeyboardInterrupt) and EOF (EOFError) without
+    needing a real TTY. The first `before` prompts return scripted answers;
+    the next prompt raises `exc`.
+    """
+
+    answers: list[str]
+    exc: BaseException
+    before: int = 0
+    info_log: list[str] = field(default_factory=list)
+    warn_log: list[str] = field(default_factory=list)
+    _index: int = 0
+
+    def prompt(self, message: str) -> str:
+        if self._index == self.before:
+            self._index += 1
+            raise self.exc
+        answer = self.answers[self._index]
+        self._index += 1
+        return answer
+
+    def info(self, message: str) -> None:
+        self.info_log.append(message)
+
+    def warn(self, message: str) -> None:
+        self.warn_log.append(message)
+
+
+def test_walk_catalog_aborts_on_keyboard_interrupt(tmp_path):
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    io = _RaisingIO(answers=[], exc=KeyboardInterrupt(), before=0)
+    with pytest.raises(PlanCreationAborted):
+        walk_catalog_interactive(catalog, io)
+
+
+def test_walk_catalog_aborts_on_eof(tmp_path):
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    io = _RaisingIO(answers=[], exc=EOFError(), before=0)
+    with pytest.raises(PlanCreationAborted):
+        walk_catalog_interactive(catalog, io)
+
+
+# ---------------------------------------------------------------------------
+# Final confirmation: tree summary + save y/N
+# ---------------------------------------------------------------------------
+
+
+def _drive_simple_plan(catalog) -> tuple[list, ScriptedIO]:
+    """Run the walker with a minimal scripted flow (Bonds 100% leaf)."""
+    answers = ["Bonds", "100", "n", "", ""]
+    io = ScriptedIO(answers)
+    plan = walk_catalog_interactive(catalog, io)
+    return plan, io
+
+
+def test_confirm_and_write_plan_writes_when_user_accepts(tmp_path):
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+    plan, _ = _drive_simple_plan(catalog)
+
+    out = tmp_path / "out.yaml"
+    confirm_io = ScriptedIO(["y"])
+    confirm_and_write_plan(out, plan, confirm_io)
+    assert out.exists()
+    parsed = yaml.safe_load(out.read_text(encoding="utf-8"))
+    assert parsed["assets"][0]["name"] == "Bonds"
+    # The summary must have been printed before the save prompt.
+    assert any("Plan summary" in msg for msg in confirm_io.info_log)
+    assert any("Bonds" in msg for msg in confirm_io.info_log)
+
+
+def test_confirm_and_write_plan_aborts_on_decline(tmp_path):
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+    plan, _ = _drive_simple_plan(catalog)
+
+    out = tmp_path / "out.yaml"
+    with pytest.raises(PlanCreationAborted):
+        confirm_and_write_plan(out, plan, ScriptedIO(["n"]))
+    assert not out.exists()
+
+
+def test_confirm_and_write_plan_aborts_on_quit(tmp_path):
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+    plan, _ = _drive_simple_plan(catalog)
+
+    out = tmp_path / "out.yaml"
+    with pytest.raises(PlanCreationAborted):
+        confirm_and_write_plan(out, plan, ScriptedIO(["quit"]))
+    assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# CLI-level integration: cmd_plan_create exits cleanly on abort
+# ---------------------------------------------------------------------------
+
+
+def test_cmd_plan_create_aborts_cleanly_on_quit(tmp_path, monkeypatch, capsys):
+    paths = _build_paths(tmp_path, user="emre")
+    paths.user_dir.mkdir(parents=True, exist_ok=True)
+
+    # The walker reads via `input()` through `StdIO.prompt`. Replace it with
+    # a script that types `quit` at the very first prompt.
+    answers = iter(["quit"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+    args = argparse.Namespace(user="emre", overwrite=False, from_user=None)
+    rc = cmd_plan_create(args, paths=paths)
+    assert rc == 1
+    assert not paths.plan.exists()
+    err = capsys.readouterr().err
+    assert "aborted" in err
