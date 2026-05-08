@@ -3,9 +3,9 @@
 > **Note for agents**: `CLAUDE.md` and `AGENTS.md` are always identical.
 > If you edit one, apply the same change to the other immediately.
 
-RiskBalancer is a Python CLI that ingests broker statements, maps holdings into a nested
-category plan, converts values to GBP when needed, and compares actual holdings against
-risk-parity targets.
+RiskBalancer is a Python CLI that ingests broker statements for one or more household
+members, maps holdings into a per-user nested category plan, converts values to GBP
+when needed, and compares actual holdings against risk-parity targets.
 
 ---
 
@@ -27,12 +27,26 @@ making any structural decisions.
 
 The current top-level shape of the codebase is:
 
-- `src/riskbalancer/` — CLI entry point, broker adapters, domain models, portfolio logic.
-- `config/` — committed configuration: the category plan and broker/manual mapping files.
-- `private/` — local-only runtime data (FX rates, raw broker statements). Never committed.
-- `portfolios/` — local-only portfolio JSON snapshots. Never committed.
-- `reports/` — local-only CSV exports. Never committed.
+- `src/riskbalancer/` — CLI entry point, broker adapters, domain models, portfolio
+  logic, `paths.py` (`UserPaths` filesystem decisions), `plan_bootstrap.py` (catalog
+  construction and the `plan create` interactive walker).
+- `config/` — committed configuration:
+  - `seed_plan.yaml` — catalog floor for the very first user.
+  - `riskbalancer.yaml` — holds `default_user`.
+  - `mappings/<adapter>.yaml` — shared adapter mappings.
+  - `fx.example.yaml` — FX template.
+- `private/` — gitignored local data:
+  - `fx.yaml` — shared GBP FX rates.
+  - `inbox/` — shared landing zone for unfiled statements.
+  - `users/<user>/` — per-user `plan.yaml`, `portfolio.json`, `mappings/`,
+    `statements/`, `reports/`.
 - `tests/` — pytest suite mirroring the source tree.
+
+Every per-user command takes `--user <name>`, falling back to the
+`RISKBALANCER_USER` env var and then to `default_user` in
+`config/riskbalancer.yaml`. All filesystem decisions flow through
+`UserPaths.for_user(user, root=...)` — do not embed layout literals in
+command handlers; route them through that object.
 
 ---
 
@@ -130,32 +144,44 @@ This project has no database. All persistent state is stored in human-readable f
 
 | Concern | Location | Format |
 |---|---|---|
-| Target category plan, weights, volatilities | `config/categories.yaml` | YAML, committed |
-| Broker and manual instrument mappings | `config/mappings/<adapter>.yaml` | YAML, committed |
-| Live FX rates | `private/fx.yaml` | YAML, **gitignored** |
-| Broker statements | `private/statements/<broker>/...` | broker-native, **gitignored** |
-| Portfolio snapshots | `portfolios/<name>.json` | JSON, **gitignored** |
-| Exported reports | `reports/*.csv` | CSV, **gitignored** |
+| Catalog floor (committed default plan) | `config/seed_plan.yaml` | YAML, committed |
+| Default-user pointer | `config/riskbalancer.yaml` | YAML, committed |
+| Shared adapter mappings | `config/mappings/<adapter>.yaml` | YAML, committed |
+| FX template | `config/fx.example.yaml` | YAML, committed |
+| Per-user category plan | `private/users/<user>/plan.yaml` | YAML, **gitignored** |
+| Per-user portfolio snapshot | `private/users/<user>/portfolio.json` | JSON, **gitignored** |
+| Per-user mapping overrides | `private/users/<user>/mappings/<adapter>.yaml` | YAML, **gitignored** |
+| Per-user manual mappings | `private/users/<user>/mappings/manual.yaml` | YAML, **gitignored** |
+| Per-user statements | `private/users/<user>/statements/<broker>/...` | broker-native, **gitignored** |
+| Per-user reports | `private/users/<user>/reports/<YYYY-MM-DD>.csv` | CSV, **gitignored** |
+| Shared FX rates | `private/fx.yaml` | YAML, **gitignored** |
+| Statements awaiting triage | `private/inbox/` | broker-native, **gitignored** |
 
 Persistence rules:
 
-- **Never commit anything under `private/`, `portfolios/`, or `reports/`.** These hold
-  real financial data.
-- **Schema discipline still applies.** Even though the storage is YAML/JSON, every
-  persisted structure has an implicit schema. Validate it on read and fail loudly on
-  malformed data — do not silently coerce or paper over missing fields.
-- **One concept per file.** Do not mix unrelated state in the same YAML/JSON document.
-- **Stable identifiers.** `source_id` for broker imports and `instrument_id` for holdings
-  must remain stable across runs; re-imports replace by `source_id` and must not duplicate
-  data.
-- **No magic values.** Use `None`/absent keys for missing values, not sentinels like `0`,
-  `-1`, or `"N/A"`.
-- **Document the on-disk format.** When the shape of any persisted file changes, update
-  `docs/architecture.md` (or the relevant doc) in the same commit and consider whether a
-  one-shot migration of existing local files is needed.
-- **If a real database is ever introduced**, replace this section with the full schema
-  design rules (single source of truth, normalisation, FK/UNIQUE/CHECK constraints,
-  indexed query patterns, etc.) before any persistence code is written against it.
+- **Never commit anything under `private/`.** It holds real financial data for
+  every household member.
+- **Mapping resolution is layered.** The shared file is read first; the per-user
+  override file replaces individual entries. New mappings learned at import time
+  are written only to the per-user override file — the shared catalog stays curated.
+- **Schema discipline still applies.** Validate every persisted structure on
+  read and fail loudly on malformed data; do not silently coerce or paper over
+  missing fields.
+- **One concept per file.** Do not mix unrelated state in the same YAML/JSON
+  document.
+- **Stable identifiers.** `source_id` for broker imports and `instrument_id`
+  for holdings must remain stable across runs; re-imports replace by `source_id`
+  and must not duplicate data.
+- **No magic values.** Use `None`/absent keys for missing values, not sentinels
+  like `0`, `-1`, or `"N/A"`.
+- **Document the on-disk format.** When the shape of any persisted file
+  changes, update `docs/architecture.md` (or the relevant doc) in the same
+  commit and consider whether a one-shot migration of existing local files is
+  needed.
+- **If a real database is ever introduced**, replace this section with the
+  full schema design rules (single source of truth, normalisation,
+  FK/UNIQUE/CHECK constraints, indexed query patterns, etc.) before any
+  persistence code is written against it.
 
 ---
 

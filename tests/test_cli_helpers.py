@@ -34,7 +34,7 @@ def test_load_and_save_mappings(tmp_path):
 
 
 def test_gather_missing_mappings_validates_inputs(monkeypatch, tmp_path):
-    plan = load_portfolio_plan_from_yaml("config/categories.yaml")
+    plan = load_portfolio_plan_from_yaml("config/seed_plan.yaml")
     plan_index = PlanIndex.from_plan(plan)
     inputs = iter(
         [

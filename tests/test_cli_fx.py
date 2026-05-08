@@ -5,6 +5,7 @@ Author: Emre Tezel
 """
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 from urllib.error import URLError
 
@@ -19,6 +20,7 @@ from riskbalancer.cli import (
     load_fx_rates,
     parse_ecb_reference_rates_xml,
 )
+from riskbalancer.paths import UserPaths
 
 ECB_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <gesmes:Envelope xmlns:gesmes="http://www.gesmes.org/xml/2002-08-01" xmlns="http://www.ecb.int/vocabulary/2002-08-01/eurofxref">
@@ -135,15 +137,14 @@ def test_cmd_fx_update_bootstraps_default_private_file_from_example(tmp_path, mo
         "date: 2025-01-01\nbase: GBP\nrates:\n  USD: 0.70\n  EUR: 0.90\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(cli_module, "DEFAULT_FX_PATH", private_fx)
-    monkeypatch.setattr(cli_module, "FX_TEMPLATE_PATH", example_fx)
+    paths = replace(UserPaths.for_user(""), fx=private_fx, fx_template=example_fx)
     monkeypatch.setattr(
         cli_module,
         "fetch_ecb_reference_rates",
         lambda: ("2026-03-23", {"GBP": 0.8, "USD": 1.25, "CHF": 1.0}),
     )
 
-    result = cmd_fx_update(argparse.Namespace(fx=str(private_fx), currency=None))
+    result = cmd_fx_update(argparse.Namespace(fx=str(private_fx), currency=None), paths=paths)
 
     assert result == 0
     assert private_fx.exists()

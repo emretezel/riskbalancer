@@ -1,5 +1,6 @@
 import argparse
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import riskbalancer.cli as cli_module
@@ -15,10 +16,12 @@ from riskbalancer.cli import (
     investment_from_dict,
     investment_to_dict,
     load_fx_rates,
+    load_layered_mappings,
     resolve_mapping_path,
     save_mappings,
     summarize_portfolio,
 )
+from riskbalancer.paths import UserPaths
 from riskbalancer.portfolio import PortfolioPlan
 
 AJ_BELL_FIXTURE = Path("tests/fixtures/aj_bell_sample.csv")
@@ -28,9 +31,56 @@ def load_snapshot(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _paths_with(**overrides) -> UserPaths:
+    return replace(UserPaths.for_user(""), **overrides)
+
+
 def test_resolve_mapping_path_defaults_by_adapter():
     path = resolve_mapping_path("ajbell")
     assert path == Path("config/mappings/ajbell.yaml")
+
+
+def test_load_layered_mappings_user_override_wins(tmp_path, capsys):
+    shared_dir = tmp_path / "shared"
+    shared_dir.mkdir()
+    overrides_dir = tmp_path / "overrides"
+    overrides_dir.mkdir()
+    paths = _paths_with(
+        shared_mappings_dir=shared_dir,
+        overrides_dir=overrides_dir,
+    )
+
+    nam = CategoryPath("Equities", "Developed", "NAM")
+    em = CategoryPath("Equities", "EM")
+    save_mappings(
+        paths.adapter_mappings_path("ajbell"),
+        {
+            "VWRL": InstrumentMapping(allocations=[CategoryAllocation(path=nam, weight=1.0)]),
+            "VHYL": InstrumentMapping(allocations=[CategoryAllocation(path=nam, weight=1.0)]),
+        },
+    )
+    save_mappings(
+        paths.adapter_overrides_path("ajbell"),
+        {
+            # Override an existing shared key
+            "VWRL": InstrumentMapping(allocations=[CategoryAllocation(path=em, weight=1.0)]),
+            # Add a key not in the shared file
+            "ICAP": InstrumentMapping(allocations=[CategoryAllocation(path=em, weight=1.0)]),
+        },
+    )
+
+    merged = load_layered_mappings("ajbell", paths, log_overrides=True)
+    err = capsys.readouterr().err
+
+    # Override wins for VWRL
+    assert merged["VWRL"].allocations[0].path.levels() == ("Equities", "EM")
+    # Shared retained for VHYL
+    assert merged["VHYL"].allocations[0].path.levels() == ("Equities", "Developed", "NAM")
+    # Override-only key is included
+    assert merged["ICAP"].allocations[0].path.levels() == ("Equities", "EM")
+    # The override notice is emitted only for keys that existed in shared
+    assert "Using user override for VWRL" in err
+    assert "ICAP" not in err
 
 
 def test_investment_serialization_round_trip_preserves_source_id():
@@ -55,32 +105,29 @@ def test_investment_serialization_round_trip_preserves_source_id():
 
 def test_cmd_portfolio_create_creates_empty_snapshot(tmp_path):
     portfolio_path = tmp_path / "portfolio.json"
+    paths = _paths_with(portfolio=portfolio_path)
     result = cmd_portfolio_create(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan="config/categories.yaml",
-            overwrite=False,
-        )
+        argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
+        paths=paths,
     )
     assert result == 0
 
     snapshot = load_snapshot(portfolio_path)
-    assert snapshot["plan"] == "config/categories.yaml"
+    assert snapshot["plan"] == "config/seed_plan.yaml"
     assert snapshot["imports"] == []
     assert snapshot["investments"] == []
     assert snapshot["created_at"] == snapshot["updated_at"]
 
 
-def test_build_parser_replaces_build_with_create_and_import():
+def test_build_parser_uses_user_flag_and_drops_portfolio():
     parser = build_parser()
-    create_args = parser.parse_args(["portfolio", "create", "--portfolio", "demo"])
-    assert create_args.portfolio == "demo"
 
+    # `--user` is recognised on user-keyed subcommands.
     import_args = parser.parse_args(
         [
             "portfolio",
             "import",
-            "--portfolio",
+            "--user",
             "demo",
             "--source-id",
             "ajbell-sipp",
@@ -91,12 +138,13 @@ def test_build_parser_replaces_build_with_create_and_import():
         ]
     )
     assert import_args.source_id == "ajbell-sipp"
+    assert import_args.user == "demo"
 
     add_args = parser.parse_args(
         [
             "portfolio",
             "add",
-            "--portfolio",
+            "--user",
             "demo",
             "--instrument-id",
             "CASH_GBP",
@@ -107,24 +155,40 @@ def test_build_parser_replaces_build_with_create_and_import():
         ]
     )
     assert add_args.category is None
+    assert add_args.user == "demo"
 
+    # `portfolio create` is removed; the user/portfolio is auto-initialised
+    # by `portfolio import` or `portfolio add`.
     try:
-        parser.parse_args(["portfolio", "build"])
+        parser.parse_args(["portfolio", "create", "--user", "demo"])
     except SystemExit as exc:
         assert exc.code != 0
     else:
-        raise AssertionError("portfolio build should no longer parse")
+        raise AssertionError("portfolio create should no longer parse")
+
+    # `--portfolio` is gone everywhere.
+    try:
+        parser.parse_args(["portfolio", "report", "--portfolio", "demo"])
+    except SystemExit as exc:
+        assert exc.code != 0
+    else:
+        raise AssertionError("--portfolio should no longer parse")
+
+    # `user list` and `user delete` exist.
+    list_args = parser.parse_args(["user", "list"])
+    assert list_args.user_command == "list"
+    delete_args = parser.parse_args(["user", "delete", "--user", "demo", "--confirm"])
+    assert delete_args.user == "demo"
+    assert delete_args.confirm is True
 
 
 def test_cmd_portfolio_import_prompts_and_persists_missing_mappings(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "portfolio.json"
     mapping_path = tmp_path / "ajbell.yaml"
+    paths = _paths_with(portfolio=portfolio_path)
     cmd_portfolio_create(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan="config/categories.yaml",
-            overwrite=False,
-        )
+        argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
+        paths=paths,
     )
 
     def fake_gather_missing(missing, *, plan_index, input_func=None):
@@ -139,13 +203,13 @@ def test_cmd_portfolio_import_prompts_and_persists_missing_mappings(tmp_path, mo
 
     result = cmd_portfolio_import(
         argparse.Namespace(
-            portfolio=str(portfolio_path),
             source_id="ajbell-sipp",
             adapter="ajbell",
             statement=str(AJ_BELL_FIXTURE),
             mappings=str(mapping_path),
             fx=None,
-        )
+        ),
+        paths=paths,
     )
     assert result == 0
 
@@ -162,12 +226,10 @@ def test_cmd_portfolio_import_prompts_and_persists_missing_mappings(tmp_path, mo
 def test_cmd_portfolio_import_replaces_existing_source_id(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "portfolio.json"
     mapping_path = tmp_path / "broker.yaml"
+    paths = _paths_with(portfolio=portfolio_path)
     cmd_portfolio_create(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan="config/categories.yaml",
-            overwrite=False,
-        )
+        argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
+        paths=paths,
     )
     save_mappings(
         mapping_path,
@@ -215,15 +277,14 @@ def test_cmd_portfolio_import_replaces_existing_source_id(tmp_path, monkeypatch)
     )
 
     args = argparse.Namespace(
-        portfolio=str(portfolio_path),
         source_id="ajbell-sipp",
         adapter="ajbell",
         statement="statement.csv",
         mappings=str(mapping_path),
         fx=None,
     )
-    cmd_portfolio_import(args)
-    cmd_portfolio_import(args)
+    cmd_portfolio_import(args, paths=paths)
+    cmd_portfolio_import(args, paths=paths)
 
     snapshot = load_snapshot(portfolio_path)
     assert len(snapshot["imports"]) == 1
@@ -235,12 +296,10 @@ def test_cmd_portfolio_import_replaces_existing_source_id(tmp_path, monkeypatch)
 def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "portfolio.json"
     mapping_path = tmp_path / "broker.yaml"
+    paths = _paths_with(portfolio=portfolio_path)
     cmd_portfolio_create(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan="config/categories.yaml",
-            overwrite=False,
-        )
+        argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
+        paths=paths,
     )
     save_mappings(
         mapping_path,
@@ -297,23 +356,23 @@ def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
 
     cmd_portfolio_import(
         argparse.Namespace(
-            portfolio=str(portfolio_path),
             source_id="source-a",
             adapter="ajbell",
             statement="a.csv",
             mappings=str(mapping_path),
             fx=None,
-        )
+        ),
+        paths=paths,
     )
     cmd_portfolio_import(
         argparse.Namespace(
-            portfolio=str(portfolio_path),
             source_id="source-b",
             adapter="ibkr",
             statement="b.csv",
             mappings=str(mapping_path),
             fx=None,
-        )
+        ),
+        paths=paths,
     )
 
     snapshot = load_snapshot(portfolio_path)
@@ -321,26 +380,23 @@ def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
     assert len(snapshot["imports"]) == 2
 
 
-def test_cmd_portfolio_add_with_explicit_category_splits_investment(tmp_path, monkeypatch):
+def test_cmd_portfolio_add_with_explicit_category_splits_investment(tmp_path):
     portfolio_path = tmp_path / "portfolio.json"
     manual_mapping_path = tmp_path / "manual.yaml"
+    paths = _paths_with(portfolio=portfolio_path, manual_mappings=manual_mapping_path)
     cmd_portfolio_create(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan="config/categories.yaml",
-            overwrite=False,
-        )
+        argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
+        paths=paths,
     )
-    monkeypatch.setattr(cli_module, "MANUAL_MAPPINGS_PATH", manual_mapping_path)
 
     result = cmd_portfolio_add_instrument(
         argparse.Namespace(
-            portfolio=str(portfolio_path),
             instrument_id="GOLD",
             description="Physical Gold",
             market_value=1000.0,
             category="Alternative / Gold=60, Cash=40",
-        )
+        ),
+        paths=paths,
     )
     assert result == 0
 
@@ -353,14 +409,11 @@ def test_cmd_portfolio_add_with_explicit_category_splits_investment(tmp_path, mo
 def test_cmd_portfolio_add_without_category_reuses_manual_mapping(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "portfolio.json"
     manual_mapping_path = tmp_path / "manual.yaml"
+    paths = _paths_with(portfolio=portfolio_path, manual_mappings=manual_mapping_path)
     cmd_portfolio_create(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan="config/categories.yaml",
-            overwrite=False,
-        )
+        argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
+        paths=paths,
     )
-    monkeypatch.setattr(cli_module, "MANUAL_MAPPINGS_PATH", manual_mapping_path)
 
     call_count = {"value": 0}
 
@@ -376,14 +429,13 @@ def test_cmd_portfolio_add_without_category_reuses_manual_mapping(tmp_path, monk
     monkeypatch.setattr(cli_module, "gather_missing_mappings", fake_gather_missing)
 
     args = argparse.Namespace(
-        portfolio=str(portfolio_path),
         instrument_id="CASH1",
         description="Cash Position",
         market_value=500.0,
         category=None,
     )
-    cmd_portfolio_add_instrument(args)
-    cmd_portfolio_add_instrument(args)
+    cmd_portfolio_add_instrument(args, paths=paths)
+    cmd_portfolio_add_instrument(args, paths=paths)
 
     snapshot = load_snapshot(portfolio_path)
     assert call_count["value"] == 1
@@ -396,7 +448,7 @@ def test_cmd_portfolio_report_reads_legacy_snapshot_without_imports(tmp_path, ca
     portfolio_path.write_text(
         json.dumps(
             {
-                "plan": "config/categories.yaml",
+                "plan": "config/seed_plan.yaml",
                 "created_at": "2026-03-23T12:00:00Z",
                 "investments": [
                     {
@@ -414,11 +466,8 @@ def test_cmd_portfolio_report_reads_legacy_snapshot_without_imports(tmp_path, ca
     )
 
     result = cmd_portfolio_report(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan=None,
-            export=None,
-        )
+        argparse.Namespace(plan=None, export=None),
+        paths=_paths_with(portfolio=portfolio_path),
     )
     assert result == 0
     captured = capsys.readouterr()
@@ -463,11 +512,8 @@ assets:
     )
 
     result = cmd_portfolio_report(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan=None,
-            export=None,
-        )
+        argparse.Namespace(plan=None, export=None),
+        paths=_paths_with(portfolio=portfolio_path),
     )
 
     assert result == 1
@@ -518,11 +564,8 @@ assets:
     )
 
     result = cmd_portfolio_report(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan=None,
-            export=str(export_path),
-        )
+        argparse.Namespace(plan=None, export=str(export_path)),
+        paths=_paths_with(portfolio=portfolio_path),
     )
 
     assert result == 1
@@ -576,11 +619,8 @@ assets:
     )
 
     result = cmd_portfolio_report(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan=None,
-            export=None,
-        )
+        argparse.Namespace(plan=None, export=None),
+        paths=_paths_with(portfolio=portfolio_path),
     )
 
     assert result == 1
@@ -595,7 +635,7 @@ def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, 
     portfolio_path.write_text(
         json.dumps(
             {
-                "plan": "config/categories.yaml",
+                "plan": "config/seed_plan.yaml",
                 "created_at": "2026-03-23T12:00:00Z",
                 "investments": [
                     {
@@ -641,13 +681,13 @@ def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, 
 
     result = cmd_portfolio_import(
         argparse.Namespace(
-            portfolio=str(portfolio_path),
             source_id="ajbell-sipp",
             adapter="ajbell",
             statement="statement.csv",
             mappings=str(mapping_path),
             fx=None,
-        )
+        ),
+        paths=_paths_with(portfolio=portfolio_path),
     )
 
     assert result == 0
@@ -664,7 +704,7 @@ def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tm
     portfolio_path.write_text(
         json.dumps(
             {
-                "plan": "config/categories.yaml",
+                "plan": "config/seed_plan.yaml",
                 "created_at": "2026-03-23T12:00:00Z",
                 "imports": [
                     {
@@ -724,11 +764,8 @@ def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tm
     )
 
     result = cmd_portfolio_report(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan=None,
-            export=str(export_path),
-        )
+        argparse.Namespace(plan=None, export=str(export_path)),
+        paths=_paths_with(portfolio=portfolio_path),
     )
 
     assert result == 0
@@ -748,7 +785,7 @@ def test_cmd_portfolio_report_source_breakdown_sorts_by_value(tmp_path, capsys):
     portfolio_path.write_text(
         json.dumps(
             {
-                "plan": "config/categories.yaml",
+                "plan": "config/seed_plan.yaml",
                 "created_at": "2026-03-23T12:00:00Z",
                 "investments": [
                     {
@@ -784,11 +821,8 @@ def test_cmd_portfolio_report_source_breakdown_sorts_by_value(tmp_path, capsys):
     )
 
     result = cmd_portfolio_report(
-        argparse.Namespace(
-            portfolio=str(portfolio_path),
-            plan=None,
-            export=None,
-        )
+        argparse.Namespace(plan=None, export=None),
+        paths=_paths_with(portfolio=portfolio_path),
     )
 
     assert result == 0

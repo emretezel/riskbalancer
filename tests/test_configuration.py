@@ -10,7 +10,7 @@ from riskbalancer.configuration import (
     load_portfolio_plan_from_yaml,
 )
 
-CONFIG = Path("config") / "categories.yaml"
+CONFIG = Path("config") / "seed_plan.yaml"
 
 
 def test_load_portfolio_plan_from_yaml_generates_targets(tmp_path):

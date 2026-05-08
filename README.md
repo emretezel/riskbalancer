@@ -1,32 +1,39 @@
 # riskbalancer
 
-RiskBalancer ingests broker statements, maps holdings into a nested category plan, converts values to GBP when needed, and compares actual holdings against risk-parity targets.
+RiskBalancer ingests broker statements for one or more household members,
+maps holdings into a per-user nested category plan, converts values to GBP
+when needed, and compares actual holdings against risk-parity targets.
 
 ## Project Layout
 
 ```text
 .
-├── pyproject.toml            # packaging, tooling, pytest config
-├── config/
-│   ├── categories.yaml       # target categories, weights, volatilities
-│   ├── fx.example.yaml       # tracked FX currency template
-│   └── mappings/             # persistent broker + manual instrument mappings
-├── portfolios/               # stored portfolio snapshots (gitignored)
-├── private/                  # local runtime data (gitignored)
-│   ├── fx.yaml               # live FX rates written by the CLI
-│   └── statements/           # broker statement files
-├── reports/                  # exported CSV reports (gitignored)
-├── src/riskbalancer/         # CLI, adapters, models, portfolio logic
-├── tests/                    # pytest suite
-├── AGENTS.md                 # Codex instructions
-└── CLAUDE.md                 # Claude instructions
+├── pyproject.toml                       # packaging, tooling, pytest config
+├── config/                              # committed
+│   ├── seed_plan.yaml                   # catalog floor (the first user's starting point)
+│   ├── riskbalancer.yaml                # holds default_user
+│   ├── mappings/<adapter>.yaml          # shared adapter mappings
+│   └── fx.example.yaml                  # FX template
+├── private/                             # gitignored
+│   ├── fx.yaml                          # shared GBP FX rates (one file across all users)
+│   ├── inbox/                           # shared landing zone for unfiled statements
+│   └── users/<user>/
+│       ├── plan.yaml                    # this user's category plan (target weights)
+│       ├── portfolio.json               # this user's portfolio snapshot
+│       ├── mappings/                    # per-user override directory
+│       │   ├── manual.yaml              # always per-user
+│       │   └── <adapter>.yaml           # optional override of shared mappings
+│       ├── statements/<broker>/...
+│       └── reports/<YYYY-MM-DD>.csv
+├── src/riskbalancer/                    # CLI, adapters, models, portfolio logic
+└── tests/                               # pytest suite
 ```
 
-`private/`, `portfolios/`, and `reports/` are local working directories and should not be committed.
+`private/` is gitignored — never commit it. `config/` is committed.
 
 ## Installation
 
-Use the `riskbalancer` conda environment for project commands:
+Use the `riskbalancer` conda environment:
 
 ```bash
 conda activate riskbalancer
@@ -34,143 +41,121 @@ python -m pip install -e '.[dev]'
 riskbalancer --help
 ```
 
-## Category Plan
+## Picking the user
 
-Edit `config/categories.yaml` first. This file defines the target hierarchy, category weights, and standard deviations (`volatility`).
+Every per-user command takes `--user <name>`. The flag falls back to:
 
-Rules:
+1. the `RISKBALANCER_USER` environment variable, then
+2. the `default_user` field in `config/riskbalancer.yaml`.
 
-- Top-level categories must sum to 100%.
-- Every sibling set must also sum to 100% recursively.
-- Leaf categories need a volatility, either directly or inherited from a parent.
-- `adjustment` is optional and scales raw risk weight before normalization.
+The committed default is `default_user: emre`, so omitting `--user` runs
+commands against `emre`. Override per-command with `--user wife`,
+`--user kid1`, etc.
 
-`portfolio report` validates these totals before producing a report. If any level does not add to 100%, it prints every failure and stops.
+## Main Workflow
 
-## Main Usage
+### 1. Bootstrap a plan for the user
 
-### 1. Finalise categories, weights, and standard deviations
-
-Update `config/categories.yaml` until the hierarchy reflects the portfolio you want to manage.
-
-### 2. Create an empty portfolio
+If you are setting up a new user, build their `plan.yaml` interactively from
+the catalog the system already knows about:
 
 ```bash
-riskbalancer portfolio create \
-  --plan config/categories.yaml \
-  --portfolio emre_portfolio
+riskbalancer plan create --user wife
 ```
 
-This creates `portfolios/emre_portfolio.json` with the stored plan path, timestamps, no imports, and no investments.
+The walk goes one level at a time. At every level it asks which categories
+to include and what risk weight to give each, then recurses into the chosen
+subtree. Leaves prompt for `volatility` and `adjustment` with the catalog's
+suggestion as the default.
 
-### 3. Update FX rates
+To clone an existing user's plan as a starting point:
 
-If you import non-GBP statements, refresh FX first:
+```bash
+riskbalancer plan create --user kid1 --from emre
+```
+
+To check that a plan is well-formed:
+
+```bash
+riskbalancer plan validate --user wife
+```
+
+### 2. Refresh FX rates (shared across users)
 
 ```bash
 riskbalancer fx update --currency USD --currency EUR --currency CHF
 ```
 
-This creates `private/` and `private/fx.yaml` if they do not already exist. Stored rates are GBP-based, so `USD: 0.76` means `1 USD = 0.76 GBP`.
+FX is not per-user — exchange rates are the same for everyone. This writes
+`private/fx.yaml`.
 
-### 4. Import broker statements
+### 3. Drop broker statements into the user's directory
 
-Store statement files under `private/statements/`, for example:
+Statements live under `private/users/<user>/statements/<broker>/<account>/<year>/`.
+For example:
 
 ```text
-private/statements/ajbell/sipp/2026/2026-03-23-positions.csv
-private/statements/ibkr/taxable/2026/U10049818_20260320.csv
-private/statements/ms401k/401k/2026/2026-03-23-positions.csv
-private/statements/citi/taxable/2026/2026-03-23-positions.csv
+private/users/emre/statements/ajbell/sipp/2026/2026-03-23-positions.csv
+private/users/emre/statements/ibkr/taxable/2026/U10049818_20260320.csv
+private/users/wife/statements/ajbell/isa/2026/portfolio-AB8LNFI-ISA.csv
 ```
 
-Import one account at a time with a stable `source_id`:
+Use `private/inbox/` as a shared landing zone if you need to triage a file
+before deciding which user it belongs to.
+
+### 4. Import each statement
 
 ```bash
 riskbalancer portfolio import \
-  --portfolio emre_portfolio \
+  --user emre \
   --source-id ajbell-sipp \
   --adapter ajbell \
-  --statement private/statements/ajbell/sipp/2026/2026-03-23-positions.csv
+  --statement private/users/emre/statements/ajbell/sipp/2026/2026-03-23-positions.csv
 ```
 
-```bash
-riskbalancer portfolio import \
-  --portfolio emre_portfolio \
-  --source-id ibkr-taxable \
-  --adapter ibkr \
-  --statement private/statements/ibkr/taxable/2026/U10049818_20260320.csv \
-  --fx private/fx.yaml
-```
+Mapping resolution is layered: the shared file at
+`config/mappings/<adapter>.yaml` is read first, then the per-user override
+at `private/users/<user>/mappings/<adapter>.yaml` replaces individual
+entries by instrument id. New mappings learned interactively are written
+only to the override file so the shared catalog stays curated.
 
-Import behavior:
+`portfolio import` re-imports replace by `--source-id` so re-running with the
+same source updates that source's positions and leaves other sources alone.
 
-- If a holding has no mapping yet, the CLI prompts for category allocations and saves them in `config/mappings/<adapter>.yaml`.
-- If you re-import the same `source_id`, the CLI replaces only that source’s imported positions.
-- Manual holdings and other broker sources are left untouched.
-
-Supported adapters in the main workflow are `ajbell`, `ibkr`, `ms401k`, `schwab`, and `citi`.
+Supported adapters: `ajbell`, `citi`, `ibkr`, `ms401k`, `schwab`.
 
 ### 5. Add manual investments
 
-Use `portfolio add` for holdings that do not come from broker statements, such as cash, gold, or private investments.
-
-Examples:
-
 ```bash
 riskbalancer portfolio add \
-  --portfolio emre_portfolio \
-  --instrument-id CASH_GBP \
-  --description "GBP Cash" \
-  --market-value 25000 \
-  --category "Cash"
-```
-
-```bash
-riskbalancer portfolio add \
-  --portfolio emre_portfolio \
+  --user emre \
   --instrument-id GOLD \
   --description "Physical Gold" \
   --market-value 15000 \
   --category "Alternative / Gold"
 ```
 
-```bash
-riskbalancer portfolio add \
-  --portfolio emre_portfolio \
-  --instrument-id SYSTEMATICA \
-  --description "Systematic Strategy" \
-  --market-value 40000 \
-  --category "Alternative / Systematic"
-```
-
-If you omit `--category`, the CLI looks in `config/mappings/manual.yaml`. For a new manual instrument it prompts once, stores the mapping, and reuses it on future adds.
+Manual mappings live in `private/users/<user>/mappings/manual.yaml`.
 
 ### 6. Run the report
 
 ```bash
-riskbalancer portfolio report --portfolio emre_portfolio
+riskbalancer portfolio report --user emre
 ```
 
-Optional CSV export:
+To export the category summary as CSV:
 
 ```bash
-riskbalancer portfolio report \
-  --portfolio emre_portfolio \
-  --export reports/emre_portfolio.csv
+riskbalancer portfolio report --user emre --export
 ```
 
-Report behavior:
-
-- Terminal output includes the category summary and a GBP source breakdown.
-- The source breakdown aggregates each imported `source_id` plus all manual additions.
-- The CSV export contains only the category summary.
-- If the category plan is invalid, the command prints all weight-validation failures and exits without producing the report.
+The bare `--export` writes to
+`private/users/emre/reports/<YYYY-MM-DD>.csv`. Pass an explicit path to
+override.
 
 ## Supporting Commands
 
 ```bash
-riskbalancer portfolio list
-riskbalancer portfolio delete --portfolio emre_portfolio
-riskbalancer fx update
+riskbalancer user list                           # list all users with portfolios
+riskbalancer user delete --user wife --confirm   # wipe a user's directory
 ```

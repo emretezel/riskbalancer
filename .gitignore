@@ -73,8 +73,6 @@ Icon?
 
 # Private workspace
 private/
-portfolios/
-reports/
 
 # Logs
 *.log

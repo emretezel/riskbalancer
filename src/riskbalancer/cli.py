@@ -36,15 +36,42 @@ from .configuration import (
     load_portfolio_plan_from_yaml,
 )
 from .models import CategoryPath, Investment
+from .paths import UserPaths, resolve_default_user
+from .plan_bootstrap import (
+    StdIO,
+    build_catalog,
+    clone_plan,
+    count_unique_categories,
+    describe_catalog_sources,
+    walk_catalog_interactive,
+    write_plan_yaml,
+)
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
 DEFAULT_LEAF_VOLATILITY = 0.15
-PORTFOLIO_DIR = Path("portfolios")
-MANUAL_MAPPINGS_PATH = Path("config/mappings/manual.yaml")
-DEFAULT_FX_PATH = Path("private/fx.yaml")
-FX_TEMPLATE_PATH = Path("config/fx.example.yaml")
 ECB_DAILY_RATES_URL = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
 FX_HTTP_USER_AGENT = "riskbalancer/1.0"
+
+
+def _paths_from_args(args: argparse.Namespace) -> UserPaths:
+    """Resolve the `UserPaths` for a parsed CLI invocation.
+
+    Reads `args.user` first (set by the `--user` flag) and falls back to the
+    default-user lookup (`RISKBALANCER_USER` env var, then
+    `config/riskbalancer.yaml`). Missing values resolve to the empty string,
+    which produces sensible-but-unusable per-user paths so commands that do
+    not need a user (such as `fx update`) still work.
+    """
+    user = getattr(args, "user", None) or resolve_default_user() or ""
+    return UserPaths.for_user(user)
+
+
+def _default_paths() -> UserPaths:
+    """Fallback `UserPaths` for tests that do not pass an explicit `paths`."""
+    user = resolve_default_user() or ""
+    return UserPaths.for_user(user)
+
+
 ADAPTERS = {
     "ajbell": AJBellCSVAdapter,
     "citi": CitiCSVAdapter,
@@ -208,9 +235,22 @@ def _parse_weight_input(raw: str) -> float:
     return value
 
 
-def resolve_mapping_path(adapter: str, raw_path: Optional[str] = None) -> Path:
-    """Resolve the mappings path for a broker adapter."""
-    mappings_path = Path(raw_path) if raw_path else Path(f"config/mappings/{adapter}.yaml")
+def resolve_mapping_path(
+    adapter: str,
+    raw_path: Optional[str] = None,
+    *,
+    paths: Optional[UserPaths] = None,
+) -> Path:
+    """Resolve the mappings path for a broker adapter.
+
+    Falls back to `<paths.shared_mappings_dir>/<adapter>.yaml` when no
+    explicit path is supplied. The default `paths` is the system layout.
+    """
+    if raw_path:
+        mappings_path = Path(raw_path)
+    else:
+        resolved_paths = paths if paths is not None else _default_paths()
+        mappings_path = resolved_paths.adapter_mappings_path(adapter)
     mappings_path.parent.mkdir(parents=True, exist_ok=True)
     return mappings_path
 
@@ -219,9 +259,17 @@ def _utc_timestamp() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
-def load_fx_rates(path: Optional[str] = None) -> Dict[str, float]:
+def load_fx_rates(
+    path: Optional[str] = None,
+    *,
+    paths: Optional[UserPaths] = None,
+) -> Dict[str, float]:
     """Load FX rates (currency -> GBP) from YAML."""
-    fx_path = Path(path or DEFAULT_FX_PATH)
+    if path:
+        fx_path = Path(path)
+    else:
+        resolved_paths = paths if paths is not None else _default_paths()
+        fx_path = resolved_paths.fx
     if not fx_path.exists():
         return {}
     data = yaml.safe_load(fx_path.read_text(encoding="utf-8"))
@@ -274,12 +322,20 @@ def tracked_fx_currencies(path: Path) -> List[str]:
     return _normalize_currency_codes(raw_currencies)
 
 
-def resolve_tracked_fx_currencies(path: Path) -> List[str]:
-    """Resolve tracked currencies from the target file or the checked-in template."""
+def resolve_tracked_fx_currencies(
+    path: Path,
+    *,
+    fallback_template: Optional[Path] = None,
+) -> List[str]:
+    """Resolve tracked currencies from the target file or a checked-in template.
+
+    The caller decides when to allow a template fallback by passing
+    `fallback_template`; the function itself does not assume a layout.
+    """
     if path.exists():
         return tracked_fx_currencies(path)
-    if path == DEFAULT_FX_PATH and FX_TEMPLATE_PATH.exists():
-        return tracked_fx_currencies(FX_TEMPLATE_PATH)
+    if fallback_template is not None and fallback_template.exists():
+        return tracked_fx_currencies(fallback_template)
     raise FileNotFoundError(f"FX file {path} not found. Use --currency to bootstrap a new FX file.")
 
 
@@ -445,11 +501,24 @@ def _snapshot_imports(snapshot: Mapping[str, object]) -> List[ImportRecord]:
     return imports
 
 
-def _snapshot_plan_path(snapshot: Mapping[str, object]) -> Path:
-    plan_value = snapshot.get("plan", "config/categories.yaml")
-    if not isinstance(plan_value, str):
+def _snapshot_plan_path(
+    snapshot: Mapping[str, object],
+    *,
+    fallback: Optional[Path] = None,
+) -> Path:
+    """Read a snapshot's ``plan`` field, falling back when it is absent.
+
+    The fallback is provided by the caller (typically `paths.plan` for the
+    user being acted on) so this function does not embed a layout decision.
+    """
+    plan_value = snapshot.get("plan")
+    if isinstance(plan_value, str) and plan_value:
+        return Path(plan_value)
+    if plan_value is not None:
         raise ValueError("Stored plan path must be a string")
-    return Path(plan_value)
+    if fallback is not None:
+        return fallback
+    raise ValueError("Portfolio snapshot does not record a plan path and no fallback was provided")
 
 
 def _snapshot_created_at(snapshot: Mapping[str, object]) -> str:
@@ -628,14 +697,50 @@ def export_summary_to_csv(path: Path, rows: List[Dict[str, float]]) -> None:
             )
 
 
-def resolve_portfolio_path(value: str) -> Path:
-    """Resolve portfolio names into JSON file paths."""
-    path = Path(value)
-    if path.is_dir():
-        raise ValueError("Portfolio path must be a file, not a directory")
-    if not path.suffix:
-        path = PORTFOLIO_DIR / f"{path}.json"
-    return path
+def load_layered_mappings(
+    adapter: str,
+    paths: UserPaths,
+    *,
+    log_overrides: bool = False,
+) -> Dict[str, InstrumentMapping]:
+    """Merge the shared adapter mappings with the per-user override file.
+
+    The shared file (`config/mappings/<adapter>.yaml`) provides defaults for
+    instruments held by anyone in the household; the per-user override
+    (`private/users/<user>/mappings/<adapter>.yaml`) replaces individual
+    entries by instrument id. New mappings learned at import time are written
+    only to the override file so the shared catalog stays curated.
+    """
+    merged = load_mappings(paths.adapter_mappings_path(adapter))
+    overrides = load_mappings(paths.adapter_overrides_path(adapter))
+    for instrument, mapping in overrides.items():
+        if log_overrides and instrument in merged:
+            print(f"Using user override for {instrument}", file=sys.stderr)
+        merged[instrument] = mapping
+    return merged
+
+
+def resolve_mapping_sources(
+    adapter: str,
+    raw_path: Optional[str],
+    paths: UserPaths,
+    *,
+    log_overrides: bool = False,
+) -> tuple[Dict[str, InstrumentMapping], Path]:
+    """Return the (read-time, write-time) pair for instrument mappings.
+
+    When `raw_path` is provided the caller is pointing at a single explicit
+    file: that file is both the read and write target (no layering, by
+    request). Otherwise the read view is the layered union of shared +
+    per-user override and new entries are written only to the override.
+    """
+    if raw_path:
+        write_path = Path(raw_path)
+        write_path.parent.mkdir(parents=True, exist_ok=True)
+        return load_mappings(write_path), write_path
+    write_path = paths.adapter_overrides_path(adapter)
+    write_path.parent.mkdir(parents=True, exist_ok=True)
+    return load_layered_mappings(adapter, paths, log_overrides=log_overrides), write_path
 
 
 def save_portfolio_snapshot(
@@ -777,35 +882,48 @@ def ensure_mappings_for_investments(
     *,
     plan_index: PlanIndex,
     input_func: Optional[Callable[[str], str]] = None,
+    existing_mappings: Optional[Dict[str, InstrumentMapping]] = None,
 ) -> tuple[Dict[str, InstrumentMapping], int]:
-    """Load mappings, prompt for missing instruments, and persist new entries."""
-    mappings = load_mappings(mapping_path)
+    """Prompt for missing mappings and persist new entries.
+
+    `existing_mappings` lets the caller pass an already-merged view (e.g. the
+    layered shared+override result) so the lookup uses the full picture even
+    when new entries are written to a narrower file. Missing entries are
+    written to `mapping_path`, merged with whatever already lives there, so
+    the file accumulates over time.
+    """
+    if existing_mappings is None:
+        existing_mappings = load_mappings(mapping_path)
     missing = sorted(
-        {inv.instrument_id for inv in investments if inv.instrument_id not in mappings}
+        {inv.instrument_id for inv in investments if inv.instrument_id not in existing_mappings}
     )
     if not missing:
-        return mappings, 0
+        return existing_mappings, 0
     new_entries = gather_missing_mappings(
         missing,
         plan_index=plan_index,
         input_func=input_func,
     )
-    mappings.update(new_entries)
-    save_mappings(mapping_path, mappings)
-    return mappings, len(new_entries)
+    persisted = load_mappings(mapping_path)
+    persisted.update(new_entries)
+    save_mappings(mapping_path, persisted)
+    existing_mappings.update(new_entries)
+    return existing_mappings, len(new_entries)
 
 
 def tag_imported_investments(investments: Iterable[Investment], source_id: str) -> List[Investment]:
     return [replace(investment, source_id=source_id) for investment in investments]
 
 
-def cmd_fx_update(args: argparse.Namespace) -> int:
+def cmd_fx_update(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    paths = paths if paths is not None else _default_paths()
     fx_path = Path(args.fx)
+    fallback = paths.fx_template if fx_path == paths.fx else None
     try:
         currencies = (
             _normalize_currency_codes(args.currency)
             if args.currency
-            else resolve_tracked_fx_currencies(fx_path)
+            else resolve_tracked_fx_currencies(fx_path, fallback_template=fallback)
         )
         if not currencies:
             raise ValueError("At least one currency must be specified or already tracked")
@@ -820,12 +938,14 @@ def cmd_fx_update(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_categorize(args: argparse.Namespace) -> int:
-    plan = load_portfolio_plan_from_yaml(args.plan, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
+def cmd_categorize(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    paths = paths if paths is not None else _paths_from_args(args)
+    plan_arg = getattr(args, "plan", None)
+    plan_path = Path(plan_arg) if plan_arg else _resolve_user_plan_path(paths)
+    plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     plan_index = PlanIndex.from_plan(plan)
-    mapping_path = resolve_mapping_path(args.adapter, args.mappings)
-    mappings = load_mappings(mapping_path)
-    fx_rates = load_fx_rates()
+    mappings, write_path = resolve_mapping_sources(args.adapter, args.mappings, paths)
+    fx_rates = load_fx_rates(paths=paths)
     investments = parse_statement(Path(args.statement), args.adapter, fx_rates=fx_rates)
     missing = [inv.instrument_id for inv in investments if inv.instrument_id not in mappings]
     if not missing:
@@ -833,39 +953,64 @@ def cmd_categorize(args: argparse.Namespace) -> int:
         return 0
     _, new_count = ensure_mappings_for_investments(
         investments,
-        mapping_path,
+        write_path,
         plan_index=plan_index,
+        existing_mappings=mappings,
     )
-    print(f"Stored {new_count} new mappings in {mapping_path}")
+    print(f"Stored {new_count} new mappings in {write_path}")
     return 0
 
 
-def cmd_portfolio_create(args: argparse.Namespace) -> int:
-    portfolio_path = resolve_portfolio_path(args.portfolio)
-    plan_path = Path(args.plan)
-    if portfolio_path.exists() and not args.overwrite:
-        raise FileExistsError(f"{portfolio_path} already exists. Use --overwrite to replace it.")
-    save_portfolio_snapshot(portfolio_path, plan_path, [], imports=[])
-    print(f"Created empty portfolio at {portfolio_path}")
+def _resolve_user_plan_path(paths: UserPaths) -> Path:
+    """Return the plan file for this user, falling back to the seed plan."""
+    if paths.plan.exists():
+        return paths.plan
+    return paths.seed_plan
+
+
+def cmd_portfolio_create(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """Create an empty portfolio snapshot for the resolved user.
+
+    Retained as a helper so test fixtures and one-shot bootstraps can build
+    an empty `portfolio.json` without going through `portfolio import`.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    plan_arg = getattr(args, "plan", None)
+    plan_path = Path(plan_arg) if plan_arg else _resolve_user_plan_path(paths)
+    overwrite = bool(getattr(args, "overwrite", False))
+    if paths.portfolio.exists() and not overwrite:
+        raise FileExistsError(f"{paths.portfolio} already exists. Use --overwrite to replace it.")
+    save_portfolio_snapshot(paths.portfolio, plan_path, [], imports=[])
+    print(f"Created empty portfolio at {paths.portfolio}")
     return 0
 
 
-def cmd_portfolio_import(args: argparse.Namespace) -> int:
-    portfolio_path = resolve_portfolio_path(args.portfolio)
-    if not portfolio_path.exists():
-        raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
-    snapshot = load_portfolio_snapshot(portfolio_path)
-    plan_path = _snapshot_plan_path(snapshot)
+def _ensure_portfolio_exists(paths: UserPaths) -> None:
+    """Create an empty portfolio snapshot for this user if none exists yet."""
+    if paths.portfolio.exists():
+        return
+    plan_path = _resolve_user_plan_path(paths)
+    save_portfolio_snapshot(paths.portfolio, plan_path, [], imports=[])
+
+
+def cmd_portfolio_import(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    paths = paths if paths is not None else _paths_from_args(args)
+    _ensure_portfolio_exists(paths)
+    snapshot = load_portfolio_snapshot(paths.portfolio)
+    plan_path = _snapshot_plan_path(snapshot, fallback=_resolve_user_plan_path(paths))
     plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     plan_index = PlanIndex.from_plan(plan)
 
-    mapping_path = resolve_mapping_path(args.adapter, args.mappings)
-    fx_rates = load_fx_rates(args.fx)
+    mappings, write_path = resolve_mapping_sources(
+        args.adapter, args.mappings, paths, log_overrides=True
+    )
+    fx_rates = load_fx_rates(args.fx, paths=paths)
     parsed_investments = parse_statement(Path(args.statement), args.adapter, fx_rates=fx_rates)
     mappings, new_count = ensure_mappings_for_investments(
         parsed_investments,
-        mapping_path,
+        write_path,
         plan_index=plan_index,
+        existing_mappings=mappings,
     )
     imported_investments = tag_imported_investments(
         apply_mappings_to_investments(parsed_investments, mappings),
@@ -886,12 +1031,12 @@ def cmd_portfolio_import(args: argparse.Namespace) -> int:
             source_id=args.source_id,
             adapter=args.adapter,
             statement=str(Path(args.statement)),
-            mappings=str(mapping_path),
+            mappings=str(write_path),
             imported_at=_utc_timestamp(),
         )
     )
     save_portfolio_snapshot(
-        portfolio_path,
+        paths.portfolio,
         plan_path,
         preserved_investments + imported_investments,
         imports=imports,
@@ -900,20 +1045,41 @@ def cmd_portfolio_import(args: argparse.Namespace) -> int:
     if replaced_count:
         print(f"Replaced {replaced_count} existing position(s) for source '{args.source_id}'.")
     if new_count:
-        print(f"Stored {new_count} new mapping(s) in {mapping_path}.")
+        print(f"Stored {new_count} new mapping(s) in {write_path}.")
     print(
         f"Imported {len(imported_investments)} position(s) from {args.statement} "
-        f"into {portfolio_path} as '{args.source_id}'."
+        f"into {paths.portfolio} as '{args.source_id}'."
     )
     return 0
 
 
-def cmd_portfolio_report(args: argparse.Namespace) -> int:
-    portfolio_path = resolve_portfolio_path(args.portfolio)
-    if not portfolio_path.exists():
-        raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
-    snapshot = load_portfolio_snapshot(portfolio_path)
-    plan_path = Path(args.plan) if args.plan else _snapshot_plan_path(snapshot)
+def _resolve_export_path(args: argparse.Namespace, paths: UserPaths) -> Optional[Path]:
+    """Return the CSV export destination, or None if no export was requested.
+
+    `--export` accepts an optional value: if the flag is present without an
+    argument, the report is exported to the user's reports directory using
+    today's date as the filename.
+    """
+    raw = getattr(args, "export", None)
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw and raw != "__default__":
+        return Path(raw)
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    return paths.reports_dir / f"{today}.csv"
+
+
+def cmd_portfolio_report(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    paths = paths if paths is not None else _paths_from_args(args)
+    if not paths.portfolio.exists():
+        raise FileNotFoundError(f"Portfolio file {paths.portfolio} not found")
+    snapshot = load_portfolio_snapshot(paths.portfolio)
+    plan_arg = getattr(args, "plan", None)
+    plan_path = (
+        Path(plan_arg)
+        if plan_arg
+        else _snapshot_plan_path(snapshot, fallback=_resolve_user_plan_path(paths))
+    )
     category_nodes = load_category_nodes_from_yaml(plan_path)
     validation_failures = collect_category_weight_validation_failures(category_nodes)
     if validation_failures:
@@ -926,52 +1092,127 @@ def cmd_portfolio_report(args: argparse.Namespace) -> int:
     investments = investments_from_dicts(_snapshot_investments(snapshot))
     total_value, summary = summarize_portfolio(plan, investments)
     source_total_value, source_rows = summarize_sources(investments)
-    print(f"Loaded {len(investments)} investments from {portfolio_path}")
+    print(f"Loaded {len(investments)} investments from {paths.portfolio}")
     print_summary_table(total_value, summary)
     print()
     print_source_breakdown(source_total_value, source_rows)
-    if args.export:
-        export_summary_to_csv(Path(args.export), summary)
-        print(f"Wrote summary to {args.export}")
+    export_path = _resolve_export_path(args, paths)
+    if export_path is not None:
+        export_summary_to_csv(export_path, summary)
+        print(f"Wrote summary to {export_path}")
     return 0
 
 
-def cmd_portfolio_list(args: argparse.Namespace) -> int:
-    directory = PORTFOLIO_DIR
-    if not directory.exists():
-        print("No stored portfolios.")
+def cmd_plan_create(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    paths = paths if paths is not None else _paths_from_args(args)
+    if not paths.user:
+        print(
+            "plan create requires a --user (or RISKBALANCER_USER / default_user)",
+            file=sys.stderr,
+        )
+        return 1
+    overwrite = bool(getattr(args, "overwrite", False))
+    if paths.plan.exists() and not overwrite:
+        print(
+            f"Plan already exists at {paths.plan}. Use --overwrite to replace it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    source_user = getattr(args, "from_user", None)
+    if source_user:
+        source_paths = UserPaths.for_user(source_user, root=paths.root)
+        clone_plan(source_paths, paths)
+        print(f"Cloned plan from {source_paths.plan} to {paths.plan}")
         return 0
-    files = sorted(directory.glob("*.json"))
-    if not files:
-        print("No stored portfolios.")
+
+    catalog = build_catalog(paths)
+    print(describe_catalog_sources(paths))
+    print(f"Catalog contains {count_unique_categories(catalog)} unique categories.")
+    plan_nodes = walk_catalog_interactive(catalog, StdIO())
+    failures = collect_category_weight_validation_failures(plan_nodes)
+    if failures:
+        print(format_category_weight_validation_failures(failures), file=sys.stderr)
+        return 1
+    write_plan_yaml(paths.plan, plan_nodes)
+    leaf_count = sum(1 for _ in _iter_leaves(plan_nodes))
+    print(f"Wrote plan to {paths.plan} ({leaf_count} leaf categories).")
+    return 0
+
+
+def _iter_leaves(nodes: Iterable) -> Iterable:
+    for node in nodes:
+        if node.children:
+            yield from _iter_leaves(node.children)
+        else:
+            yield node
+
+
+def cmd_plan_validate(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    paths = paths if paths is not None else _paths_from_args(args)
+    explicit = getattr(args, "path", None)
+    plan_path = Path(explicit) if explicit else paths.plan
+    if not plan_path.exists():
+        print(f"Plan file {plan_path} not found", file=sys.stderr)
+        return 1
+    nodes = load_category_nodes_from_yaml(plan_path)
+    failures = collect_category_weight_validation_failures(nodes)
+    if failures:
+        print(format_category_weight_validation_failures(failures), file=sys.stderr)
+        return 1
+    print(f"{plan_path} is valid.")
+    return 0
+
+
+def cmd_user_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    paths = paths if paths is not None else _paths_from_args(args)
+    root = paths.users_root
+    if not root.exists():
+        print("No stored users.")
         return 0
-    for file in files:
-        snapshot = load_portfolio_snapshot(file)
+    candidates = sorted(child for child in root.iterdir() if child.is_dir())
+    listed = 0
+    for user_dir in candidates:
+        portfolio_file = user_dir / "portfolio.json"
+        if not portfolio_file.exists():
+            continue
+        snapshot = load_portfolio_snapshot(portfolio_file)
         created = snapshot.get("created_at", "?")
         plan = snapshot.get("plan", "?")
-        print(f"{file.name:<25} plan={plan} created={created}")
+        print(f"{user_dir.name:<25} plan={plan} created={created}")
+        listed += 1
+    if listed == 0:
+        print("No stored users.")
     return 0
 
 
-def cmd_portfolio_delete(args: argparse.Namespace) -> int:
-    portfolio_path = resolve_portfolio_path(args.portfolio)
-    if not portfolio_path.exists():
-        raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
-    portfolio_path.unlink()
-    print(f"Deleted {portfolio_path}")
+def cmd_user_delete(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    paths = paths if paths is not None else _paths_from_args(args)
+    if not paths.user_dir.exists():
+        raise FileNotFoundError(f"User directory {paths.user_dir} not found")
+    if not getattr(args, "confirm", False):
+        raise ValueError(
+            f"Refusing to delete {paths.user_dir} without --confirm "
+            "(this removes the entire user directory including statements and reports)"
+        )
+    import shutil
+
+    shutil.rmtree(paths.user_dir)
+    print(f"Deleted {paths.user_dir}")
     return 0
 
 
-def cmd_portfolio_add_instrument(args: argparse.Namespace) -> int:
-    portfolio_path = resolve_portfolio_path(args.portfolio)
-    if not portfolio_path.exists():
-        raise FileNotFoundError(f"Portfolio file {portfolio_path} not found")
-    snapshot = load_portfolio_snapshot(portfolio_path)
-    plan_path = _snapshot_plan_path(snapshot)
+def cmd_portfolio_add_instrument(
+    args: argparse.Namespace, paths: Optional[UserPaths] = None
+) -> int:
+    paths = paths if paths is not None else _paths_from_args(args)
+    _ensure_portfolio_exists(paths)
+    snapshot = load_portfolio_snapshot(paths.portfolio)
+    plan_path = _snapshot_plan_path(snapshot, fallback=_resolve_user_plan_path(paths))
     plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
     plan_index = PlanIndex.from_plan(plan)
 
-    manual_path = MANUAL_MAPPINGS_PATH
+    manual_path = paths.manual_mappings
     manual_path.parent.mkdir(parents=True, exist_ok=True)
     manual_mappings = load_mappings(manual_path)
 
@@ -1007,28 +1248,42 @@ def cmd_portfolio_add_instrument(args: argparse.Namespace) -> int:
             )
         )
     save_portfolio_snapshot(
-        portfolio_path,
+        paths.portfolio,
         plan_path,
         existing_investments,
         imports=imports,
         created_at=_snapshot_created_at(snapshot),
     )
 
-    print(f"Added {args.instrument_id} to {portfolio_path} using manual mappings")
+    print(f"Added {args.instrument_id} to {paths.portfolio} using manual mappings")
     return 0
+
+
+def _user_parent_parser() -> argparse.ArgumentParser:
+    """Argparse parent that adds `--user` to every subcommand that needs it."""
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument(
+        "--user",
+        help=(
+            "User name. Defaults to the RISKBALANCER_USER environment variable "
+            "or the default_user field in config/riskbalancer.yaml."
+        ),
+    )
+    return parent
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RiskBalancer CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    user_parent = _user_parent_parser()
 
+    # fx — shared across users; no --user.
     fx_parser = subparsers.add_parser("fx", help="Manage FX rate data")
     fx_sub = fx_parser.add_subparsers(dest="fx_command", required=True)
-
     fx_update = fx_sub.add_parser("update", help="Update private/fx.yaml from ECB reference rates")
     fx_update.add_argument(
         "--fx",
-        default=str(DEFAULT_FX_PATH),
+        default="private/fx.yaml",
         help="Path to FX YAML (defaults to private/fx.yaml)",
     )
     fx_update.add_argument(
@@ -1038,58 +1293,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fx_update.set_defaults(func=cmd_fx_update)
 
+    # categorize — operates on a user's plan and adapter mappings.
     categorize = subparsers.add_parser(
-        "categorize", help="Assign categories to unmapped instruments"
+        "categorize",
+        parents=[user_parent],
+        help="Assign categories to unmapped instruments",
     )
     categorize.add_argument("--adapter", default="ajbell", choices=ADAPTERS.keys())
     categorize.add_argument("--statement", required=True, help="Path to broker CSV statement")
     categorize.add_argument(
         "--plan",
-        default="config/categories.yaml",
-        help="Path to categories YAML (defaults to config/categories.yaml)",
+        help="Path to categories YAML (defaults to the user's plan.yaml or seed_plan.yaml)",
     )
     categorize.add_argument(
         "--mappings",
-        help="Path to YAML mapping file (defaults to config/mappings/<adapter>.yaml)",
+        help=(
+            "Optional explicit mappings file. When omitted, the layered "
+            "shared+per-user override resolution is used."
+        ),
     )
     categorize.set_defaults(func=cmd_categorize)
 
-    portfolio_parser = subparsers.add_parser("portfolio", help="Manage stored portfolios")
+    # portfolio — user-keyed actions on this user's snapshot.
+    portfolio_parser = subparsers.add_parser("portfolio", help="Manage portfolio data")
     portfolio_sub = portfolio_parser.add_subparsers(dest="portfolio_command", required=True)
-
-    create = portfolio_sub.add_parser("create", help="Create an empty portfolio snapshot")
-    create.add_argument(
-        "--plan",
-        default="config/categories.yaml",
-        help="Path to categories YAML (defaults to config/categories.yaml)",
-    )
-    create.add_argument(
-        "--portfolio",
-        required=True,
-        help="Portfolio name or file path (defaults to portfolios/<name>.json if no extension)",
-    )
-    create.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite an existing portfolio snapshot",
-    )
-    create.set_defaults(func=cmd_portfolio_create)
 
     portfolio_import = portfolio_sub.add_parser(
         "import",
-        help="Import a single broker statement into an existing portfolio",
-    )
-    portfolio_import.add_argument(
-        "--portfolio",
-        required=True,
-        help="Portfolio name or file path",
+        parents=[user_parent],
+        help="Import a single broker statement into the user's portfolio",
     )
     portfolio_import.add_argument("--source-id", required=True, help="Stable source identifier")
     portfolio_import.add_argument("--adapter", required=True, choices=ADAPTERS.keys())
     portfolio_import.add_argument("--statement", required=True, help="Path to broker CSV statement")
     portfolio_import.add_argument(
         "--mappings",
-        help="Path to YAML mapping file (defaults to config/mappings/<adapter>.yaml)",
+        help=(
+            "Optional explicit mappings file. When omitted, the layered "
+            "shared+per-user override resolution is used."
+        ),
     )
     portfolio_import.add_argument(
         "--fx",
@@ -1097,39 +1339,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     portfolio_import.set_defaults(func=cmd_portfolio_import)
 
-    report = portfolio_sub.add_parser("report", help="Analyze a stored portfolio snapshot")
-    report.add_argument(
-        "--portfolio",
-        required=True,
-        help="Portfolio name or file path",
+    report = portfolio_sub.add_parser(
+        "report", parents=[user_parent], help="Analyze the user's portfolio snapshot"
     )
     report.add_argument(
         "--plan",
-        help=(
-            "Optional plan path override "
-            "(defaults to the plan stored with the portfolio or config/categories.yaml)"
-        ),
+        help="Optional plan path override (defaults to the plan stored with the portfolio)",
     )
     report.add_argument(
-        "--export", help="Optional CSV path to export the summary for Excel/analysis"
+        "--export",
+        nargs="?",
+        const="__default__",
+        default=None,
+        help=(
+            "Export the category summary as CSV. Pass an explicit path or use the bare "
+            "flag to write to <user>/reports/<YYYY-MM-DD>.csv."
+        ),
     )
     report.set_defaults(func=cmd_portfolio_report)
 
-    plist = portfolio_sub.add_parser("list", help="List stored portfolio snapshots")
-    plist.set_defaults(func=cmd_portfolio_list)
-
-    delete = portfolio_sub.add_parser("delete", help="Delete a stored portfolio snapshot")
-    delete.add_argument(
-        "--portfolio",
-        required=True,
-        help="Portfolio name or file path to delete",
-    )
-    delete.set_defaults(func=cmd_portfolio_delete)
-
     add_manual = portfolio_sub.add_parser(
-        "add", help="Manually append an instrument to a portfolio"
+        "add", parents=[user_parent], help="Manually append an instrument to this portfolio"
     )
-    add_manual.add_argument("--portfolio", required=True, help="Portfolio name or path")
     add_manual.add_argument("--instrument-id", required=True)
     add_manual.add_argument("--description", required=True)
     add_manual.add_argument("--market-value", required=True, type=float)
@@ -1138,13 +1369,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional category path(s); prompt/manual mappings used if omitted",
     )
     add_manual.set_defaults(func=cmd_portfolio_add_instrument)
+
+    # plan — bootstrap and validate per-user category plans.
+    plan_parser = subparsers.add_parser("plan", help="Manage user category plans")
+    plan_sub = plan_parser.add_subparsers(dest="plan_command", required=True)
+
+    plan_create = plan_sub.add_parser(
+        "create",
+        parents=[user_parent],
+        help="Bootstrap a new plan.yaml for the user, either interactively or by cloning",
+    )
+    plan_create.add_argument(
+        "--from",
+        dest="from_user",
+        help="Clone the plan from another user instead of walking the catalog interactively",
+    )
+    plan_create.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace the user's existing plan if one is already on disk",
+    )
+    plan_create.set_defaults(func=cmd_plan_create)
+
+    plan_validate = plan_sub.add_parser(
+        "validate",
+        parents=[user_parent],
+        help="Validate a plan's sibling weight totals; exits 0 on success, 1 on failure",
+    )
+    plan_validate.add_argument(
+        "--path",
+        help="Optional explicit plan path (defaults to the user's plan.yaml)",
+    )
+    plan_validate.set_defaults(func=cmd_plan_validate)
+
+    # user — manage which users exist in private/users/.
+    user_parser = subparsers.add_parser("user", help="Manage users")
+    user_sub = user_parser.add_subparsers(dest="user_command", required=True)
+    user_list = user_sub.add_parser("list", help="List stored users")
+    user_list.set_defaults(func=cmd_user_list)
+    user_delete = user_sub.add_parser(
+        "delete",
+        parents=[user_parent],
+        help="Remove a user's directory (statements, mappings, plan, portfolio, reports)",
+    )
+    user_delete.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Required acknowledgement: this wipes the entire user directory",
+    )
+    user_delete.set_defaults(func=cmd_user_delete)
+
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    paths = _paths_from_args(args)
+    return args.func(args, paths)
 
 
 if __name__ == "__main__":
