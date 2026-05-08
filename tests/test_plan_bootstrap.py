@@ -558,6 +558,56 @@ def test_confirm_and_write_plan_aborts_on_quit(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Weight parsing: zero is allowed; small suggestions render with precision
+# ---------------------------------------------------------------------------
+
+
+def test_walk_catalog_accepts_zero_weight_when_siblings_cover_100(tmp_path):
+    """Picking a category at 0% is allowed if siblings make up the level."""
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    # Top level: Equities=100, Bonds=0. Level still sums to 100% so the
+    # validator accepts it. Then drill through to the NAM leaf.
+    answers = [
+        "Equities",
+        "100",
+        "y",
+        "Bonds",
+        "0",
+        "n",
+        # Equities children: Developed=100 (skip EM)
+        "Developed",
+        "100",
+        "n",
+        # Developed children: NAM=100 (skip EMEA)
+        "NAM",
+        "100",
+        "n",
+        # NAM leaf metadata, then Bonds leaf metadata.
+        "",
+        "",
+        "",
+        "",
+    ]
+    plan = walk_catalog_interactive(catalog, ScriptedIO(answers))
+    bonds = next(n for n in plan if n.name == "Bonds")
+    assert bonds.weight == pytest.approx(0.0)
+    failures = collect_category_weight_validation_failures(plan)
+    assert failures == []
+
+
+def test_format_weight_suggestion_renders_small_value_with_precision():
+    """A sub-percent suggestion must not display as `0%` and mislead users."""
+    from riskbalancer.plan_bootstrap import _format_weight_suggestion
+
+    assert _format_weight_suggestion(0.004) == " (catalog suggests 0.40%)"
+    assert _format_weight_suggestion(0.0) == " (catalog suggests 0%)"
+    assert _format_weight_suggestion(0.55) == " (catalog suggests 55%)"
+    assert _format_weight_suggestion(None) == ""
+
+
 def test_cmd_plan_create_aborts_cleanly_on_quit(tmp_path, monkeypatch, capsys):
     paths = _build_paths(tmp_path, user="emre")
     paths.user_dir.mkdir(parents=True, exist_ok=True)

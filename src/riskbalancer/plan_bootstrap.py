@@ -452,17 +452,29 @@ def _decorate_label(node: CatalogNode) -> str:
 
 
 def _prompt_weight(io: IO, chosen: CatalogNode, level_label: str) -> float:
-    suggestion = (
-        f" (catalog suggests {int(round((chosen.suggested_weight or 0) * 100))}%)"
-        if chosen.suggested_weight is not None
-        else ""
-    )
+    suggestion = _format_weight_suggestion(chosen.suggested_weight)
     while True:
         raw = _ask(io, f"Risk weight for {chosen.name} at {level_label}{suggestion}: ")
         try:
             return _parse_weight_input(raw)
         except ValueError as exc:
             io.warn(str(exc))
+
+
+def _format_weight_suggestion(weight: Optional[float]) -> str:
+    """Render a `(catalog suggests N%)` clause for the weight prompt.
+
+    A naive `int(round(weight*100))%` displays a small non-zero suggestion
+    (e.g. 0.4%) as "0%", which then misleads the user about what numeric
+    value is acceptable. Fall back to two decimals when the rounded form
+    would lose a non-zero value.
+    """
+    if weight is None:
+        return ""
+    pct = weight * 100
+    if 0 < pct < 0.5:
+        return f" (catalog suggests {pct:.2f}%)"
+    return f" (catalog suggests {int(round(pct))}%)"
 
 
 def _prompt_add_another(io: IO, level_label: str, only_one_so_far: bool) -> bool:
@@ -543,6 +555,14 @@ _WEIGHT_RE = re.compile(r"^\s*([0-9.]+)\s*%?\s*$")
 
 
 def _parse_weight_input(raw: str) -> float:
+    """Parse a weight as either a percentage (e.g. 55) or fraction (e.g. 0.55).
+
+    A bare `0` is accepted and means "this category contributes 0% at this
+    level" — useful when a user wants to keep a category in the structure
+    (e.g. for tracking sub-categories or future re-allocation) but holds no
+    weight today. The level-sum-to-100% validator still applies, so the
+    other siblings must absorb the missing weight.
+    """
     match = _WEIGHT_RE.match(raw)
     if not match:
         raise ValueError(
@@ -551,8 +571,8 @@ def _parse_weight_input(raw: str) -> float:
     value = float(match.group(1))
     if value > 1:
         value /= 100.0
-    if value <= 0:
-        raise ValueError("Weights must be positive")
+    if value < 0:
+        raise ValueError("Weights must not be negative")
     if value > 1.0 + 1e-9:
         raise ValueError("Weights must not exceed 100%")
     return value
