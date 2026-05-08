@@ -29,7 +29,6 @@ from .configuration import (
 )
 from .paths import UserPaths
 
-DEFAULT_LEAF_VOLATILITY = 0.15
 DEFAULT_ADJUSTMENT = 1.0
 
 # Sentinel used at every pick prompt so the user can introduce categories that
@@ -58,9 +57,10 @@ class CatalogNode:
     `suggested_volatility`, and `suggested_adjustment` are informational hints
     drawn from whichever source the node was first seen in. `from_mappings`
     flags leaves that exist only because a mapping file references them.
-    `is_branch` marks user-added synthetic branches whose children will be
-    collected interactively (their `children` list starts empty but they must
-    still recurse, not be treated as leaves).
+
+    Whether a picked node ends up a branch or a leaf in the user's plan is
+    decided per-pick at walk time (see `_prompt_branch_or_leaf`); it is not
+    stored on the catalog node itself.
     """
 
     name: str
@@ -69,7 +69,6 @@ class CatalogNode:
     suggested_adjustment: Optional[float] = None
     children: list["CatalogNode"] = field(default_factory=list)
     from_mappings: bool = False
-    is_branch: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -283,8 +282,6 @@ def _prompt_yes_no(io: IO, message: str, *, default: bool) -> bool:
 def walk_catalog_interactive(
     catalog: Sequence[CatalogNode],
     io: IO,
-    *,
-    default_leaf_volatility: float = DEFAULT_LEAF_VOLATILITY,
 ) -> list[CategoryNode]:
     """Run the recursive pick-one/weight/add-another loop and return a plan."""
     if not catalog:
@@ -298,7 +295,6 @@ def walk_catalog_interactive(
         io,
         level_label="top level",
         path_prefix=(),
-        default_leaf_volatility=default_leaf_volatility,
     )
 
 
@@ -308,21 +304,27 @@ def _walk_level(
     *,
     level_label: str,
     path_prefix: tuple[str, ...],
-    default_leaf_volatility: float,
     inherited_volatility: Optional[float] = None,
+    inherited_adjustment: Optional[float] = None,
 ) -> list[CategoryNode]:
     io.info(f"\n—— {level_label} ——")
-    picked: list[tuple[CatalogNode, float]] = []
+    # Each pick carries its name, weight, and the per-pick branch/leaf decision
+    # captured at decision time via `_prompt_branch_or_leaf`. The bool replaces
+    # the older "infer from catalog children" heuristic so a user can flatten
+    # a catalog branch or promote a catalog leaf without leaving the walker.
+    picked: list[tuple[CatalogNode, float, bool]] = []
     # Loop without an early break on empty `remaining`: the `+ new` sentinel
     # is always offered, so a level with no catalog options (e.g. children of
-    # a user-added synthetic branch) is still reachable. The user controls
-    # when the loop ends via the "add another?" prompt.
+    # a user-added synthetic branch, or of a promoted catalog leaf) is still
+    # reachable. The user controls when the loop ends via the "add another?"
+    # prompt.
     while True:
-        picked_ids = {id(node) for node, _ in picked}
+        picked_ids = {id(node) for node, _, _ in picked}
         remaining = [node for node in options if id(node) not in picked_ids]
         chosen = _prompt_pick_one(io, remaining, level_label, picked)
+        treat_as_branch = _prompt_branch_or_leaf(io, chosen)
         weight = _prompt_weight(io, chosen, level_label)
-        picked.append((chosen, weight))
+        picked.append((chosen, weight, treat_as_branch))
         if not _prompt_add_another(io, level_label, len(picked) == 1):
             break
     if not picked:
@@ -330,22 +332,19 @@ def _walk_level(
     _validate_level_weights(picked, io, level_label)
 
     plan_nodes: list[CategoryNode] = []
-    for catalog_node, weight in picked:
+    for catalog_node, weight, treat_as_branch in picked:
         node_path = path_prefix + (catalog_node.name,)
         node_label = " / ".join(node_path)
-        next_inherited = catalog_node.suggested_volatility or inherited_volatility
-        # A node is a branch if it already has catalog children OR if the user
-        # explicitly declared it a branch when adding it (synthetic branches
-        # start with empty children but must recurse).
-        treat_as_branch = bool(catalog_node.children) or catalog_node.is_branch
+        next_inherited_vol = catalog_node.suggested_volatility or inherited_volatility
+        next_inherited_adj = catalog_node.suggested_adjustment or inherited_adjustment
         if treat_as_branch:
             child_plan = _walk_level(
                 list(catalog_node.children),
                 io,
                 level_label=node_label,
                 path_prefix=node_path,
-                default_leaf_volatility=default_leaf_volatility,
-                inherited_volatility=next_inherited,
+                inherited_volatility=next_inherited_vol,
+                inherited_adjustment=next_inherited_adj,
             )
             plan_nodes.append(
                 CategoryNode(
@@ -361,8 +360,8 @@ def _walk_level(
                 io,
                 node_label,
                 catalog_node,
-                inherited_volatility=next_inherited,
-                default_leaf_volatility=default_leaf_volatility,
+                inherited_volatility=next_inherited_vol,
+                inherited_adjustment=next_inherited_adj,
             )
             plan_nodes.append(
                 CategoryNode(
@@ -376,11 +375,29 @@ def _walk_level(
     return plan_nodes
 
 
+def _prompt_branch_or_leaf(io: IO, chosen: CatalogNode) -> bool:
+    """Ask whether `chosen` is a branch (has sub-categories) or a leaf.
+
+    Default mirrors the catalog so the common case is press-Enter: a node
+    with catalog children defaults to Y (recurse, preserving the catalog
+    structure); a catalog leaf or a freshly added `+ new` node defaults to N
+    (treat as a leaf, prompt for vol/adj). Routes through `_prompt_yes_no`
+    so quit / exit / Ctrl+C abort cleanly like every other walker prompt.
+    """
+    has_catalog_children = bool(chosen.children)
+    suffix = "[Y/n]" if has_catalog_children else "[y/N]"
+    return _prompt_yes_no(
+        io,
+        f"Does {chosen.name} have sub-categories? {suffix}: ",
+        default=has_catalog_children,
+    )
+
+
 def _prompt_pick_one(
     io: IO,
     remaining: list[CatalogNode],
     level_label: str,
-    picked: list[tuple[CatalogNode, float]],
+    picked: list[tuple[CatalogNode, float, bool]],
 ) -> CatalogNode:
     """Prompt the user to pick a category at the current level.
 
@@ -395,9 +412,9 @@ def _prompt_pick_one(
     name_to_node = {node.name.lower(): node for node in remaining}
     # Sibling names guard the "+ new" sub-flow so a synthetic node can't
     # collide with another sibling — already-picked or still-available.
-    sibling_names = {node.name.lower() for node, _ in picked} | set(name_to_node.keys())
+    sibling_names = {node.name.lower() for node, _, _ in picked} | set(name_to_node.keys())
     progress = (
-        ", ".join(f"{node.name}={int(round(weight * 100))}%" for node, weight in picked)
+        ", ".join(f"{node.name}={int(round(weight * 100))}%" for node, weight, _ in picked)
         if picked
         else "none yet"
     )
@@ -420,14 +437,13 @@ def _prompt_new_category(
     level_label: str,
     sibling_names: set[str],
 ) -> CatalogNode:
-    """Collect a brand-new category from the user and return a synthetic node.
+    """Collect a brand-new category name from the user and return a synthetic node.
 
     Asks for a name (rejecting empty input, the reserved `new` / `+ new`
-    keywords, and collisions with sibling names already at this level), then
-    asks whether the new category has sub-categories. A "yes" answer marks
-    the returned `CatalogNode` as a branch (`is_branch=True`) so the walker
-    will recurse into it; "no" leaves it as a leaf so the walker prompts for
-    volatility and adjustment.
+    keywords, and collisions with sibling names already at this level). The
+    branch-vs-leaf decision is asked uniformly afterwards by
+    `_prompt_branch_or_leaf` in `_walk_level`, so every pick (catalog or
+    synthetic) goes through the same single question in the same place.
     """
     while True:
         raw = _ask(io, f"Name for new category at {level_label}: ").strip()
@@ -441,8 +457,7 @@ def _prompt_new_category(
             io.warn(f"'{raw}' already exists at this level.")
             continue
         break
-    has_children = _prompt_yes_no(io, f"Does {raw} have sub-categories? [y/N]: ", default=False)
-    return CatalogNode(name=raw, is_branch=has_children)
+    return CatalogNode(name=raw)
 
 
 def _decorate_label(node: CatalogNode) -> str:
@@ -482,16 +497,19 @@ def _prompt_add_another(io: IO, level_label: str, only_one_so_far: bool) -> bool
 
 
 def _validate_level_weights(
-    picked: list[tuple[CatalogNode, float]], io: IO, level_label: str
+    picked: list[tuple[CatalogNode, float, bool]], io: IO, level_label: str
 ) -> None:
     """Ensure the entered weights at this level sum to 100%; re-prompt on failure.
 
     Builds an artificial CategoryNode list and runs the existing validator so
-    the same tolerance applies as for the final plan check.
+    the same tolerance applies as for the final plan check. The per-pick
+    branch/leaf bool is preserved across re-prompts so the user does not get
+    asked the sub-categories question again.
     """
     while True:
         artificial = [
-            CategoryNode(name=node.name, weight=weight, volatility=0.1) for node, weight in picked
+            CategoryNode(name=node.name, weight=weight, volatility=0.1)
+            for node, weight, _ in picked
         ]
         failures = collect_category_weight_validation_failures(artificial)
         if not failures:
@@ -499,9 +517,9 @@ def _validate_level_weights(
             return
         io.warn(format_category_weight_validation_failures(failures))
         io.info(f"Re-enter the weights for {level_label}:")
-        for index, (node, _weight) in enumerate(picked):
+        for index, (node, _weight, treat_as_branch) in enumerate(picked):
             new_weight = _prompt_weight(io, node, level_label)
-            picked[index] = (node, new_weight)
+            picked[index] = (node, new_weight, treat_as_branch)
 
 
 def _prompt_leaf_metadata(
@@ -510,37 +528,66 @@ def _prompt_leaf_metadata(
     catalog_node: CatalogNode,
     *,
     inherited_volatility: Optional[float],
-    default_leaf_volatility: float,
+    inherited_adjustment: Optional[float],
 ) -> tuple[float, float]:
+    """Ask the user for a leaf's volatility and adjustment.
+
+    Defaults follow a strict "catalog suggestion or inherited" chain. If
+    neither source has a value (e.g. the user flattened a catalog branch
+    that had no vol/adj of its own, or added a `+ new` leaf at top level),
+    the prompt offers no default and forces explicit input — the walker
+    refuses to invent a number when it has nothing to suggest, per
+    CLAUDE.md's "no magic values" rule.
+    """
     suggested_vol = (
         catalog_node.suggested_volatility
         if catalog_node.suggested_volatility is not None
         else inherited_volatility
-        if inherited_volatility is not None
-        else default_leaf_volatility
     )
     suggested_adj = (
         catalog_node.suggested_adjustment
         if catalog_node.suggested_adjustment is not None
-        else DEFAULT_ADJUSTMENT
+        else inherited_adjustment
     )
     volatility = _prompt_positive_float(
         io,
-        f"Volatility for {node_label} [catalog suggests {suggested_vol}]: ",
+        f"Volatility for {node_label} {_format_metadata_hint(suggested_vol)}: ",
         default=suggested_vol,
     )
     adjustment = _prompt_positive_float(
         io,
-        f"Adjustment for {node_label} [catalog suggests {suggested_adj}]: ",
+        f"Adjustment for {node_label} {_format_metadata_hint(suggested_adj)}: ",
         default=suggested_adj,
     )
     return volatility, adjustment
 
 
-def _prompt_positive_float(io: IO, message: str, *, default: float) -> float:
+def _format_metadata_hint(suggestion: Optional[float]) -> str:
+    """Render the bracketed hint shown next to a leaf vol/adj prompt.
+
+    A concrete suggestion preserves the existing "[catalog suggests X]"
+    label so press-Enter still works. With no suggestion, the prompt makes
+    the no-default state explicit so the user knows blank input will be
+    rejected.
+    """
+    if suggestion is None:
+        return "[no default; please enter a value]"
+    return f"[catalog suggests {suggestion}]"
+
+
+def _prompt_positive_float(io: IO, message: str, *, default: Optional[float]) -> float:
+    """Read a positive float, optionally allowing blank-means-default.
+
+    A `default=None` signals that the caller has nothing to suggest, so
+    blank input is rejected and the user must type a value. A non-None
+    default keeps the existing press-Enter-to-accept behaviour.
+    """
     while True:
         raw = _ask(io, message).strip()
         if not raw:
+            if default is None:
+                io.warn("This field has no default — please enter a positive number.")
+                continue
             return default
         try:
             value = float(raw)
@@ -548,7 +595,7 @@ def _prompt_positive_float(io: IO, message: str, *, default: float) -> float:
                 raise ValueError("value must be positive")
             return value
         except ValueError:
-            io.warn("Enter a positive number, or press Enter to accept the suggested value.")
+            io.warn("Enter a positive number.")
 
 
 _WEIGHT_RE = re.compile(r"^\s*([0-9.]+)\s*%?\s*$")

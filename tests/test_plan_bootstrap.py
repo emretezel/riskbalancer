@@ -156,17 +156,23 @@ def test_walk_catalog_picks_subset_with_explicit_weights(tmp_path):
 
     # Wife wants Equities only at top level, Developed only within Equities,
     # NAM only within Developed (single leaf with vol/adj from catalog).
+    # Each pick is followed by a branch-or-leaf prompt that mirrors the
+    # catalog by default ("y" preserves catalog branches; "n" keeps catalog
+    # leaves as leaves).
     answers = [
-        # Top level: Equities=100
+        # Top level: Equities (branch) = 100
         "Equities",
+        "y",
         "100",
         "n",
-        # Equities children: Developed=100 (skip EM)
+        # Equities children: Developed (branch) = 100 (skip EM)
         "Developed",
+        "y",
         "100",
         "n",
-        # Developed children: NAM=100 (skip EMEA)
+        # Developed children: NAM (leaf) = 100 (skip EMEA)
         "NAM",
+        "n",
         "100",
         "n",
         # NAM leaf: accept catalog vol and adj
@@ -192,29 +198,37 @@ def test_walk_catalog_reprompts_when_level_weights_do_not_sum_to_100(tmp_path):
     catalog = build_catalog(paths)
 
     # First attempt: Equities=60, Bonds=20 → 80%, will fail; then re-prompt
-    # asks for two new weights for the same picks, this time 60 and 40.
+    # asks for two new weights for the same picks, this time 60 and 40. The
+    # branch-or-leaf decision is captured at first pick and not re-asked
+    # during weight re-entry.
     answers = [
         "Equities",
+        "y",
         "60",
         "y",
         "Bonds",
+        "n",
         "20",
         "n",
         # Re-prompt for Equities then Bonds — weights now sum to 100.
         "60",
         "40",
-        # Equities children: take Developed=60 + EM=40
+        # Equities children: take Developed=60 (branch) + EM=40 (leaf)
         "Developed",
+        "y",
         "60",
         "y",
         "EM",
+        "n",
         "40",
         "n",
-        # Developed children: NAM=50 + EMEA=50
+        # Developed children: NAM=50 (leaf) + EMEA=50 (leaf)
         "NAM",
+        "n",
         "50",
         "y",
         "EMEA",
+        "n",
         "50",
         "n",
         # NAM leaf, EMEA leaf, EM leaf, Bonds leaf — accept catalog defaults.
@@ -244,6 +258,7 @@ def test_walk_catalog_treats_added_node_with_no_children_as_leaf(tmp_path):
     # Pick Bonds only (a leaf in the seed catalog) and accept catalog vol/adj.
     answers = [
         "Bonds",
+        "n",  # leaf (no sub-categories — default for catalog leaves)
         "100",
         "n",
         "",  # volatility — accept suggestion 0.07
@@ -259,6 +274,105 @@ def test_walk_catalog_treats_added_node_with_no_children_as_leaf(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Branch-vs-leaf is a per-pick user decision: catalog branches can be
+# flattened into leaves, catalog leaves can be promoted into branches.
+# ---------------------------------------------------------------------------
+
+
+def test_walk_catalog_flattens_catalog_branch_to_leaf(tmp_path):
+    """Picking a catalog branch and answering N drops to vol/adj prompts.
+
+    Equities is a branch in SEED_YAML with no own vol/adj. Flattening it
+    means the user supplies an explicit volatility (no default — the
+    branch contributes nothing to suggest) and an adjustment (defaults to
+    1.0 because YAML adjustment defaults to 1.0 at parse time).
+    """
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    answers = [
+        "Equities",
+        "n",  # flatten the catalog branch into a leaf
+        "100",
+        "n",  # don't add another at top level
+        "0.20",  # explicit volatility — no catalog default to inherit
+        "1.0",  # adjustment — catalog default is 1.0 so blank would also work
+    ]
+    plan = walk_catalog_interactive(catalog, ScriptedIO(answers))
+    assert [n.name for n in plan] == ["Equities"]
+    assert plan[0].children == []
+    assert plan[0].volatility == pytest.approx(0.20)
+    assert plan[0].adjustment == pytest.approx(1.0)
+
+
+def test_walk_catalog_promotes_catalog_leaf_to_branch(tmp_path):
+    """Picking a catalog leaf and answering Y recurses into a `+ new`-only level.
+
+    Bonds is a catalog leaf in SEED_YAML. Promoting it to a branch means
+    the walker recurses with `catalog_node.children == []`, so only the
+    `+ new` sentinel is offered. The user adds one synthetic leaf
+    underneath to keep the level summing to 100%.
+    """
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    answers = [
+        "Bonds",
+        "y",  # promote: this catalog leaf becomes a branch in the user's plan
+        "100",
+        "n",  # don't add another at top level
+        # Sub-level under Bonds: only `+ new` is available.
+        "+ new",
+        "GiltsLong",
+        "n",  # synthetic leaf
+        "100",
+        "n",  # done
+        # GiltsLong inherits Bonds' suggested_volatility=0.07 and
+        # suggested_adjustment=1.0 as defaults — accept both with blanks.
+        "",
+        "",
+    ]
+    plan = walk_catalog_interactive(catalog, ScriptedIO(answers))
+    assert [n.name for n in plan] == ["Bonds"]
+    assert [child.name for child in plan[0].children] == ["GiltsLong"]
+    leaf = plan[0].children[0]
+    assert leaf.volatility == pytest.approx(0.07)
+    assert leaf.adjustment == pytest.approx(1.0)
+
+
+def test_prompt_leaf_metadata_requires_explicit_input_when_no_suggestion(tmp_path):
+    """Blank input is rejected when the catalog has nothing to suggest.
+
+    A `+ new` leaf at top level has neither a catalog suggestion nor an
+    inherited value, so both prompts must reject blank input and warn the
+    user before re-prompting. This is the "no magic values" rule applied
+    at prompt time.
+    """
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+
+    answers = [
+        "+ new",
+        "Crypto",
+        "n",  # leaf
+        "100",
+        "n",  # don't add another
+        # Volatility prompt: no default. Blank → warning, then a real value.
+        "",
+        "0.6",
+        # Adjustment prompt: no default. Blank → warning, then a real value.
+        "",
+        "1.0",
+    ]
+    io = ScriptedIO(answers)
+    plan = walk_catalog_interactive(catalog, io)
+    assert plan[0].volatility == pytest.approx(0.6)
+    assert plan[0].adjustment == pytest.approx(1.0)
+    no_default_warnings = [msg for msg in io.warn_log if "no default" in msg]
+    assert len(no_default_warnings) == 2
+
+
+# ---------------------------------------------------------------------------
 # Persistence + clone
 # ---------------------------------------------------------------------------
 
@@ -266,7 +380,8 @@ def test_walk_catalog_treats_added_node_with_no_children_as_leaf(tmp_path):
 def test_write_plan_yaml_round_trips(tmp_path):
     paths = _build_paths(tmp_path)
     catalog = build_catalog(paths)
-    answers = ["Bonds", "100", "n", "", ""]
+    # Bonds is a catalog leaf — branch-or-leaf defaults to N, weights cleanly.
+    answers = ["Bonds", "n", "100", "n", "", ""]
     plan = walk_catalog_interactive(catalog, ScriptedIO(answers))
     out = tmp_path / "out.yaml"
     write_plan_yaml(out, plan)
@@ -342,20 +457,27 @@ def test_user_paths_replace_supports_field_overrides(tmp_path):
 
 
 def test_walk_catalog_supports_added_leaf_at_top_level(tmp_path):
-    """User picks `+ new`, names a brand-new leaf, supplies vol/adj."""
+    """User picks `+ new`, names a brand-new leaf, supplies vol/adj.
+
+    The branch-or-leaf prompt is now asked uniformly for every pick (catalog
+    or synthetic) right after `_prompt_pick_one` returns, so the `n` answer
+    that used to be consumed inside `_prompt_new_category` is now consumed
+    by `_prompt_branch_or_leaf` in the same script position.
+    """
     paths = _build_paths(tmp_path)
     catalog = build_catalog(paths)
 
     answers = [
-        # Top level: pick the sentinel, name "Crypto", no sub-categories,
-        # weight 100%, then explicit vol/adj for the leaf.
+        # Top level: pick the sentinel, name "Crypto", branch-or-leaf=n
+        # (synthetic leaves default to N), weight 100%, then explicit
+        # vol/adj because synthetic leaves have no catalog suggestion.
         "+ new",
         "Crypto",
-        "n",  # no sub-categories
+        "n",  # branch-or-leaf — leaf
         "100",
         "n",  # don't add another at top level
-        "0.6",  # volatility
-        "1.0",  # adjustment
+        "0.6",  # volatility (no default — must be explicit)
+        "1.0",  # adjustment (no default — must be explicit)
     ]
     plan = walk_catalog_interactive(catalog, ScriptedIO(answers))
     assert [n.name for n in plan] == ["Crypto"]
@@ -366,7 +488,13 @@ def test_walk_catalog_supports_added_leaf_at_top_level(tmp_path):
 
 def test_walk_catalog_supports_added_branch_with_added_children(tmp_path):
     """`+ new` branch with sub-categories recurses into a level whose only
-    available option is itself `+ new` — the user adds two synthetic leaves."""
+    available option is itself `+ new` — the user adds two synthetic leaves.
+
+    The "has sub-categories?" question now lives in the unified
+    `_prompt_branch_or_leaf` rather than inside `_prompt_new_category`, so
+    the `y`/`n` answers sit in the same conceptual slot but after the name
+    instead of inside the new-category sub-flow.
+    """
     paths = _build_paths(tmp_path)
     catalog = build_catalog(paths)
 
@@ -374,7 +502,7 @@ def test_walk_catalog_supports_added_branch_with_added_children(tmp_path):
         # Top level: `+ new` named "Alternative", branch with sub-categories.
         "+ new",
         "Alternative",
-        "y",  # has sub-categories
+        "y",  # branch-or-leaf — branch
         "100",  # weight
         "n",  # don't add another at top level
         # Sub-level (Alternative): only `+ new` is available. Add two leaves.
@@ -388,7 +516,9 @@ def test_walk_catalog_supports_added_branch_with_added_children(tmp_path):
         "n",  # leaf
         "40",
         "n",  # done
-        # Leaf metadata for Crypto, then RealEstate.
+        # Leaf metadata for Crypto, then RealEstate. Synthetic leaves
+        # under a synthetic branch have no catalog suggestion and no
+        # inherited value, so every prompt requires explicit input.
         "0.6",
         "1.0",
         "0.15",
@@ -412,12 +542,13 @@ def test_walk_catalog_rejects_new_category_name_collision(tmp_path):
     answers = [
         # Try to name the new category "Bonds" — collides with a remaining
         # catalog sibling — re-prompt; then "Equities" — also collides; then
-        # accept "Crypto".
+        # accept "Crypto". The branch-or-leaf prompt fires after the name
+        # passes validation, so its `n` sits between name and weight.
         "+ new",
         "Bonds",
         "Equities",
         "Crypto",
-        "n",  # leaf
+        "n",  # branch-or-leaf — leaf
         "100",
         "n",  # don't add another
         "0.5",
@@ -509,7 +640,7 @@ def test_walk_catalog_aborts_on_eof(tmp_path):
 
 def _drive_simple_plan(catalog) -> tuple[list, ScriptedIO]:
     """Run the walker with a minimal scripted flow (Bonds 100% leaf)."""
-    answers = ["Bonds", "100", "n", "", ""]
+    answers = ["Bonds", "n", "100", "n", "", ""]
     io = ScriptedIO(answers)
     plan = walk_catalog_interactive(catalog, io)
     return plan, io
@@ -572,17 +703,21 @@ def test_walk_catalog_accepts_zero_weight_when_siblings_cover_100(tmp_path):
     # validator accepts it. Then drill through to the NAM leaf.
     answers = [
         "Equities",
+        "y",
         "100",
         "y",
         "Bonds",
+        "n",
         "0",
         "n",
         # Equities children: Developed=100 (skip EM)
         "Developed",
+        "y",
         "100",
         "n",
         # Developed children: NAM=100 (skip EMEA)
         "NAM",
+        "n",
         "100",
         "n",
         # NAM leaf metadata, then Bonds leaf metadata.
