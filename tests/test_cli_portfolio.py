@@ -32,8 +32,14 @@ def load_snapshot(path: Path) -> dict:
 
 
 def _paths_with(**overrides) -> UserPaths:
-    """Build a UserPaths for tests; defaults to a placeholder user so the
-    user-keyed CLI guard does not refuse to run."""
+    """Build a UserPaths for tests.
+
+    Defaults to user="testuser" so the user-keyed CLI guard does not refuse
+    to run. Tests that exercise `cmd_portfolio_import` against a real source
+    file MUST override `statements_dir` to point at their `tmp_path` so the
+    auto-filer doesn't leak copies into the repo's `private/` tree. Tests
+    that mock out `_autofile_statement` are fine without the override.
+    """
     return replace(UserPaths.for_user("testuser"), **overrides)
 
 
@@ -393,7 +399,12 @@ def test_build_parser_uses_user_flag_and_drops_portfolio():
 def test_cmd_portfolio_import_prompts_and_persists_missing_mappings(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "portfolio.json"
     mapping_path = tmp_path / "ajbell.yaml"
-    paths = _paths_with(portfolio=portfolio_path)
+    # `statements_dir` lives inside tmp_path so the auto-filer's copy of
+    # AJ_BELL_FIXTURE lands in the per-test scratch dir, not in the repo.
+    paths = _paths_with(
+        portfolio=portfolio_path,
+        statements_dir=tmp_path / "statements",
+    )
     cmd_portfolio_create(
         argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
         paths=paths,
