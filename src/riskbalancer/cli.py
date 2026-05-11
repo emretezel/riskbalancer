@@ -199,10 +199,14 @@ class CategoryAllocation:
 
 @dataclass
 class ImportRecord:
-    """Metadata describing a broker statement imported into a portfolio."""
+    """Metadata describing a broker statement imported into a portfolio.
 
-    source_id: str
+    `(adapter, account)` is the stable key — re-imports of the same broker
+    account replace the prior record.
+    """
+
     adapter: str
+    account: str
     statement: str
     mappings: str
     imported_at: str
@@ -512,8 +516,10 @@ def investment_to_dict(investment: Investment) -> Dict[str, object]:
     }
     if investment.quantity is not None:
         payload["quantity"] = investment.quantity
-    if investment.source_id is not None:
-        payload["source_id"] = investment.source_id
+    if investment.adapter is not None:
+        payload["adapter"] = investment.adapter
+    if investment.account is not None:
+        payload["account"] = investment.account
     return payload
 
 
@@ -537,8 +543,8 @@ def _coerce_optional_float(value: object, *, field_name: str) -> Optional[float]
 
 def import_record_to_dict(record: ImportRecord) -> Dict[str, str]:
     return {
-        "source_id": record.source_id,
         "adapter": record.adapter,
+        "account": record.account,
         "statement": record.statement,
         "mappings": record.mappings,
         "imported_at": record.imported_at,
@@ -568,20 +574,19 @@ def _snapshot_imports(snapshot: Mapping[str, object]) -> List[ImportRecord]:
     for item in raw_imports:
         if not isinstance(item, dict):
             raise ValueError("Each stored import must be an object")
-        source_id = item.get("source_id")
         adapter = item.get("adapter")
+        account = item.get("account")
         statement = item.get("statement")
         mappings = item.get("mappings")
         imported_at = item.get("imported_at")
         if not all(
-            isinstance(value, str)
-            for value in (source_id, adapter, statement, mappings, imported_at)
+            isinstance(value, str) for value in (adapter, account, statement, mappings, imported_at)
         ):
             raise ValueError("Stored import metadata must use string values")
         imports.append(
             ImportRecord(
-                source_id=cast(str, source_id),
                 adapter=cast(str, adapter),
+                account=cast(str, account),
                 statement=cast(str, statement),
                 mappings=cast(str, mappings),
                 imported_at=cast(str, imported_at),
@@ -625,9 +630,12 @@ def investment_from_dict(payload: Mapping[str, object]) -> Investment:
     category_label = payload["category"]
     if not isinstance(category_label, str):
         raise ValueError("Category label must be a string")
-    source_id_value = payload.get("source_id")
-    if source_id_value is not None and not isinstance(source_id_value, str):
-        raise ValueError("source_id must be a string when present")
+    adapter_value = payload.get("adapter")
+    if adapter_value is not None and not isinstance(adapter_value, str):
+        raise ValueError("adapter must be a string when present")
+    account_value = payload.get("account")
+    if account_value is not None and not isinstance(account_value, str):
+        raise ValueError("account must be a string when present")
     return Investment(
         instrument_id=str(payload["instrument_id"]),
         description=str(payload.get("description", "")),
@@ -636,7 +644,8 @@ def investment_from_dict(payload: Mapping[str, object]) -> Investment:
         volatility=_coerce_float(payload.get("volatility", 0.0), field_name="volatility") or 0.0001,
         quantity=_coerce_optional_float(payload.get("quantity"), field_name="quantity"),
         source=str(payload.get("source", "portfolio")),
-        source_id=cast(Optional[str], source_id_value),
+        adapter=cast(Optional[str], adapter_value),
+        account=cast(Optional[str], account_value),
     )
 
 
@@ -732,8 +741,8 @@ def summarize_sources(investments: Iterable[Investment]) -> tuple[float, List[tu
     for investment in investments:
         if investment.source == "manual":
             label = "manual"
-        elif investment.source_id:
-            label = investment.source_id
+        elif investment.adapter and investment.account:
+            label = f"{investment.adapter}/{investment.account}"
         else:
             label = investment.source or "unknown"
         totals[label] += investment.market_value
@@ -1000,8 +1009,11 @@ def ensure_mappings_for_investments(
     return existing_mappings, len(new_entries)
 
 
-def tag_imported_investments(investments: Iterable[Investment], source_id: str) -> List[Investment]:
-    return [replace(investment, source_id=source_id) for investment in investments]
+def tag_imported_investments(
+    investments: Iterable[Investment], *, adapter: str, account: str
+) -> List[Investment]:
+    """Stamp the broker `(adapter, account)` provenance on each investment."""
+    return [replace(investment, adapter=adapter, account=account) for investment in investments]
 
 
 def cmd_fx_update(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
@@ -1118,22 +1130,29 @@ def cmd_portfolio_import(args: argparse.Namespace, paths: Optional[UserPaths] = 
     )
     imported_investments = tag_imported_investments(
         apply_mappings_to_investments(parsed_investments, mappings),
-        args.source_id,
+        adapter=args.adapter,
+        account=args.account,
     )
 
+    # `(adapter, account)` is the stable key for a brokerage account.
+    # Re-imports of the same account replace its prior positions and record.
     existing_investments = investments_from_dicts(_snapshot_investments(snapshot))
     preserved_investments = [
-        investment for investment in existing_investments if investment.source_id != args.source_id
+        investment
+        for investment in existing_investments
+        if (investment.adapter, investment.account) != (args.adapter, args.account)
     ]
     replaced_count = len(existing_investments) - len(preserved_investments)
 
     imports = [
-        record for record in _snapshot_imports(snapshot) if record.source_id != args.source_id
+        record
+        for record in _snapshot_imports(snapshot)
+        if (record.adapter, record.account) != (args.adapter, args.account)
     ]
     imports.append(
         ImportRecord(
-            source_id=args.source_id,
             adapter=args.adapter,
+            account=args.account,
             statement=str(canonical_statement),
             mappings=str(write_path),
             imported_at=_utc_timestamp(),
@@ -1146,13 +1165,14 @@ def cmd_portfolio_import(args: argparse.Namespace, paths: Optional[UserPaths] = 
         imports=imports,
         created_at=_snapshot_created_at(snapshot),
     )
+    account_label = f"{args.adapter}/{args.account}"
     if replaced_count:
-        print(f"Replaced {replaced_count} existing position(s) for source '{args.source_id}'.")
+        print(f"Replaced {replaced_count} existing position(s) for '{account_label}'.")
     if new_count:
         print(f"Stored {new_count} new mapping(s) in {write_path}.")
     print(
         f"Imported {len(imported_investments)} position(s) from {canonical_statement} "
-        f"into {paths.portfolio} as '{args.source_id}'."
+        f"into {paths.portfolio} as '{account_label}'."
     )
     return 0
 
@@ -1767,14 +1787,15 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[user_parent],
         help="Import a single broker statement into the user's portfolio",
     )
-    portfolio_import.add_argument("--source-id", required=True, help="Stable source identifier")
     portfolio_import.add_argument("--adapter", required=True, choices=ADAPTERS.keys())
     portfolio_import.add_argument(
         "--account",
         required=True,
         help=(
-            "Account name (the second path segment under <broker>, e.g. sipp/isa/taxable). "
-            "Used to file the statement under "
+            "Account name within the broker (e.g. sipp/isa/dealing). Together with "
+            "--adapter this forms the stable key for the imported positions; "
+            "re-imports against the same (adapter, account) pair replace the prior "
+            "positions. Also used to file the statement under "
             "private/users/<user>/statements/<adapter>/<account>/<YYYY>/<MM>/."
         ),
     )

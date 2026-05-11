@@ -170,9 +170,11 @@ Persistence rules:
   missing fields.
 - **One concept per file.** Do not mix unrelated state in the same YAML/JSON
   document.
-- **Stable identifiers.** `source_id` for broker imports and `instrument_id`
-  for holdings must remain stable across runs; re-imports replace by `source_id`
-  and must not duplicate data.
+- **Stable identifiers.** `(adapter, account)` is the stable key for an
+  imported broker statement and `instrument_id` is the stable key for a
+  holding. Re-imports of the same `(adapter, account)` replace the prior
+  positions and import record; different accounts at the same broker (e.g.
+  AJ Bell SIPP vs Dealing) coexist as separate keys.
 - **No magic values.** Use `None`/absent keys for missing values, not sentinels
   like `0`, `-1`, or `"N/A"`.
 - **Document the on-disk format.** When the shape of any persisted file

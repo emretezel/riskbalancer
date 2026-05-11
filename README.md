@@ -81,7 +81,6 @@ riskbalancer plan create --user wife
 #    run. The source file stays put unless you pass --move.
 riskbalancer portfolio import \
   --user wife \
-  --source-id ajbell-isa \
   --adapter ajbell \
   --account isa \
   --statement ~/Downloads/wife-isa-snapshot.csv
@@ -169,7 +168,6 @@ today's date as the year/month folder, creating directories as needed:
 ```bash
 riskbalancer portfolio import \
   --user emre \
-  --source-id ajbell-sipp \
   --adapter ajbell \
   --account sipp \
   --statement ~/Downloads/2026-03-23-positions.csv
@@ -187,9 +185,10 @@ at `private/users/<user>/mappings/<adapter>.yaml` replaces individual
 entries by instrument id. New mappings learned interactively are written
 only to the override file so the shared catalog stays curated.
 
-`portfolio import` re-imports replace by `--source-id` so re-running with
-the same source updates that source's positions and leaves other sources
-alone.
+`portfolio import` re-imports replace by `(--adapter, --account)` so
+re-running for the same brokerage account updates that account's positions
+and leaves other accounts alone. Multiple accounts at the same broker
+(e.g. an AJ Bell SIPP and Dealing account) coexist because the keys differ.
 
 Supported adapters: `ajbell`, `citi`, `ibkr`, `ms401k`, `schwab`.
 

@@ -94,7 +94,10 @@ class Investment:
     volatility: float
     quantity: Optional[float] = None
     source: str = "unknown"
-    source_id: Optional[str] = None
+    # `adapter` and `account` together identify the brokerage account that
+    # produced this position. They are absent on manual entries.
+    adapter: Optional[str] = None
+    account: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.market_value < 0:

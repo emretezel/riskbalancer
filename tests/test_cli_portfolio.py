@@ -114,7 +114,6 @@ def test_cmd_portfolio_import_autofiles_external_source_and_handles_conflict(tmp
     # First import — file lands under YYYY/MM, source untouched (default copy).
     result = cmd_portfolio_import(
         argparse.Namespace(
-            source_id="ajbell-isa",
             adapter="ajbell",
             account="isa",
             statement=str(source),
@@ -132,10 +131,11 @@ def test_cmd_portfolio_import_autofiles_external_source_and_handles_conflict(tmp
     snapshot = load_snapshot(paths.portfolio)
     assert snapshot["imports"][0]["statement"] == str(canonical)
 
-    # Second import with same source filename → -2 suffix.
+    # Second import of the same filename to the same (adapter, account)
+    # triggers the -2 autofile suffix; the import record for the
+    # (adapter, account) pair is replaced in place.
     result = cmd_portfolio_import(
         argparse.Namespace(
-            source_id="ajbell-isa-second",
             adapter="ajbell",
             account="isa",
             statement=str(source),
@@ -191,7 +191,6 @@ def test_cmd_portfolio_import_move_removes_source_and_prefiled_path_stays(tmp_pa
 
     cmd_portfolio_import(
         argparse.Namespace(
-            source_id="moveA",
             adapter="ajbell",
             account="isa",
             statement=str(source),
@@ -205,17 +204,17 @@ def test_cmd_portfolio_import_move_removes_source_and_prefiled_path_stays(tmp_pa
     assert canonical.exists()
     assert not source.exists()  # moved away from the inbox
 
-    # --- Branch B: source already under statements_dir is left alone.
-    prefiled_dir = paths.statements_dir / "ajbell" / "isa" / "2026" / "03"
+    # --- Branch B: source already under statements_dir, filed under a
+    # different account so it lands as a fresh import record.
+    prefiled_dir = paths.statements_dir / "ajbell" / "dealing" / "2026" / "03"
     prefiled_dir.mkdir(parents=True, exist_ok=True)
     prefiled = prefiled_dir / "old.csv"
     prefiled.write_bytes(AJ_BELL_FIXTURE.read_bytes())
 
     cmd_portfolio_import(
         argparse.Namespace(
-            source_id="prefiled",
             adapter="ajbell",
-            account="isa",
+            account="dealing",
             statement=str(prefiled),
             mappings=None,
             move=False,
@@ -226,10 +225,14 @@ def test_cmd_portfolio_import_move_removes_source_and_prefiled_path_stays(tmp_pa
     # No copy — file is exactly where it was.
     assert prefiled.exists()
     snapshot = load_snapshot(paths.portfolio)
-    prefiled_record = next(rec for rec in snapshot["imports"] if rec["source_id"] == "prefiled")
+    prefiled_record = next(
+        rec
+        for rec in snapshot["imports"]
+        if rec["adapter"] == "ajbell" and rec["account"] == "dealing"
+    )
     assert prefiled_record["statement"] == str(prefiled.resolve())
-    # No copy made into the May folder for this source.
-    assert not (paths.statements_dir / "ajbell" / "isa" / "2026" / "05" / "old.csv").exists()
+    # No copy made into the May folder for this account.
+    assert not (paths.statements_dir / "ajbell" / "dealing" / "2026" / "05" / "old.csv").exists()
 
 
 def test_cmd_portfolio_report_without_user_prints_clean_error(tmp_path, capsys):
@@ -293,7 +296,7 @@ def test_load_layered_mappings_user_override_wins(tmp_path, capsys):
     assert "ICAP" not in err
 
 
-def test_investment_serialization_round_trip_preserves_source_id():
+def test_investment_serialization_round_trip_preserves_account_provenance():
     investment = Investment(
         instrument_id="ETF",
         description="Global ETF",
@@ -302,7 +305,8 @@ def test_investment_serialization_round_trip_preserves_source_id():
         category=CategoryPath("Equities", "Developed", "NAM"),
         volatility=0.2,
         source="aj_bell",
-        source_id="ajbell-sipp",
+        adapter="ajbell",
+        account="sipp",
     )
     payload = investment_to_dict(investment)
     restored = investment_from_dict(payload)
@@ -310,7 +314,8 @@ def test_investment_serialization_round_trip_preserves_source_id():
     assert restored.market_value == investment.market_value
     assert restored.category.levels() == investment.category.levels()
     assert restored.quantity == 10.0
-    assert restored.source_id == "ajbell-sipp"
+    assert restored.adapter == "ajbell"
+    assert restored.account == "sipp"
 
 
 def test_cmd_portfolio_create_creates_empty_snapshot(tmp_path):
@@ -339,8 +344,6 @@ def test_build_parser_uses_user_flag_and_drops_portfolio():
             "import",
             "--user",
             "demo",
-            "--source-id",
-            "ajbell-sipp",
             "--adapter",
             "ajbell",
             "--account",
@@ -349,10 +352,12 @@ def test_build_parser_uses_user_flag_and_drops_portfolio():
             str(AJ_BELL_FIXTURE),
         ]
     )
-    assert import_args.source_id == "ajbell-sipp"
+    assert import_args.adapter == "ajbell"
     assert import_args.user == "demo"
     assert import_args.account == "sipp"
     assert import_args.move is False
+    # `--source-id` was retired in favour of the (adapter, account) key.
+    assert not hasattr(import_args, "source_id")
 
     add_args = parser.parse_args(
         [
@@ -422,7 +427,6 @@ def test_cmd_portfolio_import_prompts_and_persists_missing_mappings(tmp_path, mo
 
     result = cmd_portfolio_import(
         argparse.Namespace(
-            source_id="ajbell-sipp",
             adapter="ajbell",
             account="sipp",
             statement=str(AJ_BELL_FIXTURE),
@@ -436,15 +440,18 @@ def test_cmd_portfolio_import_prompts_and_persists_missing_mappings(tmp_path, mo
 
     snapshot = load_snapshot(portfolio_path)
     assert len(snapshot["imports"]) == 1
-    assert snapshot["imports"][0]["source_id"] == "ajbell-sipp"
     assert snapshot["imports"][0]["adapter"] == "ajbell"
+    assert snapshot["imports"][0]["account"] == "sipp"
     assert snapshot["imports"][0]["mappings"] == str(mapping_path)
     assert len(snapshot["investments"]) == 3
-    assert all(entry["source_id"] == "ajbell-sipp" for entry in snapshot["investments"])
+    assert all(
+        entry["adapter"] == "ajbell" and entry["account"] == "sipp"
+        for entry in snapshot["investments"]
+    )
     assert mapping_path.exists()
 
 
-def test_cmd_portfolio_import_replaces_existing_source_id(tmp_path, monkeypatch):
+def test_cmd_portfolio_import_replaces_existing_adapter_account(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "portfolio.json"
     mapping_path = tmp_path / "broker.yaml"
     paths = _paths_with(portfolio=portfolio_path)
@@ -500,7 +507,6 @@ def test_cmd_portfolio_import_replaces_existing_source_id(tmp_path, monkeypatch)
     monkeypatch.setattr(cli_module, "_autofile_statement", lambda source, paths, **kwargs: source)
 
     args = argparse.Namespace(
-        source_id="ajbell-sipp",
         adapter="ajbell",
         account="sipp",
         statement="statement.csv",
@@ -515,7 +521,8 @@ def test_cmd_portfolio_import_replaces_existing_source_id(tmp_path, monkeypatch)
     assert len(snapshot["imports"]) == 1
     assert len(snapshot["investments"]) == 1
     assert snapshot["investments"][0]["market_value"] == 250.0
-    assert snapshot["investments"][0]["source_id"] == "ajbell-sipp"
+    assert snapshot["investments"][0]["adapter"] == "ajbell"
+    assert snapshot["investments"][0]["account"] == "sipp"
 
 
 def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
@@ -582,7 +589,6 @@ def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
 
     cmd_portfolio_import(
         argparse.Namespace(
-            source_id="source-a",
             adapter="ajbell",
             account="sipp",
             statement="a.csv",
@@ -594,7 +600,6 @@ def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
     )
     cmd_portfolio_import(
         argparse.Namespace(
-            source_id="source-b",
             adapter="ibkr",
             account="taxable",
             statement="b.csv",
@@ -606,7 +611,10 @@ def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
     )
 
     snapshot = load_snapshot(portfolio_path)
-    assert {entry["source_id"] for entry in snapshot["investments"]} == {"source-a", "source-b"}
+    assert {(entry["adapter"], entry["account"]) for entry in snapshot["investments"]} == {
+        ("ajbell", "sipp"),
+        ("ibkr", "taxable"),
+    }
     assert len(snapshot["imports"]) == 2
 
 
@@ -912,7 +920,6 @@ def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, 
 
     result = cmd_portfolio_import(
         argparse.Namespace(
-            source_id="ajbell-sipp",
             adapter="ajbell",
             account="sipp",
             statement="statement.csv",
@@ -926,9 +933,14 @@ def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, 
     assert result == 0
     snapshot = load_snapshot(portfolio_path)
     assert len(snapshot["imports"]) == 1
-    assert snapshot["imports"][0]["source_id"] == "ajbell-sipp"
+    assert snapshot["imports"][0]["adapter"] == "ajbell"
+    assert snapshot["imports"][0]["account"] == "sipp"
     assert {entry["source"] for entry in snapshot["investments"]} == {"manual", "ajbell"}
-    assert {entry.get("source_id") for entry in snapshot["investments"]} == {None, "ajbell-sipp"}
+    # The manual entry has no broker provenance; the imported one does.
+    assert {(entry.get("adapter"), entry.get("account")) for entry in snapshot["investments"]} == {
+        (None, None),
+        ("ajbell", "sipp"),
+    }
 
 
 def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tmp_path, capsys):
@@ -941,15 +953,15 @@ def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tm
                 "created_at": "2026-03-23T12:00:00Z",
                 "imports": [
                     {
-                        "source_id": "ibkr-taxable",
                         "adapter": "ibkr",
+                        "account": "taxable",
                         "statement": "ibkr.csv",
                         "mappings": "config/mappings/ibkr.yaml",
                         "imported_at": "2026-03-23T12:00:00Z",
                     },
                     {
-                        "source_id": "ajbell-sipp",
                         "adapter": "ajbell",
+                        "account": "sipp",
                         "statement": "ajbell.csv",
                         "mappings": "config/mappings/ajbell.yaml",
                         "imported_at": "2026-03-23T12:01:00Z",
@@ -963,7 +975,8 @@ def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tm
                         "category": "Equities / Developed / NAM",
                         "volatility": 0.2,
                         "source": "ibkr",
-                        "source_id": "ibkr-taxable",
+                        "adapter": "ibkr",
+                        "account": "taxable",
                     },
                     {
                         "instrument_id": "BBB",
@@ -972,7 +985,8 @@ def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tm
                         "category": "Equities / Developed / Europe",
                         "volatility": 0.25,
                         "source": "aj_bell",
-                        "source_id": "ajbell-sipp",
+                        "adapter": "ajbell",
+                        "account": "sipp",
                     },
                     {
                         "instrument_id": "CASH1",
@@ -1004,8 +1018,8 @@ def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tm
     assert result == 0
     captured = capsys.readouterr()
     assert "Source Breakdown (GBP)" in captured.out
-    assert "ibkr-taxable" in captured.out
-    assert "ajbell-sipp" in captured.out
+    assert "ibkr/taxable" in captured.out
+    assert "ajbell/sipp" in captured.out
     assert "manual" in captured.out
     assert "1,700.00" in captured.out
     csv_output = export_path.read_text(encoding="utf-8")
@@ -1028,7 +1042,8 @@ def test_cmd_portfolio_report_source_breakdown_sorts_by_value(tmp_path, capsys):
                         "category": "Equities / Developed / NAM",
                         "volatility": 0.2,
                         "source": "ajbell",
-                        "source_id": "small-source",
+                        "adapter": "ajbell",
+                        "account": "isa",
                     },
                     {
                         "instrument_id": "BBB",
@@ -1037,7 +1052,8 @@ def test_cmd_portfolio_report_source_breakdown_sorts_by_value(tmp_path, capsys):
                         "category": "Equities / Developed / Europe",
                         "volatility": 0.25,
                         "source": "ibkr",
-                        "source_id": "large-source",
+                        "adapter": "ibkr",
+                        "account": "taxable",
                     },
                     {
                         "instrument_id": "CCC",
@@ -1060,9 +1076,9 @@ def test_cmd_portfolio_report_source_breakdown_sorts_by_value(tmp_path, capsys):
 
     assert result == 0
     captured = capsys.readouterr()
-    large_idx = captured.out.index("large-source")
+    large_idx = captured.out.index("ibkr/taxable")
     manual_idx = captured.out.index("manual")
-    small_idx = captured.out.index("small-source")
+    small_idx = captured.out.index("ajbell/isa")
     assert large_idx < manual_idx < small_idx
 
 
