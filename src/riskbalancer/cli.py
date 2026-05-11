@@ -38,7 +38,16 @@ from .configuration import (
 )
 from .models import CategoryPath, Investment
 from .paths import UserPaths, resolve_default_user
+from .plan_adjust import (
+    apply_targeted,
+    confirm_changes,
+    filter_under,
+    iter_leaf_nodes,
+    render_list,
+    walk_adjustments,
+)
 from .plan_bootstrap import (
+    IO,
     PlanCreationAborted,
     StdIO,
     build_catalog,
@@ -47,6 +56,7 @@ from .plan_bootstrap import (
     count_unique_categories,
     describe_catalog_sources,
     walk_catalog_interactive,
+    write_plan_yaml,
 )
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
@@ -1261,6 +1271,120 @@ def cmd_plan_validate(args: argparse.Namespace, paths: Optional[UserPaths] = Non
     return 0
 
 
+def cmd_plan_adjust(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb plan adjust` — review or change leaf adjustments on a user's plan.
+
+    Three mutually exclusive modes:
+
+    - `--list`: print a tabular view of every leaf and exit; never writes.
+    - Positional `path` plus `value`: targeted single-leaf set, with a
+      y/N confirm that `--yes` can skip.
+    - Default: interactive walker over every non-zero-weight leaf, with
+      an optional `--under` subtree filter; a single y/N confirm applies
+      the whole batch.
+
+    All write paths flow through `write_plan_yaml`, which writes atomically.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
+
+    list_mode = bool(getattr(args, "list_mode", False))
+    under = getattr(args, "under", None)
+    path_label = getattr(args, "path", None)
+    value = getattr(args, "value", None)
+    skip_confirm = bool(getattr(args, "yes", False))
+
+    # Mutually exclusive combinations are rejected up front so each branch
+    # below can assume a clean shape. argparse alone can't express these
+    # combos because `path` and `value` are positional and optional.
+    if list_mode and (under or path_label is not None or skip_confirm):
+        print(
+            "plan adjust: --list cannot be combined with a path, --under, or --yes",
+            file=sys.stderr,
+        )
+        return 1
+    if path_label is not None and value is None:
+        print(
+            "plan adjust: a positional path requires a value (e.g. "
+            '`plan adjust "Bonds / Developed > UK > Govt" 0.95`)',
+            file=sys.stderr,
+        )
+        return 1
+    if path_label is None and value is not None:
+        # Unreachable through argparse (positionals are consumed left to
+        # right), but kept as a guard so hand-built Namespaces fail loudly.
+        print("plan adjust: a value requires a positional path", file=sys.stderr)
+        return 1
+    if path_label is not None and under is not None:
+        print(
+            "plan adjust: --under cannot be combined with a positional path",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not paths.plan.exists():
+        print(
+            f"No plan found for user '{paths.user}' at {paths.plan}. Run `rb plan create` first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    nodes = load_category_nodes_from_yaml(paths.plan)
+
+    if list_mode:
+        print(render_list(list(iter_leaf_nodes(nodes))))
+        return 0
+
+    io: IO = StdIO()
+
+    if path_label is not None:
+        # Translate the doc/help-text `>` separator into the project's
+        # canonical `/` before handing off to the existing label parser.
+        parts = _parse_category_label(path_label.replace(">", "/")).parts
+        # The mutex check above guarantees `value is not None` whenever
+        # `path_label` is not None — this assert narrows the type for mypy.
+        assert value is not None
+        try:
+            change = apply_targeted(nodes, parts, float(value))
+        except ValueError as exc:
+            print(f"plan adjust failed: {exc}", file=sys.stderr)
+            return 1
+        try:
+            should_write = confirm_changes(paths.plan, [change], io, skip_prompt=skip_confirm)
+        except PlanCreationAborted as exc:
+            print(f"plan adjust aborted: {exc}", file=sys.stderr)
+            return 1
+        if not should_write:
+            print("plan adjust aborted: user declined.")
+            return 0
+        write_plan_yaml(paths.plan, nodes)
+        print(f"Wrote updated plan to {paths.plan} (1 leaf changed).")
+        return 0
+
+    # Walker mode (with optional --under).
+    try:
+        leaves = filter_under(iter_leaf_nodes(nodes), under)
+    except ValueError as exc:
+        print(f"plan adjust failed: {exc}", file=sys.stderr)
+        return 1
+    try:
+        changes = walk_adjustments(leaves, io)
+        if not changes:
+            print("No changes.")
+            return 0
+        should_write = confirm_changes(paths.plan, changes, io)
+    except PlanCreationAborted as exc:
+        print(f"plan adjust aborted: {exc}", file=sys.stderr)
+        return 1
+    if not should_write:
+        print("plan adjust aborted: user declined.")
+        return 0
+    write_plan_yaml(paths.plan, nodes)
+    print(f"Wrote updated plan to {paths.plan} ({len(changes)} leaf changes).")
+    return 0
+
+
 def cmd_user_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     paths = paths if paths is not None else _paths_from_args(args)
     root = paths.users_root
@@ -1549,6 +1673,45 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional explicit plan path (defaults to the user's plan.yaml)",
     )
     plan_validate.set_defaults(func=cmd_plan_validate)
+
+    plan_adjust = plan_sub.add_parser(
+        "adjust",
+        parents=[user_parent],
+        help="Review or change adjustment values on leaf categories",
+    )
+    plan_adjust.add_argument(
+        "path",
+        nargs="?",
+        help=(
+            'Category path like "Bonds / Developed > UK > Govt". '
+            "When given, the next positional must be the new adjustment value."
+        ),
+    )
+    plan_adjust.add_argument(
+        "value",
+        nargs="?",
+        type=float,
+        help="New adjustment value (only valid with a positional path)",
+    )
+    plan_adjust.add_argument(
+        "--under",
+        help=(
+            "Restrict the walker to leaves under the given subtree "
+            '(e.g. "Bonds / Developed"). Mutually exclusive with the positional path.'
+        ),
+    )
+    plan_adjust.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_mode",
+        help="Print every leaf's adjustment metadata and exit (read-only)",
+    )
+    plan_adjust.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the y/N confirm for targeted single-leaf edits",
+    )
+    plan_adjust.set_defaults(func=cmd_plan_adjust)
 
     # user — manage which users exist in private/users/.
     user_parser = subparsers.add_parser("user", help="Manage users")

@@ -12,9 +12,11 @@ Author: Emre Tezel
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional, Protocol, Sequence
@@ -631,10 +633,36 @@ def _parse_weight_input(raw: str) -> float:
 
 
 def write_plan_yaml(path: Path, nodes: Sequence[CategoryNode]) -> None:
-    """Serialise a plan tree to YAML in the canonical `assets:` shape."""
+    """Serialise a plan tree to YAML in the canonical `assets:` shape.
+
+    Writes via a sibling temp file plus `os.replace` so an interrupted write
+    cannot leave the user's plan half-written. A failed serialisation or
+    rename leaves the original file untouched and unlinks the temp file.
+    """
     payload = {"assets": [_node_to_dict(node) for node in nodes]}
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    serialised = yaml.safe_dump(payload, sort_keys=False)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(serialised)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        # On any failure (serialisation, fsync, rename), make sure we don't
+        # leave a stray `.tmp` sibling behind. The original file — if any —
+        # is still intact because `os.replace` is the only step that touches
+        # it, and it either succeeds atomically or doesn't run at all.
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _render_plan_tree(nodes: Sequence[CategoryNode]) -> str:

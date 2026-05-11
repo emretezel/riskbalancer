@@ -392,6 +392,33 @@ def test_write_plan_yaml_round_trips(tmp_path):
     assert nodes[0].name == "Bonds"
 
 
+def test_write_plan_yaml_is_atomic_on_rename_failure(tmp_path, monkeypatch):
+    """A mid-write failure must leave the original file intact and clean up.
+
+    The original plan content is preserved, no `*.tmp` sibling is left
+    behind, and the exception propagates so the caller can react.
+    """
+    paths = _build_paths(tmp_path)
+    catalog = build_catalog(paths)
+    plan, _ = _drive_simple_plan(catalog)
+
+    out = tmp_path / "out.yaml"
+    out.write_text("ORIGINAL", encoding="utf-8")
+
+    def boom(*_args, **_kwargs):
+        raise OSError("simulated rename failure")
+
+    import riskbalancer.plan_bootstrap as plan_bootstrap_mod
+
+    monkeypatch.setattr(plan_bootstrap_mod.os, "replace", boom)
+    with pytest.raises(OSError, match="simulated rename failure"):
+        write_plan_yaml(out, plan)
+
+    assert out.read_text(encoding="utf-8") == "ORIGINAL"
+    leftover = list(tmp_path.glob("**/*.tmp"))
+    assert leftover == [], f"unexpected leftover temp files: {leftover}"
+
+
 def test_clone_plan_copies_and_validates(tmp_path):
     src_paths = _build_paths(tmp_path, user="emre")
     src_paths.user_dir.mkdir(parents=True, exist_ok=True)

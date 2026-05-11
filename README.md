@@ -130,6 +130,23 @@ To check that a plan is well-formed:
 riskbalancer plan validate --user wife
 ```
 
+To review or change leaf `adjustment` values without hand-editing YAML:
+
+```bash
+# Walk every leaf with weight > 0 and prompt for a new adjustment.
+# Press Enter to keep, type a number to replace, or `q` to stop early.
+riskbalancer plan adjust --user wife
+
+# Restrict the walk to a subtree.
+riskbalancer plan adjust --user wife --under "Bonds / Developed"
+
+# Set a single leaf without the walker (use `--yes` to skip the y/N confirm).
+riskbalancer plan adjust --user wife "Bonds / Developed > UK > Govt" 0.95
+
+# Read-only table of every leaf's current weight, vol, and adjustment.
+riskbalancer plan adjust --user wife --list
+```
+
 ### 2. Refresh FX rates (shared across users)
 
 ```bash
