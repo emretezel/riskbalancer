@@ -4,6 +4,7 @@ Adapters used to normalize broker statements into Investment objects.
 Author: Emre Tezel
 """
 
+from .aegon import AegonCSVAdapter
 from .aj_bell import AJBellCSVAdapter
 from .base import StatementAdapter
 from .citi import CitiCSVAdapter
@@ -13,6 +14,7 @@ from .schwab import SchwabCSVAdapter
 
 __all__ = [
     "AJBellCSVAdapter",
+    "AegonCSVAdapter",
     "CitiCSVAdapter",
     "IBKRCSVAdapter",
     "MS401KCSVAdapter",

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from riskbalancer import CategoryPath
 from riskbalancer.adapters import (
+    AegonCSVAdapter,
     AJBellCSVAdapter,
     CitiCSVAdapter,
     IBKRCSVAdapter,
@@ -14,6 +15,7 @@ IBKR_FIXTURE = Path(__file__).parent / "fixtures" / "ibkr_sample.csv"
 MS401K_FIXTURE = Path(__file__).parent / "fixtures" / "ms401k_sample.csv"
 SCHWAB_FIXTURE = Path(__file__).parent / "fixtures" / "schwab_sample.csv"
 CITI_FIXTURE = Path(__file__).parent / "fixtures" / "citi_sample.csv"
+AEGON_FIXTURE = Path(__file__).parent / "fixtures" / "aegon_sample.csv"
 
 
 def test_aj_bell_adapter_parses_sample_rows():
@@ -74,3 +76,31 @@ def test_citi_adapter_parses_after_header():
     values = {inv.instrument_id: inv.market_value for inv in investments}
     assert values["BDP"] == 1538.62 * 0.8
     assert values["C"] == 23871.40 * 0.8
+
+
+def test_aegon_adapter_parses_and_skips_total():
+    adapter = AegonCSVAdapter(default_volatility=0.18)
+
+    investments = adapter.parse_path(AEGON_FIXTURE)
+    # Four real holdings; the inline ``TOTAL`` summary row must be dropped.
+    assert len(investments) == 4
+
+    ids = {inv.instrument_id for inv in investments}
+    assert "TOTAL" not in ids
+
+    world = next(
+        inv for inv in investments if inv.instrument_id == "AGN BLK World (ex UK) Eq Idx (BLK)"
+    )
+    # Fund name with spaces and parentheses must round-trip verbatim.
+    assert world.description == "AGN BLK World (ex UK) Eq Idx (BLK)"
+    assert world.market_value == 20000.00
+    assert world.quantity == 10000.0
+    assert world.source == "aegon"
+    assert world.volatility == 0.18
+    assert world.category.levels()[0] == "Uncategorized"
+
+    brsp = next(
+        inv for inv in investments if inv.instrument_id == "BRSP Default Strategy 2046-2048"
+    )
+    # Confirms the row after the TOTAL marker is still parsed.
+    assert brsp.market_value == 10000.00

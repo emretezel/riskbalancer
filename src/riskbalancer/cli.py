@@ -23,6 +23,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 import yaml
 
 from .adapters import (
+    AegonCSVAdapter,
     AJBellCSVAdapter,
     CitiCSVAdapter,
     IBKRCSVAdapter,
@@ -160,6 +161,7 @@ def _require_user(paths: UserPaths) -> bool:
 
 
 ADAPTERS = {
+    "aegon": AegonCSVAdapter,
     "ajbell": AJBellCSVAdapter,
     "citi": CitiCSVAdapter,
     "ibkr": IBKRCSVAdapter,
