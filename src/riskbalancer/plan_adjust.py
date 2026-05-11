@@ -2,19 +2,20 @@
 Convenience interface for updating leaf `adjustment` values on a user's
 `plan.yaml`.
 
-The CLI command `rb plan adjust` exposes three mutually exclusive modes:
+The CLI command `rb plan adjust` exposes two mutually exclusive modes:
 
 - a depth-first **walker** over every leaf with `weight > 0`, prompting
   per leaf for a new adjustment;
-- a **targeted** single-leaf set keyed by category path;
-- a read-only **`--list`** dump of every leaf (zero-weight leaves
-  included, for context).
+- a **targeted** single-leaf set keyed by category path.
+
+A read-only listing of the same data is available via `rb plan list`,
+which shares this module's `iter_leaf_nodes` and `render_list`.
 
 All write paths flow back into `plan_bootstrap.write_plan_yaml`, which
 performs the atomic write back to `private/users/<user>/plan.yaml`. The
-CLI glue lives in `cli.cmd_plan_adjust`; this module owns the pure
-logic and the interactive walker so they can be unit-tested without a
-real terminal via `plan_bootstrap.ScriptedIO`.
+CLI glue lives in `cli.cmd_plan_adjust` and `cli.cmd_plan_list`; this
+module owns the pure logic and the interactive walker so they can be
+unit-tested without a real terminal via `plan_bootstrap.ScriptedIO`.
 
 Author: Emre Tezel
 """

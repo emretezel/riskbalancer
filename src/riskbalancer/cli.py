@@ -1271,25 +1271,45 @@ def cmd_plan_validate(args: argparse.Namespace, paths: Optional[UserPaths] = Non
     return 0
 
 
+def cmd_plan_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb plan list` — print every leaf's weight, vol, and adjustment.
+
+    Read-only — never writes. Zero-weight leaves are included so the user
+    can see the whole plan at a glance (unlike `plan adjust`, where the
+    walker silently skips them).
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
+    if not paths.plan.exists():
+        print(
+            f"No plan found for user '{paths.user}' at {paths.plan}. Run `rb plan create` first.",
+            file=sys.stderr,
+        )
+        return 1
+    nodes = load_category_nodes_from_yaml(paths.plan)
+    print(render_list(list(iter_leaf_nodes(nodes))))
+    return 0
+
+
 def cmd_plan_adjust(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     """`rb plan adjust` — review or change leaf adjustments on a user's plan.
 
-    Three mutually exclusive modes:
+    Two mutually exclusive modes:
 
-    - `--list`: print a tabular view of every leaf and exit; never writes.
     - Positional `path` plus `value`: targeted single-leaf set, with a
       y/N confirm that `--yes` can skip.
     - Default: interactive walker over every non-zero-weight leaf, with
       an optional `--under` subtree filter; a single y/N confirm applies
       the whole batch.
 
-    All write paths flow through `write_plan_yaml`, which writes atomically.
+    Read-only inspection of the plan lives at `rb plan list`. All write
+    paths here flow through `write_plan_yaml`, which writes atomically.
     """
     paths = paths if paths is not None else _paths_from_args(args)
     if not _require_user(paths):
         return 1
 
-    list_mode = bool(getattr(args, "list_mode", False))
     under = getattr(args, "under", None)
     path_label = getattr(args, "path", None)
     value = getattr(args, "value", None)
@@ -1298,12 +1318,6 @@ def cmd_plan_adjust(args: argparse.Namespace, paths: Optional[UserPaths] = None)
     # Mutually exclusive combinations are rejected up front so each branch
     # below can assume a clean shape. argparse alone can't express these
     # combos because `path` and `value` are positional and optional.
-    if list_mode and (under or path_label is not None or skip_confirm):
-        print(
-            "plan adjust: --list cannot be combined with a path, --under, or --yes",
-            file=sys.stderr,
-        )
-        return 1
     if path_label is not None and value is None:
         print(
             "plan adjust: a positional path requires a value (e.g. "
@@ -1331,10 +1345,6 @@ def cmd_plan_adjust(args: argparse.Namespace, paths: Optional[UserPaths] = None)
         return 1
 
     nodes = load_category_nodes_from_yaml(paths.plan)
-
-    if list_mode:
-        print(render_list(list(iter_leaf_nodes(nodes))))
-        return 0
 
     io: IO = StdIO()
 
@@ -1674,6 +1684,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plan_validate.set_defaults(func=cmd_plan_validate)
 
+    plan_list = plan_sub.add_parser(
+        "list",
+        parents=[user_parent],
+        help="Print every leaf's weight, volatility, and adjustment (read-only)",
+    )
+    plan_list.set_defaults(func=cmd_plan_list)
+
     plan_adjust = plan_sub.add_parser(
         "adjust",
         parents=[user_parent],
@@ -1699,12 +1716,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Restrict the walker to leaves under the given subtree "
             '(e.g. "Bonds / Developed"). Mutually exclusive with the positional path.'
         ),
-    )
-    plan_adjust.add_argument(
-        "--list",
-        action="store_true",
-        dest="list_mode",
-        help="Print every leaf's adjustment metadata and exit (read-only)",
     )
     plan_adjust.add_argument(
         "--yes",

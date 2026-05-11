@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from riskbalancer.cli import cmd_plan_adjust
+from riskbalancer.cli import cmd_plan_adjust, cmd_plan_list
 from riskbalancer.configuration import load_category_nodes_from_yaml
 from riskbalancer.paths import UserPaths
 from riskbalancer.plan_adjust import iter_leaf_nodes
@@ -96,11 +96,15 @@ def _args(**kwargs) -> argparse.Namespace:
         "path": None,
         "value": None,
         "under": None,
-        "list_mode": False,
         "yes": False,
     }
     defaults.update(kwargs)
     return argparse.Namespace(**defaults)
+
+
+def _list_args(user: str = "emre") -> argparse.Namespace:
+    """Argparse Namespace matching the `plan list` subparser shape."""
+    return argparse.Namespace(user=user)
 
 
 def _script(monkeypatch, answers):
@@ -110,16 +114,16 @@ def _script(monkeypatch, answers):
 
 
 # ---------------------------------------------------------------------------
-# --list
+# rb plan list
 # ---------------------------------------------------------------------------
 
 
-def test_list_prints_table_and_does_not_write(tmp_path, capsys):
+def test_plan_list_prints_table_and_does_not_write(tmp_path, capsys):
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
     mtime_before = paths.plan.stat().st_mtime_ns
 
-    rc = cmd_plan_adjust(_args(list_mode=True), paths=paths)
+    rc = cmd_plan_list(_list_args(), paths=paths)
 
     assert rc == 0
     out = capsys.readouterr().out
@@ -130,14 +134,31 @@ def test_list_prints_table_and_does_not_write(tmp_path, capsys):
     assert paths.plan.stat().st_mtime_ns == mtime_before
 
 
-def test_list_includes_zero_weight_leaves(tmp_path, capsys):
+def test_plan_list_includes_zero_weight_leaves(tmp_path, capsys):
     paths = _paths_for(tmp_path)
     _seed_plan(paths, PLAN_WITH_CASH_YAML)
 
-    rc = cmd_plan_adjust(_args(list_mode=True), paths=paths)
+    rc = cmd_plan_list(_list_args(), paths=paths)
     assert rc == 0
     out = capsys.readouterr().out
     assert "Cash" in out
+
+
+def test_plan_list_missing_plan_errors(tmp_path, capsys):
+    paths = _paths_for(tmp_path)
+    rc = cmd_plan_list(_list_args(), paths=paths)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No plan found" in err
+    assert "plan create" in err
+
+
+def test_plan_list_missing_user_errors(tmp_path, capsys):
+    paths = _paths_for(tmp_path, user="")
+    rc = cmd_plan_list(_list_args(user=""), paths=paths)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "No user resolved" in err
 
 
 # ---------------------------------------------------------------------------
@@ -313,16 +334,6 @@ def test_walker_under_no_match_errors(tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_list_rejects_combined_flags(tmp_path, capsys):
-    paths = _paths_for(tmp_path)
-    _seed_plan(paths)
-
-    rc = cmd_plan_adjust(_args(list_mode=True, under="Bonds"), paths=paths)
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "--list" in err
-
-
 def test_positional_path_without_value_errors(tmp_path, capsys):
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
@@ -346,17 +357,17 @@ def test_under_combined_with_path_errors(tmp_path, capsys):
     assert "--under" in err
 
 
-def test_missing_plan_errors_with_helpful_message(tmp_path, capsys):
+def test_adjust_missing_plan_errors_with_helpful_message(tmp_path, capsys):
     paths = _paths_for(tmp_path)
     # Do not seed the plan.
-    rc = cmd_plan_adjust(_args(list_mode=True), paths=paths)
+    rc = cmd_plan_adjust(_args(under="Bonds"), paths=paths)
     assert rc == 1
     err = capsys.readouterr().err
     assert "No plan found" in err
     assert "plan create" in err
 
 
-def test_missing_user_errors(tmp_path, capsys):
+def test_adjust_missing_user_errors(tmp_path, capsys):
     paths = _paths_for(tmp_path, user="")
     rc = cmd_plan_adjust(_args(user=""), paths=paths)
     assert rc == 1
