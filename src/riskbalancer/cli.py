@@ -18,7 +18,7 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, cast
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, cast
 
 import yaml
 
@@ -30,6 +30,7 @@ from .adapters import (
     SchwabCSVAdapter,
 )
 from .configuration import (
+    CategoryNode,
     build_portfolio_plan_from_nodes,
     collect_category_weight_validation_failures,
     format_category_weight_validation_failures,
@@ -50,6 +51,7 @@ from .plan_bootstrap import (
     IO,
     PlanCreationAborted,
     StdIO,
+    _prompt_yes_no,
     build_catalog,
     clone_plan,
     confirm_and_write_plan,
@@ -58,6 +60,7 @@ from .plan_bootstrap import (
     walk_catalog_interactive,
     write_plan_yaml,
 )
+from .plan_csv import PlanCSVError, read_plan_csv, write_plan_csv
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
 DEFAULT_LEAF_VOLATILITY = 0.15
@@ -1395,6 +1398,146 @@ def cmd_plan_adjust(args: argparse.Namespace, paths: Optional[UserPaths] = None)
     return 0
 
 
+def cmd_plan_export(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb plan export` — write the user's plan as a depth-column CSV.
+
+    Default destination is stdout (pipe-friendly); pass `--out PATH` to write
+    a file. The CSV format is documented in `plan_csv.write_plan_csv` and is
+    designed to round-trip through `rb plan import` without loss.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
+    if not paths.plan.exists():
+        print(
+            f"No plan found for user '{paths.user}' at {paths.plan}. Run `rb plan create` first.",
+            file=sys.stderr,
+        )
+        return 1
+    nodes = load_category_nodes_from_yaml(paths.plan)
+
+    out_path: Optional[Path] = getattr(args, "out", None)
+    if out_path is None:
+        # `csv.writer` writes `\r\n` line terminators by default; that's the
+        # RFC 4180 convention and matches what spreadsheet apps expect on
+        # import, so we let it through to stdout untouched.
+        write_plan_csv(nodes, sys.stdout)
+        return 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # `newline=""` tells the file object not to translate the `\r\n` that
+    # csv.writer emits — without it, Windows would end up with `\r\r\n`.
+    with out_path.open("w", encoding="utf-8", newline="") as handle:
+        write_plan_csv(nodes, handle)
+    print(f"Wrote plan CSV to {out_path}")
+    return 0
+
+
+def cmd_plan_import(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb plan import` — replace the user's plan from a depth-column CSV.
+
+    Reads and validates the CSV first (header shape, weight totals, leaf
+    structure). On success, prints a leaves-added/removed/changed summary
+    and asks for y/N confirmation before overwriting `plan.yaml`. Pass
+    `--yes` to skip the prompt. Any CSV-parse or validation error returns
+    exit code 2 with the failing row's number, and `plan.yaml` is left
+    untouched.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    if not _require_user(paths):
+        return 1
+    csv_path = Path(args.csv_path)
+    if not csv_path.exists():
+        print(f"CSV file {csv_path} not found", file=sys.stderr)
+        return 1
+
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as handle:
+            new_nodes = read_plan_csv(handle)
+    except PlanCSVError as exc:
+        print(f"plan import failed: {exc}", file=sys.stderr)
+        return 2
+
+    # Run the same sibling-weight validator the YAML loader uses so the CSV
+    # path and `plan validate` cannot disagree on what counts as a valid plan.
+    failures = collect_category_weight_validation_failures(new_nodes)
+    if failures:
+        print(format_category_weight_validation_failures(failures), file=sys.stderr)
+        return 2
+
+    skip_confirm = bool(getattr(args, "yes", False))
+
+    if paths.plan.exists():
+        old_nodes = load_category_nodes_from_yaml(paths.plan)
+        print(_render_import_summary(old_nodes, new_nodes))
+    else:
+        new_leaf_count = sum(1 for _ in iter_leaf_nodes(new_nodes))
+        print(
+            f"No existing plan at {paths.plan}; importing will create a new plan "
+            f"with {new_leaf_count} leaves."
+        )
+
+    if not skip_confirm:
+        io: IO = StdIO()
+        try:
+            ok = _prompt_yes_no(
+                io,
+                f"\nReplace plan at {paths.plan}? [y/N]: ",
+                default=False,
+            )
+        except PlanCreationAborted as exc:
+            print(f"plan import aborted: {exc}", file=sys.stderr)
+            return 1
+        if not ok:
+            print("plan import aborted: user declined.")
+            return 0
+
+    write_plan_yaml(paths.plan, new_nodes)
+    leaf_count = sum(1 for _ in iter_leaf_nodes(new_nodes))
+    print(f"Wrote plan to {paths.plan} ({leaf_count} leaves).")
+    return 0
+
+
+def _render_import_summary(
+    old_nodes: Sequence[CategoryNode],
+    new_nodes: Sequence[CategoryNode],
+) -> str:
+    """Render a leaves-added/removed/changed summary between two plan trees.
+
+    Diff is computed on leaves only — branches don't carry vol/adj and their
+    weights are derived implicitly from sibling layout. A leaf is "changed"
+    when its `(weight, volatility, adjustment)` tuple differs between old
+    and new, even if its path is unchanged.
+    """
+    old_leaves = {path: node for path, node in iter_leaf_nodes(old_nodes)}
+    new_leaves = {path: node for path, node in iter_leaf_nodes(new_nodes)}
+    added = sorted(new_leaves.keys() - old_leaves.keys())
+    removed = sorted(old_leaves.keys() - new_leaves.keys())
+    changed: list[tuple[str, ...]] = []
+    for path in old_leaves.keys() & new_leaves.keys():
+        old, new = old_leaves[path], new_leaves[path]
+        if (old.weight, old.volatility, old.adjustment) != (
+            new.weight,
+            new.volatility,
+            new.adjustment,
+        ):
+            changed.append(path)
+    lines = [
+        f"Import summary: {len(new_leaves)} leaves total "
+        f"(was {len(old_leaves)}; +{len(added)} added, "
+        f"-{len(removed)} removed, ~{len(changed)} changed)"
+    ]
+    if added:
+        lines.append("Added:")
+        lines.extend(f"  + {' / '.join(path)}" for path in added)
+    if removed:
+        lines.append("Removed:")
+        lines.extend(f"  - {' / '.join(path)}" for path in removed)
+    if changed:
+        lines.append("Changed:")
+        lines.extend(f"  ~ {' / '.join(path)}" for path in sorted(changed))
+    return "\n".join(lines)
+
+
 def cmd_user_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     paths = paths if paths is not None else _paths_from_args(args)
     root = paths.users_root
@@ -1723,6 +1866,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the y/N confirm for targeted single-leaf edits",
     )
     plan_adjust.set_defaults(func=cmd_plan_adjust)
+
+    plan_export = plan_sub.add_parser(
+        "export",
+        parents=[user_parent],
+        help="Export the user's plan as a depth-column CSV (stdout by default)",
+    )
+    plan_export.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help="Write the CSV to this path instead of stdout.",
+    )
+    plan_export.set_defaults(func=cmd_plan_export)
+
+    plan_import = plan_sub.add_parser(
+        "import",
+        parents=[user_parent],
+        help="Replace the user's plan from a depth-column CSV",
+    )
+    plan_import.add_argument(
+        "csv_path",
+        help="CSV file to import (produced by `rb plan export` or hand-edited).",
+    )
+    plan_import.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the y/N confirm before overwriting plan.yaml.",
+    )
+    plan_import.set_defaults(func=cmd_plan_import)
 
     # user — manage which users exist in private/users/.
     user_parser = subparsers.add_parser("user", help="Manage users")
