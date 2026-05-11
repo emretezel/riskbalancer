@@ -1,9 +1,11 @@
 """
 Unit tests for `riskbalancer.plan_csv`.
 
-Covers the depth-column CSV format: header parsing, round-trip fidelity
-(YAML → CSV → YAML must be byte-stable), order-independence on read,
-optional cell handling, and the catalogue of typed parse errors.
+Covers the leaves-only interleaved CSV format: header shape with
+`level1,weight1,...,levelN,weightN,volatility,adjustment`, round-trip
+fidelity, conflict detection on per-level weights repeated across
+sibling leaves, contiguous-path validation, and the catalogue of typed
+parse errors.
 
 Author: Emre Tezel
 """
@@ -48,7 +50,7 @@ assets:
     adjustment: 1.0
 """
 
-# Includes a 4-deep tree so the header writer is exercised at varying widths.
+# 4-deep so the header writer is exercised at varying widths.
 DEEP_PLAN_YAML = """\
 assets:
   - name: Equities
@@ -80,12 +82,12 @@ def _roundtrip_through_csv(nodes: list[CategoryNode]) -> list[CategoryNode]:
 
 
 def _yaml_form(nodes: list[CategoryNode], tmp_path: Path, name: str) -> str:
-    """Write `nodes` to YAML via the project's writer and return the file text.
+    """Write `nodes` via the project's writer and return the file text.
 
-    Round-trip equality is asserted at the YAML level rather than on the
-    CategoryNode instances directly because the loader normalises some
-    values (e.g. `volatility: 0.0` → None) — comparing the YAML byte stream
-    is the strongest "the user sees the same plan" check.
+    Round-trip equality is asserted at the YAML level (rather than on the
+    CategoryNode instances directly) because the loader normalises some
+    values — comparing the YAML byte stream is the strongest "the user
+    sees the same plan" check.
     """
     target = tmp_path / name
     write_plan_yaml(target, nodes)
@@ -124,7 +126,7 @@ def test_roundtrip_deep_plan_byte_stable(tmp_path):
 
 
 def test_roundtrip_committed_seed_plan(tmp_path):
-    """The committed seed plan (the broadest example we ship) round-trips cleanly."""
+    """The committed seed plan (broadest example we ship) round-trips cleanly."""
     seed = Path(__file__).resolve().parents[1] / "config" / "seed_plan.yaml"
     original = load_category_nodes_from_yaml(seed)
 
@@ -136,12 +138,12 @@ def test_roundtrip_committed_seed_plan(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Header writing
+# Header writing & shape
 # ---------------------------------------------------------------------------
 
 
-def test_header_width_matches_max_depth(tmp_path):
-    """A 4-deep plan emits `level1..level4` plus the trailing triple."""
+def test_header_has_interleaved_level_and_weight_columns(tmp_path):
+    """4-deep plan emits `level1,weight1,...,level4,weight4,vol,adj`."""
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text(DEEP_PLAN_YAML, encoding="utf-8")
     nodes = load_category_nodes_from_yaml(plan_path)
@@ -149,25 +151,77 @@ def test_header_width_matches_max_depth(tmp_path):
     buffer = io.StringIO()
     write_plan_csv(nodes, buffer)
     header = buffer.getvalue().splitlines()[0]
-    assert header == "level1,level2,level3,level4,weight,volatility,adjustment"
+    assert header == (
+        "level1,weight1,level2,weight2,level3,weight3,level4,weight4,volatility,adjustment"
+    )
 
 
-def test_export_branches_have_blank_volatility_and_explicit_adjustment(tmp_path):
-    """Branch rows leave volatility blank but write adjustment explicitly."""
+def test_export_writes_only_leaves(tmp_path):
+    """Branches must not appear in the CSV — every data row is a leaf."""
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text(SIMPLE_PLAN_YAML, encoding="utf-8")
     nodes = load_category_nodes_from_yaml(plan_path)
 
     buffer = io.StringIO()
     write_plan_csv(nodes, buffer)
-    rows = list(buffer.getvalue().splitlines())
-    # Row for top-level "Equities" branch (vol blank, adjustment 1.0 explicit).
-    equities_row = next(line for line in rows if line.startswith("Equities,,"))
-    cells = equities_row.split(",")
-    # cells: ['Equities', '', 'weight', 'volatility', 'adjustment']
-    assert cells[2] == "0.6"
-    assert cells[3] == ""
-    assert cells[4] == "1.0"
+    rows = buffer.getvalue().splitlines()[1:]  # drop header
+    # 3 leaves: Equities/NAM, Equities/EMEA, Bonds.
+    assert len(rows) == 3
+    leaf_paths = [
+        tuple(cell for i, cell in enumerate(line.split(",")) if i % 2 == 0 and cell)
+        for line in rows
+    ]
+    assert tuple(leaf_paths[0][:2]) == ("Equities", "NAM")
+    assert tuple(leaf_paths[1][:2]) == ("Equities", "EMEA")
+    assert leaf_paths[2][:1] == ("Bonds",)
+
+
+def test_top_level_leaf_pads_trailing_cells(tmp_path):
+    """A shallower leaf (depth 1 in a depth-2 plan) leaves trailing cells blank."""
+    plan_path = tmp_path / "plan.yaml"
+    plan_path.write_text(SIMPLE_PLAN_YAML, encoding="utf-8")
+    nodes = load_category_nodes_from_yaml(plan_path)
+
+    buffer = io.StringIO()
+    write_plan_csv(nodes, buffer)
+    rows = buffer.getvalue().splitlines()
+    bonds_row = next(line for line in rows if line.startswith("Bonds,"))
+    cells = bonds_row.split(",")
+    # Header is level1,weight1,level2,weight2,volatility,adjustment.
+    assert cells[0] == "Bonds"
+    assert cells[1] == "0.4"
+    assert cells[2] == ""  # blank level2
+    assert cells[3] == ""  # blank weight2
+    assert cells[4] == "0.07"
+    assert cells[5] == "1.0"
+
+
+def test_resolved_volatility_uses_inherited_value(tmp_path):
+    """A leaf with no own volatility inherits from the nearest ancestor that has one."""
+    yaml_text = textwrap.dedent(
+        """\
+        assets:
+          - name: Bonds
+            weight: 1.0
+            volatility: 0.08
+            children:
+              - name: Govt
+                weight: 1.0
+                adjustment: 1.0
+        """
+    )
+    plan_path = tmp_path / "plan.yaml"
+    plan_path.write_text(yaml_text, encoding="utf-8")
+    nodes = load_category_nodes_from_yaml(plan_path)
+
+    buffer = io.StringIO()
+    write_plan_csv(nodes, buffer)
+    rows = buffer.getvalue().splitlines()
+    # Header: level1,weight1,level2,weight2,volatility,adjustment.
+    govt_row = next(line for line in rows if line.startswith("Bonds,"))
+    cells = govt_row.split(",")
+    # The leaf's resolved volatility is the inherited 0.08, not blank.
+    assert cells[4] == "0.08"
 
 
 # ---------------------------------------------------------------------------
@@ -175,12 +229,17 @@ def test_export_branches_have_blank_volatility_and_explicit_adjustment(tmp_path)
 # ---------------------------------------------------------------------------
 
 
-def test_read_is_order_agnostic_for_shuffled_input(tmp_path):
-    """Shuffling rows in the CSV (keeping the header) yields the same plan."""
+def test_read_is_structurally_order_agnostic_for_shuffled_input(tmp_path):
+    """Shuffling rows in the CSV (keeping the header) yields a structurally equivalent plan.
+
+    Sibling order in a leaves-only CSV is determined by the row order, so
+    a shuffled file legitimately produces a tree with re-ordered siblings.
+    The check is that the same set of paths with the same per-leaf values
+    survives — order-equivalence, not byte-equality.
+    """
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text(SIMPLE_PLAN_YAML, encoding="utf-8")
     nodes = load_category_nodes_from_yaml(plan_path)
-    expected_yaml = _yaml_form(nodes, tmp_path, "expected.yaml")
 
     buffer = io.StringIO()
     write_plan_csv(nodes, buffer)
@@ -191,11 +250,36 @@ def test_read_is_order_agnostic_for_shuffled_input(tmp_path):
     shuffled = "\n".join([header, *rest]) + "\n"
 
     rebuilt = read_plan_csv(io.StringIO(shuffled))
-    assert _yaml_form(rebuilt, tmp_path, "actual.yaml") == expected_yaml
+    assert _flat_leaf_set(nodes) == _flat_leaf_set(rebuilt)
+
+
+def _flat_leaf_set(
+    nodes: list[CategoryNode],
+) -> set[tuple[tuple[str, ...], float, float | None, float]]:
+    """Return `{(path, cumulative_weight, volatility, adjustment)}` for every leaf."""
+    out: set[tuple[tuple[str, ...], float, float | None, float]] = set()
+
+    def walk(
+        children: list[CategoryNode],
+        prefix: tuple[str, ...],
+        weight: float,
+        inherited_vol: float | None,
+    ) -> None:
+        for child in children:
+            path = prefix + (child.name,)
+            cumulative = weight * child.weight
+            next_vol = child.volatility if child.volatility is not None else inherited_vol
+            if child.children:
+                walk(child.children, path, cumulative, next_vol)
+            else:
+                out.add((path, cumulative, next_vol, child.adjustment))
+
+    walk(nodes, prefix=(), weight=1.0, inherited_vol=None)
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Optional cells
+# Optional cells & loader-compatible parsing
 # ---------------------------------------------------------------------------
 
 
@@ -203,7 +287,7 @@ def test_blank_volatility_and_adjustment_default_correctly():
     """Empty volatility cell → None; empty adjustment cell → 1.0."""
     csv_text = textwrap.dedent(
         """\
-        level1,weight,volatility,adjustment
+        level1,weight1,volatility,adjustment
         Bonds,1.0,,
         """
     )
@@ -215,10 +299,10 @@ def test_blank_volatility_and_adjustment_default_correctly():
 
 
 def test_percent_suffix_on_weight_is_accepted():
-    """`55%` should be accepted, mirroring the YAML loader."""
+    """`55%` is accepted, mirroring the YAML loader."""
     csv_text = textwrap.dedent(
         """\
-        level1,weight,volatility,adjustment
+        level1,weight1,volatility,adjustment
         A,55%,0.1,1.0
         B,45%,0.1,1.0
         """
@@ -228,25 +312,117 @@ def test_percent_suffix_on_weight_is_accepted():
     assert nodes[1].weight == pytest.approx(0.45)
 
 
+def test_blank_rows_are_skipped_silently():
+    """Trailing/embedded blank rows from spreadsheets shouldn't error."""
+    csv_text = textwrap.dedent(
+        """\
+        level1,weight1,volatility,adjustment
+        A,0.5,0.1,1.0
+
+        B,0.5,0.1,1.0
+
+        """
+    )
+    nodes = read_plan_csv(io.StringIO(csv_text))
+    assert [node.name for node in nodes] == ["A", "B"]
+
+
+def test_short_rows_are_padded_with_blanks():
+    """Spreadsheets often trim trailing empty cells — the reader pads them back."""
+    csv_text = "level1,weight1,volatility,adjustment\nBonds,0.5\n"
+    nodes = read_plan_csv(io.StringIO(csv_text))
+    # Bonds gets the loader's blank-volatility (None) and default adjustment (1.0).
+    assert nodes[0].volatility is None
+    assert nodes[0].adjustment == pytest.approx(1.0)
+
+
 # ---------------------------------------------------------------------------
-# Error cases
+# Conflict detection
+# ---------------------------------------------------------------------------
+
+
+def test_conflicting_branch_weight_errors_with_both_rows():
+    """Two sibling leaves under the same parent must agree on the parent's weight."""
+    csv_text = textwrap.dedent(
+        """\
+        level1,weight1,level2,weight2,volatility,adjustment
+        Equities,0.6,NAM,0.5,0.18,1.0
+        Equities,0.7,EMEA,0.5,0.18,0.9
+        """
+    )
+    with pytest.raises(PlanCSVError) as excinfo:
+        read_plan_csv(io.StringIO(csv_text))
+    message = str(excinfo.value)
+    assert "Equities" in message
+    assert "row 2" in message  # first occurrence
+    assert excinfo.value.row_number == 3  # the disagreeing row
+
+
+def test_matching_branch_weights_pass_conflict_check():
+    """Sibling leaves agreeing on parent weight build a valid tree."""
+    csv_text = textwrap.dedent(
+        """\
+        level1,weight1,level2,weight2,volatility,adjustment
+        Equities,0.6,NAM,0.5,0.18,1.0
+        Equities,0.6,EMEA,0.5,0.18,0.9
+        Bonds,0.4,,,0.07,1.0
+        """
+    )
+    nodes = read_plan_csv(io.StringIO(csv_text))
+    assert nodes[0].name == "Equities"
+    assert nodes[0].weight == pytest.approx(0.6)
+    assert [child.name for child in nodes[0].children] == ["NAM", "EMEA"]
+
+
+def test_floating_point_close_branch_weights_are_accepted():
+    """Tiny float noise on a repeated branch weight does not trigger a conflict."""
+    csv_text = textwrap.dedent(
+        """\
+        level1,weight1,level2,weight2,volatility,adjustment
+        Equities,0.6,NAM,0.5,0.18,1.0
+        Equities,0.6000000000000001,EMEA,0.5,0.18,0.9
+        """
+    )
+    # No exception expected — within absolute tolerance.
+    nodes = read_plan_csv(io.StringIO(csv_text))
+    assert nodes[0].weight == pytest.approx(0.6)
+
+
+# ---------------------------------------------------------------------------
+# Header and row error cases
 # ---------------------------------------------------------------------------
 
 
 def test_missing_header_trailing_columns_errors():
-    csv_text = "level1,weight,volatility\nA,1.0,0.1\n"
+    csv_text = "level1,weight1,volatility\nA,1.0,0.1\n"
     with pytest.raises(PlanCSVError) as excinfo:
         read_plan_csv(io.StringIO(csv_text))
     assert excinfo.value.row_number == 1
-    assert "weight,volatility,adjustment" in str(excinfo.value)
+    assert "volatility,adjustment" in str(excinfo.value)
 
 
 def test_misnamed_level_column_errors():
-    csv_text = "category,weight,volatility,adjustment\nA,1.0,0.1,1.0\n"
+    csv_text = "category,weight1,volatility,adjustment\nA,1.0,0.1,1.0\n"
     with pytest.raises(PlanCSVError) as excinfo:
         read_plan_csv(io.StringIO(csv_text))
     assert excinfo.value.row_number == 1
     assert "level1" in str(excinfo.value)
+
+
+def test_misnamed_weight_column_errors():
+    csv_text = "level1,share,volatility,adjustment\nA,1.0,0.1,1.0\n"
+    with pytest.raises(PlanCSVError) as excinfo:
+        read_plan_csv(io.StringIO(csv_text))
+    assert excinfo.value.row_number == 1
+    assert "weight1" in str(excinfo.value)
+
+
+def test_odd_prefix_count_errors():
+    """Header like `level1,weight1,level2,vol,adj` has an unpaired level2."""
+    csv_text = "level1,weight1,level2,volatility,adjustment\nA,1.0,B,0.1,1.0\n"
+    with pytest.raises(PlanCSVError) as excinfo:
+        read_plan_csv(io.StringIO(csv_text))
+    assert excinfo.value.row_number == 1
 
 
 def test_empty_csv_errors():
@@ -254,40 +430,38 @@ def test_empty_csv_errors():
         read_plan_csv(io.StringIO(""))
 
 
-def test_missing_parent_errors_with_row_number():
+def test_duplicate_leaf_path_errors():
     csv_text = textwrap.dedent(
         """\
-        level1,level2,weight,volatility,adjustment
-        Equities,NAM,0.5,0.18,1.0
-        """
-    )
-    # NAM has no parent row; rows are sorted by depth so the depth-2 row
-    # is processed without ever seeing a depth-1 'Equities' row.
-    with pytest.raises(PlanCSVError) as excinfo:
-        read_plan_csv(io.StringIO(csv_text))
-    assert excinfo.value.row_number == 2
-    assert "parent" in str(excinfo.value)
-
-
-def test_duplicate_path_errors():
-    csv_text = textwrap.dedent(
-        """\
-        level1,weight,volatility,adjustment
+        level1,weight1,volatility,adjustment
         Bonds,0.5,0.07,1.0
         Bonds,0.5,0.07,1.0
         """
     )
     with pytest.raises(PlanCSVError) as excinfo:
         read_plan_csv(io.StringIO(csv_text))
-    # Sorted by (depth, row_number) — the duplicate is at row 3 in source order.
     assert excinfo.value.row_number == 3
     assert "duplicate" in str(excinfo.value)
+
+
+def test_leaf_under_leaf_errors():
+    """A leaf whose path is a strict prefix of another row's path is invalid."""
+    csv_text = textwrap.dedent(
+        """\
+        level1,weight1,level2,weight2,volatility,adjustment
+        Equities,1.0,,,0.18,1.0
+        Equities,1.0,NAM,0.5,0.18,1.0
+        """
+    )
+    with pytest.raises(PlanCSVError) as excinfo:
+        read_plan_csv(io.StringIO(csv_text))
+    assert "leaf" in str(excinfo.value)
 
 
 def test_non_numeric_weight_errors():
     csv_text = textwrap.dedent(
         """\
-        level1,weight,volatility,adjustment
+        level1,weight1,volatility,adjustment
         Bonds,abc,0.07,1.0
         """
     )
@@ -296,25 +470,37 @@ def test_non_numeric_weight_errors():
     assert excinfo.value.row_number == 2
 
 
-def test_missing_weight_errors():
+def test_missing_weight_when_level_is_filled_errors():
     csv_text = textwrap.dedent(
         """\
-        level1,weight,volatility,adjustment
+        level1,weight1,volatility,adjustment
         Bonds,,0.07,1.0
         """
     )
     with pytest.raises(PlanCSVError) as excinfo:
         read_plan_csv(io.StringIO(csv_text))
     assert excinfo.value.row_number == 2
-    assert "weight" in str(excinfo.value)
+    assert "level1" in str(excinfo.value) or "weight1" in str(excinfo.value)
+
+
+def test_filled_weight_with_blank_level_errors():
+    csv_text = textwrap.dedent(
+        """\
+        level1,weight1,level2,weight2,volatility,adjustment
+        Equities,0.5,,0.5,0.18,1.0
+        """
+    )
+    with pytest.raises(PlanCSVError) as excinfo:
+        read_plan_csv(io.StringIO(csv_text))
+    assert excinfo.value.row_number == 2
 
 
 def test_gap_in_level_columns_errors():
-    """`Equities, , NAM` is a silent way to lose hierarchy and must be rejected."""
+    """`Equities,0.6,,,NAM,0.5,...` is a silent way to lose hierarchy."""
     csv_text = textwrap.dedent(
         """\
-        level1,level2,level3,weight,volatility,adjustment
-        Equities,,NAM,0.5,0.18,1.0
+        level1,weight1,level2,weight2,level3,weight3,volatility,adjustment
+        Equities,0.6,,,NAM,0.5,0.18,1.0
         """
     )
     with pytest.raises(PlanCSVError) as excinfo:
@@ -326,8 +512,8 @@ def test_gap_in_level_columns_errors():
 def test_empty_path_row_errors():
     csv_text = textwrap.dedent(
         """\
-        level1,weight,volatility,adjustment
-        ,0.5,0.07,1.0
+        level1,weight1,volatility,adjustment
+        ,,0.07,1.0
         """
     )
     with pytest.raises(PlanCSVError) as excinfo:
@@ -338,7 +524,7 @@ def test_empty_path_row_errors():
 def test_too_many_cells_errors():
     csv_text = textwrap.dedent(
         """\
-        level1,weight,volatility,adjustment
+        level1,weight1,volatility,adjustment
         Bonds,0.5,0.07,1.0,extra
         """
     )
@@ -347,45 +533,19 @@ def test_too_many_cells_errors():
     assert excinfo.value.row_number == 2
 
 
-def test_blank_rows_are_skipped_silently():
-    """Trailing/embedded blank rows from spreadsheets shouldn't error."""
-    csv_text = textwrap.dedent(
-        """\
-        level1,weight,volatility,adjustment
-        A,0.5,0.1,1.0
-
-        B,0.5,0.1,1.0
-
-        """
-    )
-    nodes = read_plan_csv(io.StringIO(csv_text))
-    assert [node.name for node in nodes] == ["A", "B"]
-
-
 # ---------------------------------------------------------------------------
-# Internal helpers (used only via the public API)
+# Round-trip through the YAML loader (sanity check)
 # ---------------------------------------------------------------------------
-
-
-def test_short_rows_are_padded_with_blanks():
-    """Spreadsheets often trim trailing empty cells — the reader pads them back."""
-    # Header is 4 columns wide (level1, weight, volatility, adjustment); the
-    # data row provides only 3 cells. The trailing blank should be treated
-    # as the (optional) adjustment cell.
-    csv_text = "level1,weight,volatility,adjustment\nBonds,0.5,0.07\n"
-    nodes = read_plan_csv(io.StringIO(csv_text))
-    assert nodes[0].adjustment == pytest.approx(1.0)
 
 
 def test_yaml_loader_round_trip_via_loader(tmp_path):
-    """Belt-and-braces: ensure the rebuilt tree validates through the YAML loader."""
+    """Belt-and-braces: rebuilt tree validates through the YAML loader."""
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text(SIMPLE_PLAN_YAML, encoding="utf-8")
     nodes = load_category_nodes_from_yaml(plan_path)
     rebuilt = _roundtrip_through_csv(nodes)
     out_path = tmp_path / "rebuilt.yaml"
     write_plan_yaml(out_path, rebuilt)
-    # If the loader can re-read it without error, the structure is valid.
     reloaded = load_category_nodes_from_yaml(out_path)
     assert yaml.safe_dump(
         [_node_to_plain(node) for node in rebuilt], sort_keys=False

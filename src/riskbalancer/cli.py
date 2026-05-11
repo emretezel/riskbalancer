@@ -1503,23 +1503,20 @@ def _render_import_summary(
 ) -> str:
     """Render a leaves-added/removed/changed summary between two plan trees.
 
-    Diff is computed on leaves only — branches don't carry vol/adj and their
-    weights are derived implicitly from sibling layout. A leaf is "changed"
-    when its `(weight, volatility, adjustment)` tuple differs between old
-    and new, even if its path is unchanged.
+    Diff compares **cumulative** leaf weights (the product of every
+    ancestor's per-level weight) so a branch-level edit shows up on every
+    affected leaf — without that, a user changing `Equities` from 0.55 to
+    0.60 would see no leaf changes in the summary, only structural
+    re-derivation. Leaves are also compared on their resolved volatility
+    and own adjustment.
     """
-    old_leaves = {path: node for path, node in iter_leaf_nodes(old_nodes)}
-    new_leaves = {path: node for path, node in iter_leaf_nodes(new_nodes)}
+    old_leaves = _collect_leaf_summary(old_nodes)
+    new_leaves = _collect_leaf_summary(new_nodes)
     added = sorted(new_leaves.keys() - old_leaves.keys())
     removed = sorted(old_leaves.keys() - new_leaves.keys())
     changed: list[tuple[str, ...]] = []
     for path in old_leaves.keys() & new_leaves.keys():
-        old, new = old_leaves[path], new_leaves[path]
-        if (old.weight, old.volatility, old.adjustment) != (
-            new.weight,
-            new.volatility,
-            new.adjustment,
-        ):
+        if old_leaves[path] != new_leaves[path]:
             changed.append(path)
     lines = [
         f"Import summary: {len(new_leaves)} leaves total "
@@ -1536,6 +1533,43 @@ def _render_import_summary(
         lines.append("Changed:")
         lines.extend(f"  ~ {' / '.join(path)}" for path in sorted(changed))
     return "\n".join(lines)
+
+
+def _collect_leaf_summary(
+    nodes: Sequence[CategoryNode],
+) -> dict[tuple[str, ...], tuple[float, Optional[float], float]]:
+    """Return `{path: (cumulative_weight, resolved_volatility, adjustment)}` for every leaf.
+
+    Cumulative weight is the running product of per-level weights from
+    root to leaf. Resolved volatility is the leaf's own value falling
+    back to the nearest ancestor that defined one — same convention as
+    the loader's leaf-volatility inheritance, so the diff stays
+    consistent across CSV round-trips that don't carry branch volatility.
+    """
+    summary: dict[tuple[str, ...], tuple[float, Optional[float], float]] = {}
+
+    def walk(
+        children: Sequence[CategoryNode],
+        prefix: tuple[str, ...],
+        parent_weight: float,
+        inherited_volatility: Optional[float],
+    ) -> None:
+        for node in children:
+            path = prefix + (node.name,)
+            cumulative = parent_weight * node.weight
+            next_inherited = (
+                node.volatility if node.volatility is not None else inherited_volatility
+            )
+            if node.children:
+                walk(node.children, path, cumulative, next_inherited)
+            else:
+                resolved_volatility = (
+                    node.volatility if node.volatility is not None else inherited_volatility
+                )
+                summary[path] = (cumulative, resolved_volatility, node.adjustment)
+
+    walk(nodes, prefix=(), parent_weight=1.0, inherited_volatility=None)
+    return summary
 
 
 def cmd_user_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:

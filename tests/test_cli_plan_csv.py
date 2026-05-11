@@ -21,6 +21,8 @@ from riskbalancer.plan_bootstrap import write_plan_yaml
 # Fixtures (mirror the tests/test_cli_plan_adjust.py shape)
 # ---------------------------------------------------------------------------
 
+EXPECTED_HEADER = "level1,weight1,level2,weight2,volatility,adjustment"
+
 
 PLAN_YAML = """\
 assets:
@@ -95,9 +97,9 @@ def test_export_to_stdout_prints_csv(tmp_path, capsys):
     rc = cmd_plan_export(_export_args(), paths=paths)
     assert rc == 0
     captured = capsys.readouterr().out
-    assert captured.splitlines()[0] == "level1,level2,weight,volatility,adjustment"
-    # NAM is a leaf at depth 2 — must show up with its volatility.
-    assert any(line.startswith("Equities,NAM,") for line in captured.splitlines())
+    assert captured.splitlines()[0] == EXPECTED_HEADER
+    # NAM is a leaf at depth 2: row should start with Equities,0.6,NAM,...
+    assert any(line.startswith("Equities,0.6,NAM,") for line in captured.splitlines())
 
 
 def test_export_to_file_writes_csv(tmp_path):
@@ -109,7 +111,17 @@ def test_export_to_file_writes_csv(tmp_path):
     assert rc == 0
     assert out.exists()
     content = out.read_text(encoding="utf-8")
-    assert content.startswith("level1,level2,weight,volatility,adjustment")
+    assert content.startswith(EXPECTED_HEADER)
+
+
+def test_export_writes_only_leaves(tmp_path):
+    """Branch rows must not appear — only leaves."""
+    paths = _paths_for(tmp_path)
+    _seed_plan(paths)
+    out = tmp_path / "plan.csv"
+    cmd_plan_export(_export_args(out=out), paths=paths)
+    rows = out.read_text(encoding="utf-8").splitlines()[1:]  # drop header
+    assert len(rows) == 3  # NAM, EMEA, Bonds — Equities branch row is absent
 
 
 def test_export_missing_plan_errors(tmp_path, capsys):
@@ -142,8 +154,6 @@ def test_import_after_export_round_trips(tmp_path, capsys):
     """
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    # Canonicalise: load and re-write so the on-disk form matches what
-    # `write_plan_yaml` produces (the import path also writes through it).
     canonical_nodes = load_category_nodes_from_yaml(paths.plan)
     write_plan_yaml(paths.plan, canonical_nodes)
     canonical_yaml = paths.plan.read_text(encoding="utf-8")
@@ -164,11 +174,11 @@ def test_import_with_decline_leaves_plan_unchanged(tmp_path, monkeypatch):
     _seed_plan(paths)
     original_yaml = paths.plan.read_text(encoding="utf-8")
 
-    # Build a CSV with a small edit so we can detect a write would be a change.
     csv_path = tmp_path / "plan.csv"
     rc = cmd_plan_export(_export_args(out=csv_path), paths=paths)
     assert rc == 0
     text = csv_path.read_text(encoding="utf-8")
+    # Bump every leaf volatility cell to detect a write would change the file.
     csv_path.write_text(text.replace("0.18", "0.20"), encoding="utf-8")
 
     _script(monkeypatch, ["n"])
@@ -184,8 +194,12 @@ def test_import_with_confirm_writes_changes(tmp_path, monkeypatch):
     csv_path = tmp_path / "plan.csv"
     cmd_plan_export(_export_args(out=csv_path), paths=paths)
     text = csv_path.read_text(encoding="utf-8")
-    # Bump NAM's adjustment from 1.0 to 0.85 in the CSV.
-    edited = text.replace("Equities,NAM,0.5,0.18,1.0", "Equities,NAM,0.5,0.18,0.85")
+    # Bump NAM's adjustment from 1.0 to 0.85 in the CSV (full-row pattern with
+    # the new interleaved header: Equities,0.6,NAM,0.5,0.18,1.0).
+    edited = text.replace(
+        "Equities,0.6,NAM,0.5,0.18,1.0",
+        "Equities,0.6,NAM,0.5,0.18,0.85",
+    )
     assert edited != text, "test fixture must actually edit a value"
     csv_path.write_text(edited, encoding="utf-8")
 
@@ -203,31 +217,50 @@ def test_import_summary_lists_added_removed_changed(tmp_path, monkeypatch, capsy
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
 
-    # CSV with EMEA dropped, a new "APAC" sibling added, and Bonds adjustment changed.
-    # Includes the Equities branch row explicitly (parents must be defined
-    # before children are attached) and uses the same root weights as the seed
-    # so sibling totals validate cleanly.
+    # CSV with EMEA dropped, a new APAC sibling added, Bonds adjustment changed.
     csv_text = (
-        "level1,level2,weight,volatility,adjustment\n"
-        "Equities,,0.6,,1.0\n"
-        "Equities,NAM,0.5,0.18,1.0\n"
-        "Equities,APAC,0.5,0.18,1.0\n"
-        "Bonds,,0.4,0.07,0.95\n"
+        "level1,weight1,level2,weight2,volatility,adjustment\n"
+        "Equities,0.6,NAM,0.5,0.18,1.0\n"
+        "Equities,0.6,APAC,0.5,0.18,1.0\n"
+        "Bonds,0.4,,,0.07,0.95\n"
     )
     csv_path = tmp_path / "plan.csv"
     csv_path.write_text(csv_text, encoding="utf-8")
 
-    _script(monkeypatch, ["n"])  # decline the write — we only care about the summary
+    _script(monkeypatch, ["n"])
     rc = cmd_plan_import(_import_args(csv_path, yes=False), paths=paths)
     assert rc == 0
     out = capsys.readouterr().out
     assert "Import summary" in out
     assert "+1 added" in out
     assert "-1 removed" in out
-    # Bonds is "changed" because its adjustment moved from 1.0 to 0.95.
     assert "~1 changed" in out
     assert "Equities / APAC" in out
     assert "Equities / EMEA" in out
+
+
+def test_import_branch_weight_edit_shows_in_diff(tmp_path, monkeypatch, capsys):
+    """Editing a parent's weight shows up as ~ on every leaf under it."""
+    paths = _paths_for(tmp_path)
+    _seed_plan(paths)
+
+    # Move Equities from 0.6 to 0.7 and Bonds from 0.4 to 0.3 (still sums to 1).
+    # Both Equities leaves should be flagged as changed (cumulative weight diff).
+    csv_text = (
+        "level1,weight1,level2,weight2,volatility,adjustment\n"
+        "Equities,0.7,NAM,0.5,0.18,1.0\n"
+        "Equities,0.7,EMEA,0.5,0.18,0.9\n"
+        "Bonds,0.3,,,0.07,1.0\n"
+    )
+    csv_path = tmp_path / "plan.csv"
+    csv_path.write_text(csv_text, encoding="utf-8")
+
+    _script(monkeypatch, ["n"])
+    rc = cmd_plan_import(_import_args(csv_path, yes=False), paths=paths)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # All three leaves changed because branch weights moved.
+    assert "~3 changed" in out
 
 
 def test_import_into_fresh_user_creates_plan(tmp_path, capsys):
@@ -235,15 +268,7 @@ def test_import_into_fresh_user_creates_plan(tmp_path, capsys):
     paths.user_dir.mkdir(parents=True, exist_ok=True)
     csv_path = tmp_path / "plan.csv"
     csv_path.write_text(
-        "level1,level2,weight,volatility,adjustment\n"
-        "Equities,NAM,1.0,0.18,1.0\n"
-        "Bonds,,0.0,0.07,1.0\n",
-        encoding="utf-8",
-    )
-    # Ensure root-level totals to 100% so validation passes (Equities=1.0, Bonds=0.0
-    # would fail; rebuild with a valid split).
-    csv_path.write_text(
-        "level1,weight,volatility,adjustment\nEquities,0.6,0.18,1.0\nBonds,0.4,0.07,1.0\n",
+        "level1,weight1,volatility,adjustment\nEquities,0.6,0.18,1.0\nBonds,0.4,0.07,1.0\n",
         encoding="utf-8",
     )
 
@@ -276,13 +301,36 @@ def test_import_invalid_weights_returns_two(tmp_path, capsys):
 
     csv_path = tmp_path / "bad-weights.csv"
     csv_path.write_text(
-        "level1,weight,volatility,adjustment\nA,0.4,0.1,1.0\nB,0.4,0.1,1.0\n",
+        "level1,weight1,volatility,adjustment\nA,0.4,0.1,1.0\nB,0.4,0.1,1.0\n",
         encoding="utf-8",
     )
     rc = cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
     assert rc == 2
     err = capsys.readouterr().err
     assert "validation failed" in err
+
+
+def test_import_conflicting_branch_weight_returns_two(tmp_path, capsys):
+    """Two sibling leaves disagreeing on a parent's weight is rejected."""
+    paths = _paths_for(tmp_path)
+    _seed_plan(paths)
+    original_yaml = paths.plan.read_text(encoding="utf-8")
+
+    csv_path = tmp_path / "conflict.csv"
+    csv_path.write_text(
+        "level1,weight1,level2,weight2,volatility,adjustment\n"
+        # Two rows under Equities disagree on Equities' weight (0.6 vs 0.7).
+        "Equities,0.6,NAM,0.5,0.18,1.0\n"
+        "Equities,0.7,EMEA,0.5,0.18,0.9\n"
+        "Bonds,0.4,,,0.07,1.0\n",
+        encoding="utf-8",
+    )
+    rc = cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "conflicting weight" in err
+    assert "Equities" in err
+    assert paths.plan.read_text(encoding="utf-8") == original_yaml
 
 
 def test_import_missing_file_errors(tmp_path, capsys):
