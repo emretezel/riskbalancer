@@ -139,57 +139,93 @@ command handlers; route them through that object.
 
 ---
 
-## Persistence (file-based)
+## Persistence
 
-This project has no database. All persistent state is stored in human-readable files:
+The authoritative store for all mutable working data is SQLite at
+`private/riskbalancer.db`. Human-readable YAML/JSON files still play two
+distinct roles: committed seed/config inputs that are loaded into the DB, and
+gitignored per-user side files that the import/report flow still reads from
+on disk.
+
+**Seed / config inputs (loaded into the DB by `seed.py`, or read at startup):**
+
+| Concern | Location | Format | Committed? |
+|---|---|---|---|
+| Catalog floor (default plan) | `config/seed_plan.yaml` | YAML | yes |
+| Default-user template | `config/riskbalancer.example.yaml` | YAML | yes |
+| Default-user pointer | `config/riskbalancer.yaml` | YAML | **gitignored** |
+| Shared adapter mappings | `config/mappings/<adapter>.yaml` | YAML | yes |
+| FX template | `config/fx.example.yaml` | YAML | yes |
+| Shared FX rates | `private/fx.yaml` | YAML | **gitignored** |
+
+**Authoritative working store (gitignored):**
 
 | Concern | Location | Format |
 |---|---|---|
-| Catalog floor (committed default plan) | `config/seed_plan.yaml` | YAML, committed |
-| Default-user template (committed) | `config/riskbalancer.example.yaml` | YAML, committed |
-| Default-user pointer (local) | `config/riskbalancer.yaml` | YAML, **gitignored** |
-| Shared adapter mappings | `config/mappings/<adapter>.yaml` | YAML, committed |
-| FX template | `config/fx.example.yaml` | YAML, committed |
-| Per-user category plan | `private/users/<user>/plan.yaml` | YAML, **gitignored** |
-| Per-user portfolio snapshot | `private/users/<user>/portfolio.json` | JSON, **gitignored** |
-| Per-user mapping overrides | `private/users/<user>/mappings/<adapter>.yaml` | YAML, **gitignored** |
-| Per-user manual mappings | `private/users/<user>/mappings/manual.yaml` | YAML, **gitignored** |
-| Per-user statements | `private/users/<user>/statements/<broker>/...` | broker-native, **gitignored** |
-| Per-user reports | `private/users/<user>/reports/<YYYY-MM-DD>.csv` | CSV, **gitignored** |
-| Shared FX rates | `private/fx.yaml` | YAML, **gitignored** |
+| Users, accounts, instruments, plan tree, category attributes, seeded mappings, FX rates, statement imports, positions | `private/riskbalancer.db` | SQLite |
+
+**Per-user side files (gitignored, still file-based):**
+
+| Concern | Location | Format |
+|---|---|---|
+| Per-user category plan (on-disk artifact) | `private/users/<user>/plan.yaml` | YAML |
+| Per-user portfolio snapshot (on-disk artifact) | `private/users/<user>/portfolio.json` | JSON |
+| Per-user adapter mapping overrides | `private/users/<user>/mappings/<adapter>.yaml` | YAML |
+| Per-user manual mappings | `private/users/<user>/mappings/manual.yaml` | YAML |
+| Per-user raw statements (broker exports) | `private/users/<user>/statements/<broker>/...` | broker-native |
+| Per-user reports (output) | `private/users/<user>/reports/<YYYY-MM-DD>.csv` | CSV |
+
+Several concerns currently live in both worlds (e.g. plans in `plan.yaml` *and*
+in the `plan_node` table; mappings in per-user YAML overrides *and* in the
+global `mapping` table). This is a transitional hybrid — the DB is becoming
+the source of truth, but a full migration of the side files is still
+outstanding.
 
 Persistence rules:
 
 - **Never commit anything under `private/`.** It holds real financial data for
   every household member.
-- **Mapping resolution is layered.** The shared file is read first; the per-user
-  override file replaces individual entries. New mappings learned at import time
-  are written only to the per-user override file — the shared catalog stays curated.
-- **Schema discipline still applies.** Validate every persisted structure on
-  read and fail loudly on malformed data; do not silently coerce or paper over
-  missing fields.
-- **One concept per file.** Do not mix unrelated state in the same YAML/JSON
-  document.
-- **Stable identifiers.** `(adapter, account)` is the stable key for an
-  imported broker statement and `instrument_id` is the stable key for a
-  holding. Re-imports of the same `(adapter, account)` replace the prior
-  positions and import record; different accounts at the same broker (e.g.
-  AJ Bell SIPP vs Dealing) coexist as separate keys.
-- **No magic values.** Use `None`/absent keys for missing values, not sentinels
-  like `0`, `-1`, or `"N/A"`.
-- **Document the on-disk format.** When the shape of any persisted file
-  changes, update `docs/architecture.md` (or the relevant doc) in the same
-  commit and consider whether a one-shot migration of existing local files is
-  needed.
+- **Single-concept storage.** Whether the storage is a YAML file, a JSON file,
+  or a database table, it should model exactly one concept. Do not mix
+  unrelated state in the same document or table.
+- **Mapping resolution is currently hybrid.** Shared adapter mappings flow
+  from `config/mappings/<adapter>.yaml` into the global `mapping` table via
+  `seed.py` (the `mapping` table has no `user_id`). Per-user overrides and
+  import-time learnings still live in `private/users/<user>/mappings/` YAML
+  files, merged by `load_layered_mappings` at import time. Until per-user
+  overrides also move into the DB, both paths are real and must stay in sync.
+- **Schema discipline applies everywhere.** Validate every persisted structure
+  on read (YAML or SQL) and fail loudly on malformed data; do not silently
+  coerce or paper over missing fields. The DB enforces this for the working
+  store via `CHECK` / `UNIQUE` / `FOREIGN KEY` constraints (see the Database
+  and SQL Design section below).
+- **Stable identifiers.** `(adapter, account)` is the stable key for a
+  statement import — now enforced by `UNIQUE(account_id, as_of)` on
+  `statement_import`, with `account` itself keyed by
+  `UNIQUE(user_id, source_id, name)`. `instrument_id` is the stable key for a
+  holding — now enforced by `UNIQUE(source_id, instrument_id_text)` on
+  `instrument`. Re-imports of the same `(account, as_of)` cascade through the
+  old positions and insert fresh rows; different accounts at the same broker
+  (e.g. AJ Bell SIPP vs Dealing) coexist as separate `account` rows.
+- **No magic values.** Use `None` / `NULL` / absent keys for missing values,
+  never sentinels like `0`, `-1`, or `"N/A"`. The schema enforces this via
+  `NOT NULL` defaults and `CHECK` constraints.
+- **Document the on-disk format.** When the shape of any persisted file *or*
+  any DB table changes, update `docs/architecture.md` (or
+  `docs/database-schema.md` for schema changes) in the same commit; add a
+  migration in `src/riskbalancer/migrations.py` for any DB change and consider
+  whether a one-shot migration of existing local files is also needed.
 
 ---
 
 ## Database and SQL Design
 
-This section is **conditional** — it applies only if and when the project adopts a
-relational database. Until then, the file-based persistence rules above are the
-authoritative guide. When a database is introduced, this section becomes binding
-*before* any persistence code is written against it.
+The authoritative working store is SQLite (`private/riskbalancer.db`). All
+rules in this section are binding. Migrations live in
+`src/riskbalancer/migrations.py` (append-only, versioned via
+`PRAGMA user_version` and the `schema_version` table). The current schema is
+documented in `docs/database-schema.md`; keep that file in sync with every
+migration.
 
 ### Schema Design Principles
 
