@@ -127,10 +127,12 @@ def test_seed_loads_every_mapping_yaml(seeded_db: Database) -> None:
     """Each `<adapter>.yaml` produces mapping rows scoped to that adapter."""
     counts = seeded_db.connection.execute(
         """
-        SELECT i.adapter AS adapter, COUNT(*) AS n
-        FROM mapping m JOIN instrument i ON i.id = m.instrument_id
-        GROUP BY i.adapter
-        ORDER BY i.adapter
+        SELECT s.adapter AS adapter, COUNT(*) AS n
+        FROM mapping m
+        JOIN instrument i ON i.id = m.instrument_id
+        JOIN source s ON s.id = i.source_id
+        GROUP BY s.adapter
+        ORDER BY s.adapter
         """
     ).fetchall()
     by_adapter = {row["adapter"]: row["n"] for row in counts}
@@ -153,8 +155,9 @@ def test_seed_preserves_multi_allocation_split(seeded_db: Database) -> None:
         SELECT m.weight_micros, cp.path
         FROM mapping m
         JOIN instrument i ON i.id = m.instrument_id
+        JOIN source s ON s.id = i.source_id
         JOIN category_path cp ON cp.id = m.category_id
-        WHERE i.adapter = ? AND i.instrument_id_text = ?
+        WHERE s.adapter = ? AND i.instrument_id_text = ?
         ORDER BY cp.path
         """,
         ("ajbell", "SPAG"),
@@ -307,8 +310,10 @@ def _count_mappings(db: Database, *, adapter: str) -> int:
         db.connection.execute(
             """
             SELECT COUNT(*) AS n
-            FROM mapping m JOIN instrument i ON i.id = m.instrument_id
-            WHERE i.adapter = ?
+            FROM mapping m
+            JOIN instrument i ON i.id = m.instrument_id
+            JOIN source s ON s.id = i.source_id
+            WHERE s.adapter = ?
             """,
             (adapter,),
         ).fetchone()["n"]

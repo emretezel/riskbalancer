@@ -55,11 +55,20 @@ Migration = Callable[[sqlite3.Connection], None]
 #   so fractional seconds and short forms both pass.
 # ---------------------------------------------------------------------------
 
-# Allowed `adapter` values across `source`, `instrument`, and `mapping`.
-# Centralised here so the CHECK clause stays consistent everywhere it
-# appears. `manual` covers user-entered holdings that did not originate
-# from a broker statement.
-_ADAPTERS_LIST = "('ibkr','ajbell','citi','ms401k','schwab','aegon','manual')"
+# Allowed adapters, in one place. The tuple is the authoritative form;
+# `_ADAPTERS_LIST` is the SQL `IN (...)` literal derived from it for the
+# `source.adapter` CHECK clause. `manual` covers user-entered holdings
+# that did not originate from a broker statement.
+KNOWN_ADAPTERS: tuple[str, ...] = (
+    "ibkr",
+    "ajbell",
+    "citi",
+    "ms401k",
+    "schwab",
+    "aegon",
+    "manual",
+)
+_ADAPTERS_LIST = "(" + ",".join(f"'{a}'" for a in KNOWN_ADAPTERS) + ")"
 
 # SQLite `GLOB` uses shell-style wildcards: `?` matches a single character
 # and `*` matches zero or more. (`_` is literal in GLOB — it is the
@@ -109,35 +118,42 @@ _MIGRATION_1_TABLES: tuple[str, ...] = (
         adjustment_micros INTEGER NOT NULL DEFAULT 1000000 CHECK (adjustment_micros >= 0)
     ) STRICT
     """,
-    # A brokerage relationship for a user. One row per (user, adapter):
-    # different accounts at the same broker share the same source.
+    # A broker. One row per adapter globally — IBKR is IBKR regardless of
+    # which user holds an account there. The adapter alone determines how
+    # statements are parsed, so it has no business being per-user.
     f"""
     CREATE TABLE source (
         id INTEGER PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
-        adapter TEXT NOT NULL CHECK (adapter IN {_ADAPTERS_LIST}),
-        UNIQUE (user_id, adapter)
+        adapter TEXT NOT NULL UNIQUE CHECK (adapter IN {_ADAPTERS_LIST})
     ) STRICT
     """,
-    # A named account within a source (e.g. an AJ Bell ISA, an AJ Bell
-    # SIPP). One source can hold many accounts.
+    # A named account at a broker, owned by a user (e.g. Emre's AJ Bell
+    # ISA, Tani's AJ Bell SIPP). Two users with accounts at the same broker
+    # share the same `source` row; ownership lives here. `source` is
+    # `RESTRICT` because removing a broker while accounts still reference
+    # it would silently strand history; `user` cascades so deleting a user
+    # tears down their accounts (and, transitively, imports and positions).
     """
     CREATE TABLE account (
         id INTEGER PRIMARY KEY,
-        source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+        source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE RESTRICT,
         name TEXT NOT NULL CHECK (length(name) > 0),
-        UNIQUE (source_id, name)
+        UNIQUE (user_id, source_id, name)
     ) STRICT
     """,
     # Global registry of broker instruments. The same ticker at different
-    # brokers is two rows — the leading column is `(adapter, instrument_id_text)`.
-    f"""
+    # brokers is two distinct rows — the natural key is
+    # `(source_id, instrument_id_text)`. The adapter string lives on
+    # `source.adapter` (single source of truth); we reach it from here via
+    # the FK rather than duplicating the column.
+    """
     CREATE TABLE instrument (
         id INTEGER PRIMARY KEY,
-        adapter TEXT NOT NULL CHECK (adapter IN {_ADAPTERS_LIST}),
+        source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE RESTRICT,
         instrument_id_text TEXT NOT NULL CHECK (length(instrument_id_text) > 0),
         description TEXT,
-        UNIQUE (adapter, instrument_id_text)
+        UNIQUE (source_id, instrument_id_text)
     ) STRICT
     """,
     # Instrument-to-category mappings, split-aware (multiple rows per
@@ -188,14 +204,14 @@ _MIGRATION_1_TABLES: tuple[str, ...] = (
         UNIQUE (user_id, parent_id, category_id)
     ) STRICT
     """,
-    # An import event: one row per (account, as_of). Re-importing the
-    # same (account, as_of) is implemented as a transactional DELETE then
-    # INSERT in the import command, cascading through positions and
-    # import_fx via ON DELETE CASCADE.
+    # An import event: one row per (account, as_of). The owning user is
+    # derivable via `account.user_id`, so it is not denormalised here.
+    # Re-importing the same (account, as_of) is implemented as a
+    # transactional DELETE then INSERT in the import command, cascading
+    # through positions and import_fx via ON DELETE CASCADE.
     f"""
     CREATE TABLE statement_import (
         id INTEGER PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
         account_id INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE,
         as_of TEXT NOT NULL CHECK (as_of GLOB '{_DATE_GLOB}'),
         statement_path TEXT,
@@ -239,10 +255,12 @@ _MIGRATION_1_INDEXES: tuple[str, ...] = (
     # from a statement, fetch all (category, weight) rows for it. One
     # key, no scope discrimination — mappings are global.
     "CREATE INDEX idx_mapping_instrument ON mapping(instrument_id)",
-    # Drives both "current portfolio" and "portfolio as of date X" — every
-    # query needs the latest `as_of` per `(user, account)`.
-    "CREATE INDEX idx_statement_import_user_account_asof "
-    "ON statement_import(user_id, account_id, as_of DESC)",
+    # "Portfolio as of date X" queries scan `statement_import` by account.
+    # The `UNIQUE (account_id, as_of)` constraint already produces a usable
+    # index for `(account_id, as_of DESC)` lookups, so no additional index
+    # is declared here. Per-user queries reach `statement_import` via
+    # `account.user_id`, which is covered by the leading column of
+    # `account.UNIQUE (user_id, source_id, name)`.
     # Supports cross-import "every holding of EMIM ever" queries used by
     # the interactive walker when suggesting categories.
     "CREATE INDEX idx_position_instrument ON position(instrument_id)",
@@ -297,7 +315,8 @@ _MIGRATION_1_VIEWS: tuple[str, ...] = (
     )
     """,
     # Positions tied to the current import per account. Reports join this
-    # against import_fx by currency to compute the GBP value.
+    # against import_fx by currency to compute the GBP value. `user_id`
+    # is reached through `account` — the import itself does not store it.
     """
     CREATE VIEW current_position AS
     SELECT
@@ -308,11 +327,12 @@ _MIGRATION_1_VIEWS: tuple[str, ...] = (
         p.quantity_micro_units AS quantity_micro_units,
         p.market_value_native_decithou AS market_value_native_decithou,
         p.currency AS currency,
-        ci.user_id AS user_id,
+        a.user_id AS user_id,
         ci.account_id AS account_id,
         ci.as_of AS as_of
     FROM position p
     JOIN current_import ci ON ci.id = p.statement_import_id
+    JOIN account a ON a.id = ci.account_id
     """,
     # Recursive view materialising the full ' / '-joined path for every
     # category. Used wherever we have to render or match a path string.
@@ -333,9 +353,16 @@ _MIGRATION_1_VIEWS: tuple[str, ...] = (
 
 
 def _migration_1(connection: sqlite3.Connection) -> None:
-    """Create the initial schema: tables, indexes, views, and triggers."""
+    """Create the initial schema: tables, reference data, indexes, views, triggers."""
     for statement in _MIGRATION_1_TABLES:
         connection.execute(statement)
+    # Reference data: one row per known adapter. `source` is fixed
+    # configuration — every supported broker has a row. `instrument.source_id`,
+    # `account.source_id`, and any future per-broker FK rely on these
+    # being present from the moment the schema exists. We sort the list so
+    # the assigned surrogate ids are stable across machines.
+    for adapter_name in sorted(KNOWN_ADAPTERS):
+        connection.execute("INSERT INTO source (adapter) VALUES (?)", (adapter_name,))
     for statement in _MIGRATION_1_INDEXES:
         connection.execute(statement)
     for statement in _MIGRATION_1_VIEWS:

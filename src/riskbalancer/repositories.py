@@ -11,7 +11,7 @@ The module is organised into one section per aggregate:
 - Categories (find-or-create, path resolution, suggestion lookups)
 - Plans (load/save plan trees as `CategoryNode` lists)
 - Mappings (global instrument-to-category, leaf-only)
-- Instruments (find-or-create per `(adapter, instrument_id_text)`)
+- Instruments (find-or-create per `(source_id, instrument_id_text)`)
 - FX rates (date-keyed historical, plus per-import snapshots)
 
 Author: Emre Tezel
@@ -498,18 +498,35 @@ def resolve_category_to_plan_leaf(
 # ---------------------------------------------------------------------------
 
 
+def get_source_id(connection: sqlite3.Connection, adapter: str) -> int:
+    """Return the surrogate `source.id` for `adapter`, or raise.
+
+    `source` is pre-populated by migration 1 with one row per
+    `KNOWN_ADAPTERS` entry. A miss here means the adapter is not a
+    recognised broker — the CHECK on `source.adapter` would reject any
+    fresh insert anyway, so we surface the error rather than coercing.
+    """
+    row = connection.execute(
+        "SELECT id FROM source WHERE adapter = ?",
+        (adapter,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Unknown adapter {adapter!r}: no row in `source`")
+    return int(row["id"])
+
+
 def find_or_create_instrument(
     connection: sqlite3.Connection,
     *,
-    adapter: str,
+    source_id: int,
     instrument_id_text: str,
     description: Optional[str],
 ) -> int:
-    """Find or insert `(adapter, instrument_id_text)`. Updates an empty
+    """Find or insert `(source_id, instrument_id_text)`. Updates an empty
     description with the new one but never overwrites a curated one."""
     row = connection.execute(
-        "SELECT id, description FROM instrument WHERE adapter = ? AND instrument_id_text = ?",
-        (adapter, instrument_id_text),
+        "SELECT id, description FROM instrument WHERE source_id = ? AND instrument_id_text = ?",
+        (source_id, instrument_id_text),
     ).fetchone()
     if row is not None:
         existing_id = int(row["id"])
@@ -520,11 +537,13 @@ def find_or_create_instrument(
             )
         return existing_id
     cursor = connection.execute(
-        "INSERT INTO instrument (adapter, instrument_id_text, description) VALUES (?, ?, ?)",
-        (adapter, instrument_id_text, description),
+        "INSERT INTO instrument (source_id, instrument_id_text, description) VALUES (?, ?, ?)",
+        (source_id, instrument_id_text, description),
     )
     if cursor.lastrowid is None:
-        raise RuntimeError(f"Failed to insert instrument ({adapter!r}, {instrument_id_text!r})")
+        raise RuntimeError(
+            f"Failed to insert instrument (source_id={source_id}, {instrument_id_text!r})"
+        )
     return int(cursor.lastrowid)
 
 

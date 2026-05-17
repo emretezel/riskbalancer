@@ -116,8 +116,8 @@ identifier the CLI accepts via `--user`.
 | `created_at` | `TEXT NOT NULL` | ISO-8601 UTC. |
 
 Deleting a row cascades through every per-user concept (plans, sources,
-accounts, statement imports, positions, user-scope mappings). Categories
-and instruments survive — they are global registries.
+accounts, statement imports, positions). Categories, instruments, and
+mappings survive — those are global registries.
 
 ### 3.3 `category`
 
@@ -163,49 +163,58 @@ the leaf entries in `config/seed_plan.yaml`.
 
 ### 3.5 `source`
 
-A brokerage relationship for a user. One row per `(user, adapter)`:
-different accounts at the same broker share the same `source` row.
+A broker. **One row per adapter globally** — `ibkr` is `ibkr` regardless
+of which user holds an account there, because the adapter alone
+determines how statements are parsed. Account ownership lives on
+`account.user_id`, not here.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `adapter` | `TEXT NOT NULL UNIQUE` | `IN ('ibkr','ajbell','citi','ms401k','schwab','aegon','manual')`. |
+
+`source` is **pre-populated reference data**: migration 1 inserts one
+row per entry of `migrations.KNOWN_ADAPTERS` immediately after creating
+the table, so `instrument.source_id` and `account.source_id` always
+have a target. Adding a new broker means: new entry in
+`KNOWN_ADAPTERS`, new migration that `INSERT`s the row, new adapter
+module. The `_ADAPTERS_LIST` SQL literal is derived from
+`KNOWN_ADAPTERS` to keep the CHECK clause in lockstep.
+
+### 3.6 `account`
+
+A named account at a broker, owned by a user. AJ Bell users typically
+have `isa` and `sipp`; IBKR users typically have one `taxable`. Two
+users with accounts at the same broker share the same `source` row but
+each have their own `account` rows.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | |
 | `user_id` | `INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE` | |
-| `adapter` | `TEXT NOT NULL` | `IN ('ibkr','ajbell','citi','ms401k','schwab','aegon','manual')`. |
-
-`UNIQUE (user_id, adapter)`.
-
-The adapter list is centralised in `migrations._ADAPTERS_LIST` so the
-`source`, `instrument`, and `mapping` constraints stay in lockstep.
-Adding a new broker means: new entry in the constant, new migration,
-new adapter module.
-
-### 3.6 `account`
-
-A named account inside a source. AJ Bell users typically have `isa` and
-`sipp`; IBKR users typically have one `taxable`.
-
-| Column | Type | Notes |
-|---|---|---|
-| `id` | `INTEGER PRIMARY KEY` | |
-| `source_id` | `INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE` | |
+| `source_id` | `INTEGER NOT NULL REFERENCES source(id) ON DELETE RESTRICT` | A broker cannot be removed while any account still references it. |
 | `name` | `TEXT NOT NULL` | `length(name) > 0`. |
 
-`UNIQUE (source_id, name)`.
+`UNIQUE (user_id, source_id, name)`. The same account name can be used
+by different users — Emre and Tani can each have a `taxable` account at
+IBKR without collision.
 
 ### 3.7 `instrument`
 
 Global registry of broker tickers / fund identifiers. The same ticker
-at two different brokers is two separate rows — the leading natural key
-is `(adapter, instrument_id_text)`.
+at two different brokers is two separate rows — the leading natural
+key is `(source_id, instrument_id_text)`. The broker is reached via
+the `source` FK rather than carrying its own `adapter` column (the
+adapter string lives on `source.adapter`, single source of truth).
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | |
-| `adapter` | `TEXT NOT NULL` | Same `IN (…)` as `source.adapter`. |
+| `source_id` | `INTEGER NOT NULL REFERENCES source(id) ON DELETE RESTRICT` | The broker. A `source` row cannot be deleted while instruments still reference it. |
 | `instrument_id_text` | `TEXT NOT NULL` | The broker's identifier, as it appears in the CSV. `length(instrument_id_text) > 0`. |
 | `description` | `TEXT NULL` | Human-readable description. The seed loader populates this from the YAML and refuses to overwrite a non-empty existing description. |
 
-`UNIQUE (adapter, instrument_id_text)`.
+`UNIQUE (source_id, instrument_id_text)`.
 
 ### 3.8 `mapping`
 
@@ -307,8 +316,7 @@ timeline.
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | |
-| `user_id` | `INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE` | Denormalised for query convenience; redundant with `account.source.user_id` but cheap and avoids a join on every "user's portfolio" query. |
-| `account_id` | `INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE` | |
+| `account_id` | `INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE` | The owning user is reached via `account.user_id` — not denormalised here. |
 | `as_of` | `TEXT NOT NULL` | `GLOB '????-??-??'`. The "as-of date" the user supplied with `--as-of`. |
 | `statement_path` | `TEXT NULL` | Relative path to the filed CSV under `private/users/<user>/statements/…`. `NULL` for `adapter='manual'` imports. |
 | `imported_at` | `TEXT NOT NULL` | Wall-clock UTC timestamp of the import action itself. |
@@ -358,13 +366,18 @@ distributes it across categories on the fly.
 | Index | Columns | Purpose |
 |---|---|---|
 | `idx_mapping_instrument` | `mapping(instrument_id)` | Drives per-import mapping lookup — the resolver fetches every `mapping` row for one instrument at a time. |
-| `idx_statement_import_user_account_asof` | `statement_import(user_id, account_id, as_of DESC)` | Powers both "current portfolio" (latest `as_of` per account) and "portfolio as of date X". |
 | `idx_position_instrument` | `position(instrument_id)` | Cross-import queries — "every position ever held in EMIM". Used by the interactive walker to suggest categories from history. |
 | `idx_category_top_level_name` | `category(name) WHERE parent_id IS NULL` | Partial unique index that closes the gap left by `UNIQUE (parent_id, name)` when `parent_id IS NULL` — see §3.3. |
 
-`UNIQUE` constraints implicitly create indexes. The `fx_rate(rate_date,
-currency)` and `instrument(adapter, instrument_id_text)` uniques are
-already indexed and need no explicit `CREATE INDEX`.
+`UNIQUE` constraints implicitly create indexes. The
+`statement_import(account_id, as_of)`, `fx_rate(rate_date, currency)`,
+`account(user_id, source_id, name)`, and
+`instrument(source_id, instrument_id_text)` uniques are already indexed
+and need no explicit `CREATE INDEX`. "Portfolio as of date X" queries
+scan `statement_import` by `(account_id, as_of DESC)` directly off the
+unique index; per-user queries reach `statement_import` via
+`account.user_id`, covered by the leading column of the `account`
+unique.
 
 ---
 
@@ -378,11 +391,13 @@ because SQLite doesn't have a `DISTINCT ON`.
 
 ### 5.2 `current_position`
 
-Joins `position` to `current_import` so callers can see every position
-in the user's current portfolio with a single `SELECT * FROM
-current_position WHERE user_id = ?`. The view also surfaces
-`user_id`, `account_id`, and `as_of` so reports don't need a second
-join.
+Joins `position` to `current_import` (and `account`, to recover
+`user_id`) so callers can see every position in the user's current
+portfolio with a single `SELECT * FROM current_position WHERE user_id =
+?`. The view surfaces `user_id`, `account_id`, and `as_of` so reports
+don't need a second join. `statement_import` itself does not store
+`user_id`; the view reaches it through the `account` join, which keeps
+the underlying schema normalised.
 
 ### 5.3 `category_path`
 

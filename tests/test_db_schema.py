@@ -42,7 +42,6 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
 EXPECTED_INDEXES: frozenset[str] = frozenset(
     {
         "idx_mapping_instrument",
-        "idx_statement_import_user_account_asof",
         "idx_position_instrument",
         "idx_category_top_level_name",
     }
@@ -223,7 +222,8 @@ def test_mapping_unique_per_instrument_category(db: Database) -> None:
         "SELECT id FROM category WHERE name = ?", ("Cash",)
     ).fetchone()["id"]
     db.connection.execute(
-        "INSERT INTO instrument (adapter, instrument_id_text) VALUES (?, ?)",
+        "INSERT INTO instrument (source_id, instrument_id_text) "
+        "VALUES ((SELECT id FROM source WHERE adapter = ?), ?)",
         ("ibkr", "CASH"),
     )
     instrument_id = db.connection.execute(
@@ -250,7 +250,8 @@ def test_mapping_weight_bounds(db: Database) -> None:
         "SELECT id FROM category WHERE name = ?", ("Cash",)
     ).fetchone()["id"]
     db.connection.execute(
-        "INSERT INTO instrument (adapter, instrument_id_text) VALUES (?, ?)",
+        "INSERT INTO instrument (source_id, instrument_id_text) "
+        "VALUES ((SELECT id FROM source WHERE adapter = ?), ?)",
         ("ibkr", "CASH"),
     )
     instrument_id = db.connection.execute(
@@ -275,7 +276,8 @@ def test_mapping_target_must_be_leaf_on_insert(db: Database) -> None:
         (bonds_id, "Govt"),
     )
     db.connection.execute(
-        "INSERT INTO instrument (adapter, instrument_id_text) VALUES (?, ?)",
+        "INSERT INTO instrument (source_id, instrument_id_text) "
+        "VALUES ((SELECT id FROM source WHERE adapter = ?), ?)",
         ("ibkr", "BOND"),
     )
     instrument_id = db.connection.execute(
@@ -300,7 +302,8 @@ def test_mapping_target_must_be_leaf_on_update(db: Database) -> None:
         (bonds_id, "Govt"),
     ).fetchone()["id"]
     db.connection.execute(
-        "INSERT INTO instrument (adapter, instrument_id_text) VALUES (?, ?)",
+        "INSERT INTO instrument (source_id, instrument_id_text) "
+        "VALUES ((SELECT id FROM source WHERE adapter = ?), ?)",
         ("ibkr", "BOND"),
     )
     instrument_id = db.connection.execute(
@@ -345,41 +348,107 @@ def test_fx_rate_rate_must_be_positive(db: Database) -> None:
         )
 
 
+def test_source_is_prepopulated_with_known_adapters(db: Database) -> None:
+    """Migration 1 inserts one `source` row per `KNOWN_ADAPTERS` entry."""
+    from riskbalancer.migrations import KNOWN_ADAPTERS
+
+    rows = db.connection.execute("SELECT adapter FROM source ORDER BY adapter").fetchall()
+    assert {row["adapter"] for row in rows} == set(KNOWN_ADAPTERS)
+
+
 def test_source_adapter_must_be_known(db: Database) -> None:
     """`source.adapter` is constrained to the recognised adapter list."""
-    db.connection.execute(
-        "INSERT INTO user (name, created_at) VALUES (?, ?)",
-        ("emre", "2026-05-17T00:00:00Z"),
-    )
-    user_id = db.connection.execute("SELECT id FROM user WHERE name = ?", ("emre",)).fetchone()[
-        "id"
-    ]
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
-            "INSERT INTO source (user_id, adapter) VALUES (?, ?)",
-            (user_id, "fidelity"),
+            "INSERT INTO source (adapter) VALUES (?)",
+            ("fidelity",),
+        )
+
+
+def test_source_adapter_is_unique_globally(db: Database) -> None:
+    """`source` carries one row per adapter — the pre-populated row blocks duplicates."""
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute("INSERT INTO source (adapter) VALUES (?)", ("ibkr",))
+
+
+def _source_id_for(connection: sqlite3.Connection, adapter: str) -> int:
+    """Look up the pre-populated source row for `adapter`."""
+    return int(
+        connection.execute("SELECT id FROM source WHERE adapter = ?", (adapter,)).fetchone()["id"]
+    )
+
+
+def test_account_belongs_to_user_and_shares_source(db: Database) -> None:
+    """Two users can hold accounts at the same broker via one shared `source`."""
+    emre_id = _seed_minimal_user(db.connection)
+    db.connection.execute(
+        "INSERT INTO user (name, created_at) VALUES (?, ?)",
+        ("tani", "2026-05-17T00:00:00Z"),
+    )
+    tani_id = db.connection.execute("SELECT id FROM user WHERE name = ?", ("tani",)).fetchone()[
+        "id"
+    ]
+    source_id = _source_id_for(db.connection, "ibkr")
+    db.connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?)",
+        (emre_id, source_id, "taxable"),
+    )
+    db.connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?)",
+        (tani_id, source_id, "sipp"),
+    )
+    rows = db.connection.execute(
+        "SELECT user_id FROM account WHERE source_id = ? ORDER BY user_id",
+        (source_id,),
+    ).fetchall()
+    assert [row["user_id"] for row in rows] == sorted([emre_id, tani_id])
+
+
+def test_account_unique_per_user_source_name(db: Database) -> None:
+    """`(user_id, source_id, name)` is unique — same name allowed across users."""
+    emre_id = _seed_minimal_user(db.connection)
+    db.connection.execute(
+        "INSERT INTO user (name, created_at) VALUES (?, ?)",
+        ("tani", "2026-05-17T00:00:00Z"),
+    )
+    tani_id = db.connection.execute("SELECT id FROM user WHERE name = ?", ("tani",)).fetchone()[
+        "id"
+    ]
+    source_id = _source_id_for(db.connection, "ibkr")
+    db.connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?)",
+        (emre_id, source_id, "taxable"),
+    )
+    # Same name on a different user is fine.
+    db.connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?)",
+        (tani_id, source_id, "taxable"),
+    )
+    # Same (user, source, name) is rejected.
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?)",
+            (emre_id, source_id, "taxable"),
         )
 
 
 def test_position_market_value_must_be_non_negative(db: Database) -> None:
     """Negative market values are not allowed; zero is permitted (held but worthless)."""
     user_id = _seed_minimal_user(db.connection)
-    source_id = db.connection.execute(
-        "INSERT INTO source (user_id, adapter) VALUES (?, ?) RETURNING id",
-        (user_id, "ibkr"),
-    ).fetchone()["id"]
+    source_id = _source_id_for(db.connection, "ibkr")
     account_id = db.connection.execute(
-        "INSERT INTO account (source_id, name) VALUES (?, ?) RETURNING id",
-        (source_id, "taxable"),
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?) RETURNING id",
+        (user_id, source_id, "taxable"),
     ).fetchone()["id"]
     statement_import_id = db.connection.execute(
         "INSERT INTO statement_import "
-        "(user_id, account_id, as_of, statement_path, imported_at) "
-        "VALUES (?, ?, ?, NULL, ?) RETURNING id",
-        (user_id, account_id, "2026-05-17", "2026-05-17T12:00:00Z"),
+        "(account_id, as_of, statement_path, imported_at) "
+        "VALUES (?, ?, NULL, ?) RETURNING id",
+        (account_id, "2026-05-17", "2026-05-17T12:00:00Z"),
     ).fetchone()["id"]
     instrument_id = db.connection.execute(
-        "INSERT INTO instrument (adapter, instrument_id_text) VALUES (?, ?) RETURNING id",
+        "INSERT INTO instrument (source_id, instrument_id_text) "
+        "VALUES ((SELECT id FROM source WHERE adapter = ?), ?) RETURNING id",
         ("ibkr", "EMIM"),
     ).fetchone()["id"]
     with pytest.raises(sqlite3.IntegrityError):
@@ -394,35 +463,33 @@ def test_position_market_value_must_be_non_negative(db: Database) -> None:
 def test_statement_import_unique_per_account_asof(db: Database) -> None:
     """Two import rows cannot share `(account_id, as_of)`."""
     user_id = _seed_minimal_user(db.connection)
-    source_id = db.connection.execute(
-        "INSERT INTO source (user_id, adapter) VALUES (?, ?) RETURNING id",
-        (user_id, "ibkr"),
-    ).fetchone()["id"]
+    source_id = _source_id_for(db.connection, "ibkr")
     account_id = db.connection.execute(
-        "INSERT INTO account (source_id, name) VALUES (?, ?) RETURNING id",
-        (source_id, "taxable"),
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?) RETURNING id",
+        (user_id, source_id, "taxable"),
     ).fetchone()["id"]
     db.connection.execute(
         "INSERT INTO statement_import "
-        "(user_id, account_id, as_of, statement_path, imported_at) "
-        "VALUES (?, ?, ?, NULL, ?)",
-        (user_id, account_id, "2026-05-17", "2026-05-17T12:00:00Z"),
+        "(account_id, as_of, statement_path, imported_at) "
+        "VALUES (?, ?, NULL, ?)",
+        (account_id, "2026-05-17", "2026-05-17T12:00:00Z"),
     )
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
             "INSERT INTO statement_import "
-            "(user_id, account_id, as_of, statement_path, imported_at) "
-            "VALUES (?, ?, ?, NULL, ?)",
-            (user_id, account_id, "2026-05-17", "2026-05-17T13:00:00Z"),
+            "(account_id, as_of, statement_path, imported_at) "
+            "VALUES (?, ?, NULL, ?)",
+            (account_id, "2026-05-17", "2026-05-17T13:00:00Z"),
         )
 
 
 def test_foreign_key_violation_is_rejected(db: Database) -> None:
     """A dangling foreign key reference is rejected when FKs are enabled."""
+    source_id = _source_id_for(db.connection, "ibkr")
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
-            "INSERT INTO source (user_id, adapter) VALUES (?, ?)",
-            (9999, "ibkr"),
+            "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?)",
+            (9999, source_id, "taxable"),
         )
 
 
@@ -436,7 +503,8 @@ def test_category_restrict_blocks_delete_when_referenced(db: Database) -> None:
         "SELECT id FROM category WHERE name = ?", ("Cash",)
     ).fetchone()["id"]
     db.connection.execute(
-        "INSERT INTO instrument (adapter, instrument_id_text) VALUES (?, ?)",
+        "INSERT INTO instrument (source_id, instrument_id_text) "
+        "VALUES ((SELECT id FROM source WHERE adapter = ?), ?)",
         ("ibkr", "CASH"),
     )
     instrument_id = db.connection.execute(

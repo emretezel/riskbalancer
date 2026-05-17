@@ -208,12 +208,13 @@ def _seed_mappings_for_adapter(
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         return
+    source_id = _resolve_source_id(connection, adapter)
     connection.execute(
         """
         DELETE FROM mapping
-        WHERE instrument_id IN (SELECT id FROM instrument WHERE adapter = ?)
+        WHERE instrument_id IN (SELECT id FROM instrument WHERE source_id = ?)
         """,
-        (adapter,),
+        (source_id,),
     )
     for raw_instrument_id, payload in data.items():
         if not isinstance(payload, dict):
@@ -228,7 +229,7 @@ def _seed_mappings_for_adapter(
         description = str(description_raw).strip() if isinstance(description_raw, str) else None
         instrument_id = _find_or_create_instrument(
             connection,
-            adapter=adapter,
+            source_id=source_id,
             instrument_id_text=instrument_id_text,
             description=description,
         )
@@ -257,14 +258,36 @@ def _seed_mappings_for_adapter(
             )
 
 
+def _resolve_source_id(connection: sqlite3.Connection, adapter: str) -> int:
+    """Return the surrogate `source.id` for an adapter, or raise.
+
+    Migration 1 pre-populates `source` with one row per known adapter, so
+    a missing row here means the adapter name is not in `KNOWN_ADAPTERS`
+    — either a typo in the YAML filename or a broker that has not been
+    registered yet. We raise rather than auto-create because the CHECK
+    on `source.adapter` would reject anything outside `KNOWN_ADAPTERS`
+    anyway, and silently inventing rows would mask bugs.
+    """
+    row = connection.execute(
+        "SELECT id FROM source WHERE adapter = ?",
+        (adapter,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(
+            f"Unknown adapter {adapter!r}: no row in `source`. "
+            f"Add it to `KNOWN_ADAPTERS` in migrations.py if it is a real broker."
+        )
+    return int(row["id"])
+
+
 def _find_or_create_instrument(
     connection: sqlite3.Connection,
     *,
-    adapter: str,
+    source_id: int,
     instrument_id_text: str,
     description: Optional[str],
 ) -> int:
-    """Find or insert `(adapter, instrument_id_text)` and return its row id.
+    """Find or insert `(source_id, instrument_id_text)` and return its row id.
 
     The description is updated only when the existing row has no
     description and the new one does — the YAML is the source of truth
@@ -272,8 +295,8 @@ def _find_or_create_instrument(
     overwrite a description the user already curated.
     """
     row = connection.execute(
-        "SELECT id, description FROM instrument WHERE adapter = ? AND instrument_id_text = ?",
-        (adapter, instrument_id_text),
+        "SELECT id, description FROM instrument WHERE source_id = ? AND instrument_id_text = ?",
+        (source_id, instrument_id_text),
     ).fetchone()
     if row is not None:
         existing_id = int(row["id"])
@@ -284,9 +307,11 @@ def _find_or_create_instrument(
             )
         return existing_id
     cursor = connection.execute(
-        "INSERT INTO instrument (adapter, instrument_id_text, description) VALUES (?, ?, ?)",
-        (adapter, instrument_id_text, description),
+        "INSERT INTO instrument (source_id, instrument_id_text, description) VALUES (?, ?, ?)",
+        (source_id, instrument_id_text, description),
     )
     if cursor.lastrowid is None:
-        raise RuntimeError(f"Failed to insert instrument ({adapter!r}, {instrument_id_text!r})")
+        raise RuntimeError(
+            f"Failed to insert instrument (source_id={source_id}, {instrument_id_text!r})"
+        )
     return int(cursor.lastrowid)
