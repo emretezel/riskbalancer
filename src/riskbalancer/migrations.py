@@ -107,15 +107,26 @@ _MIGRATION_1_TABLES: tuple[str, ...] = (
         UNIQUE (parent_id, name)
     ) STRICT
     """,
-    # Seed-derived suggestions for a category's volatility/adjustment.
-    # Used only by the interactive plan walker as defaults; the user can
-    # override them per plan node. Categories that the seed never uses as
-    # a leaf have no row here.
+    # Authoritative per-category attributes drawn from the seed plan:
+    #   * `weight_micros`   — parent-relative weight (siblings sum to 1.0
+    #     within their parent in the seed model).
+    #   * `volatility_micros`, `adjustment_micros` — populated on seed
+    #     leaves only; NULL on seed branches. Branch-level vol/adj is
+    #     computed on the fly as the weight-weighted average of children
+    #     when a user's plan treats the branch as a leaf, so storing it
+    #     here would duplicate a derived fact.
+    # The two leaf-only columns are tied: either both are NULL (branch)
+    # or both are non-NULL (leaf). One row per seed-plan category.
     """
-    CREATE TABLE category_default (
+    CREATE TABLE category_attribute (
         category_id INTEGER PRIMARY KEY REFERENCES category(id) ON DELETE CASCADE,
-        volatility_micros INTEGER CHECK (volatility_micros IS NULL OR volatility_micros >= 0),
-        adjustment_micros INTEGER NOT NULL DEFAULT 1000000 CHECK (adjustment_micros >= 0)
+        weight_micros INTEGER NOT NULL
+            CHECK (weight_micros >= 0 AND weight_micros <= 1000000),
+        volatility_micros INTEGER
+            CHECK (volatility_micros IS NULL OR volatility_micros >= 0),
+        adjustment_micros INTEGER
+            CHECK (adjustment_micros IS NULL OR adjustment_micros >= 0),
+        CHECK ((volatility_micros IS NULL) = (adjustment_micros IS NULL))
     ) STRICT
     """,
     # A broker. One row per adapter globally — IBKR is IBKR regardless of
@@ -183,12 +194,14 @@ _MIGRATION_1_TABLES: tuple[str, ...] = (
         UNIQUE (rate_date, currency)
     ) STRICT
     """,
-    # A user's plan: a tree of category targets. Whether a row is a leaf
-    # or a branch is decided by whether any other plan_node row has it as
-    # parent_id, so the same category can be a leaf for one user and a
-    # branch for another. The application enforces (i) sibling weights at
-    # every level sum to 1.0, and (ii) volatility_micros IS NULL iff the
-    # row is a branch (leaves carry an explicit volatility).
+    # A user's plan: a tree of category targets. The same category can be
+    # a leaf for one user and a branch for another — leaf/branch status is
+    # purely structural (no other `plan_node` row references this one as
+    # parent). The application enforces that sibling weights at every
+    # level sum to 1.0. Volatility and adjustment are NOT stored here —
+    # they live on `category_attribute` and are looked up (or computed as
+    # a weighted average of children when the plan terminates above the
+    # seed's leaves) at report time.
     """
     CREATE TABLE plan_node (
         id INTEGER PRIMARY KEY,
@@ -197,10 +210,6 @@ _MIGRATION_1_TABLES: tuple[str, ...] = (
         category_id INTEGER NOT NULL REFERENCES category(id) ON DELETE RESTRICT,
         weight_micros INTEGER NOT NULL
             CHECK (weight_micros >= 0 AND weight_micros <= 1000000),
-        volatility_micros INTEGER
-            CHECK (volatility_micros IS NULL OR volatility_micros >= 0),
-        adjustment_micros INTEGER NOT NULL DEFAULT 1000000
-            CHECK (adjustment_micros >= 0),
         UNIQUE (user_id, parent_id, category_id)
     ) STRICT
     """,
@@ -208,7 +217,7 @@ _MIGRATION_1_TABLES: tuple[str, ...] = (
     # derivable via `account.user_id`, so it is not denormalised here.
     # Re-importing the same (account, as_of) is implemented as a
     # transactional DELETE then INSERT in the import command, cascading
-    # through positions and import_fx via ON DELETE CASCADE.
+    # through positions via ON DELETE CASCADE.
     f"""
     CREATE TABLE statement_import (
         id INTEGER PRIMARY KEY,
@@ -219,21 +228,12 @@ _MIGRATION_1_TABLES: tuple[str, ...] = (
         UNIQUE (account_id, as_of)
     ) STRICT
     """,
-    # FX rates as observed at the moment a statement was imported. Frozen
-    # per-import so the GBP-equivalent value of historical positions is
-    # reproducible even if `fx_rate` is later corrected.
-    """
-    CREATE TABLE import_fx (
-        statement_import_id INTEGER NOT NULL
-            REFERENCES statement_import(id) ON DELETE CASCADE,
-        currency TEXT NOT NULL CHECK (length(currency) = 3),
-        gbp_rate_micros INTEGER NOT NULL CHECK (gbp_rate_micros > 0),
-        PRIMARY KEY (statement_import_id, currency)
-    ) STRICT
-    """,
     # A holding inside an import. Native amounts only; GBP is computed
-    # by joining import_fx on `currency` so we never store a derived
-    # value (single source of truth).
+    # at query time by joining `fx_rate` on currency and picking the
+    # latest `rate_date <= statement_import.as_of`. `fx_rate` is treated
+    # as append-only authoritative history, so no per-import snapshot
+    # table is needed — that would just duplicate a fact already in
+    # `fx_rate`.
     """
     CREATE TABLE position (
         id INTEGER PRIMARY KEY,
@@ -315,8 +315,9 @@ _MIGRATION_1_VIEWS: tuple[str, ...] = (
     )
     """,
     # Positions tied to the current import per account. Reports join this
-    # against import_fx by currency to compute the GBP value. `user_id`
-    # is reached through `account` — the import itself does not store it.
+    # against `fx_rate` (filtered to the latest `rate_date <= as_of` for
+    # each currency) to compute the GBP value. `user_id` is reached
+    # through `account` — the import itself does not store it.
     """
     CREATE VIEW current_position AS
     SELECT

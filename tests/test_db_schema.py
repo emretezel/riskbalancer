@@ -26,7 +26,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "schema_version",
         "user",
         "category",
-        "category_default",
+        "category_attribute",
         "source",
         "account",
         "instrument",
@@ -34,7 +34,6 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "fx_rate",
         "plan_node",
         "statement_import",
-        "import_fx",
         "position",
     }
 )
@@ -210,6 +209,73 @@ def test_category_same_name_under_different_parents_ok(db: Database) -> None:
         "INSERT INTO category (parent_id, name) VALUES (?, ?)",
         (europe_id, "Govt"),
     )
+
+
+def test_category_attribute_requires_weight(db: Database) -> None:
+    """`category_attribute.weight_micros` is NOT NULL — every seed node has one."""
+    cash_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Cash",),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO category_attribute (category_id, weight_micros) VALUES (?, NULL)",
+            (cash_id,),
+        )
+
+
+def test_category_attribute_weight_bounds(db: Database) -> None:
+    """`weight_micros` must be in [0, 1_000_000]. 0 is allowed for the seed's Cash leaf."""
+    cash_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Cash",),
+    ).fetchone()["id"]
+    db.connection.execute(
+        "INSERT INTO category_attribute (category_id, weight_micros, "
+        "volatility_micros, adjustment_micros) VALUES (?, 0, 0, 0)",
+        (cash_id,),
+    )
+    bonds_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Bonds",),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO category_attribute (category_id, weight_micros) VALUES (?, ?)",
+            (bonds_id, 1_000_001),
+        )
+
+
+def test_category_attribute_vol_and_adj_nullness_locked_together(db: Database) -> None:
+    """A row must carry both vol and adj or neither — leaf or branch, not mixed.
+
+    The CHECK constraint `(vol IS NULL) = (adj IS NULL)` rejects rows
+    that would store a vol without an adj or vice versa, which would
+    otherwise let a seed leaf silently inherit a default 1.0 adjustment
+    when the seed plan deliberately omits it.
+    """
+    nam_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("NAM",),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO category_attribute "
+            "(category_id, weight_micros, volatility_micros, adjustment_micros) "
+            "VALUES (?, ?, ?, NULL)",
+            (nam_id, 340_000, 175_000),
+        )
+    other_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Other",),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO category_attribute "
+            "(category_id, weight_micros, volatility_micros, adjustment_micros) "
+            "VALUES (?, ?, NULL, ?)",
+            (other_id, 340_000, 1_000_000),
+        )
 
 
 def test_mapping_unique_per_instrument_category(db: Database) -> None:

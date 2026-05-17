@@ -117,7 +117,7 @@ def build_catalog_from_db(
     1. Peer-user plans (deterministic by `user.name`). First peer that has
        a given category wins on `suggested_weight`, `suggested_volatility`,
        and `suggested_adjustment`.
-    2. Seed defaults from `category_default`. Fills in volatility /
+    2. Seed defaults from `category_attribute`. Fills in volatility /
        adjustment suggestions for leaves the seed defined but no peer
        plan has adopted yet.
     3. Shared mapping leaves. Categories referenced by mappings but absent
@@ -144,19 +144,23 @@ def _merge_seed_leaves_into_catalog(
     connection: sqlite3.Connection,
     catalog: list[CatalogNode],
 ) -> None:
-    """Fill in volatility / adjustment suggestions from `category_default`.
+    """Fill in volatility / adjustment suggestions from `category_attribute`.
 
-    Each `category_default` row corresponds to a category the seed plan
-    treated as a leaf. Walking the row's full path ensures the catalog
-    has the ancestor chain and the leaf node's suggestions are filled in
+    Each row with non-NULL `volatility_micros` corresponds to a seed-plan
+    leaf. Walking the row's full path ensures the catalog has the
+    ancestor chain and the leaf node's suggestions are filled in
     (without overwriting an earlier peer-derived value, since gap-fill
-    is the convention everywhere else in this module).
+    is the convention everywhere else in this module). Seed branches —
+    rows where vol/adj are NULL — are skipped here; the walker derives
+    branch-level suggestions from peer plans, not from the attribute
+    table.
     """
     rows = connection.execute(
         """
-        SELECT cd.volatility_micros, cd.adjustment_micros, cp.path
-        FROM category_default cd
-        JOIN category_path cp ON cp.id = cd.category_id
+        SELECT ca.volatility_micros, ca.adjustment_micros, cp.path
+        FROM category_attribute ca
+        JOIN category_path cp ON cp.id = ca.category_id
+        WHERE ca.volatility_micros IS NOT NULL
         ORDER BY cp.path
         """
     ).fetchall()
@@ -165,8 +169,9 @@ def _merge_seed_leaves_into_catalog(
         if not path:
             continue
         vol_raw = row["volatility_micros"]
+        adj_raw = row["adjustment_micros"]
         vol = vol_raw / MICROS_SCALE if vol_raw is not None else None
-        adj = row["adjustment_micros"] / MICROS_SCALE
+        adj = adj_raw / MICROS_SCALE if adj_raw is not None else None
         cursor = catalog
         for index, segment in enumerate(path):
             is_leaf = index == len(path) - 1
@@ -895,7 +900,9 @@ def describe_catalog_sources_from_db(
     if peer_rows:
         names = [row["name"] for row in peer_rows]
         parts.append(f"{len(names)} peer plan(s): {', '.join(names)}")
-    seed_count = connection.execute("SELECT COUNT(*) AS n FROM category_default").fetchone()["n"]
+    seed_count = connection.execute(
+        "SELECT COUNT(*) AS n FROM category_attribute WHERE volatility_micros IS NOT NULL"
+    ).fetchone()["n"]
     if seed_count:
         parts.append(f"{seed_count} seed leaf default(s)")
     mapping_count = connection.execute("SELECT COUNT(*) AS n FROM mapping").fetchone()["n"]

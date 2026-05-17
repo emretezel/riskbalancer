@@ -91,30 +91,55 @@ def test_seed_distinguishes_same_leaf_name_under_distinct_parents(
     assert nam_id != europe_id
 
 
-def test_seed_records_category_default_for_leaves(seeded_db: Database) -> None:
-    """`category_default` carries the seed's leaf volatility / adjustment."""
+def test_seed_records_category_attribute_for_leaves(seeded_db: Database) -> None:
+    """`category_attribute` carries the seed leaf's weight / volatility / adjustment."""
     nam_row = seeded_db.connection.execute(
         """
-        SELECT cd.volatility_micros, cd.adjustment_micros
-        FROM category_default cd
-        JOIN category_path cp ON cp.id = cd.category_id
+        SELECT ca.weight_micros, ca.volatility_micros, ca.adjustment_micros
+        FROM category_attribute ca
+        JOIN category_path cp ON cp.id = ca.category_id
         WHERE cp.path = ?
         """,
         ("Equities / Developed / NAM",),
     ).fetchone()
     assert nam_row is not None
-    # seed_plan.yaml: volatility 0.175, adjustment 1.0
+    # seed_plan.yaml: weight 0.34, volatility 0.175, adjustment 1.0
+    assert nam_row["weight_micros"] == fraction_to_micros(0.34)
     assert nam_row["volatility_micros"] == fraction_to_micros(0.175)
     assert nam_row["adjustment_micros"] == fraction_to_micros(1.0)
+
+
+def test_seed_records_branches_with_weight_and_null_vol_adj(seeded_db: Database) -> None:
+    """Seed branches carry a weight but no vol/adj — derived at report time.
+
+    `Equities / Developed` is a branch in `seed_plan.yaml`; it gets a
+    `category_attribute` row with its parent-relative weight (0.75) but
+    `volatility_micros` and `adjustment_micros` are both NULL because
+    the branch's effective values are computed as weighted averages of
+    its children rather than stored.
+    """
+    row = seeded_db.connection.execute(
+        """
+        SELECT ca.weight_micros, ca.volatility_micros, ca.adjustment_micros
+        FROM category_attribute ca
+        JOIN category_path cp ON cp.id = ca.category_id
+        WHERE cp.path = ?
+        """,
+        ("Equities / Developed",),
+    ).fetchone()
+    assert row is not None
+    assert row["weight_micros"] == fraction_to_micros(0.75)
+    assert row["volatility_micros"] is None
+    assert row["adjustment_micros"] is None
 
 
 def test_seed_default_supports_adjustment_above_one(seeded_db: Database) -> None:
     """Adjustments like 1.35 are stored as 1_350_000 (no [0,1] clamp)."""
     row = seeded_db.connection.execute(
         """
-        SELECT cd.adjustment_micros
-        FROM category_default cd
-        JOIN category_path cp ON cp.id = cd.category_id
+        SELECT ca.adjustment_micros
+        FROM category_attribute ca
+        JOIN category_path cp ON cp.id = ca.category_id
         WHERE cp.path = ?
         """,
         ("Bonds / Developed / NAM / Inflation",),
@@ -190,8 +215,8 @@ def test_seed_is_idempotent(seeded_db: Database) -> None:
     before_mappings = seeded_db.connection.execute("SELECT COUNT(*) AS n FROM mapping").fetchone()[
         "n"
     ]
-    before_defaults = seeded_db.connection.execute(
-        "SELECT COUNT(*) AS n FROM category_default"
+    before_attributes = seeded_db.connection.execute(
+        "SELECT COUNT(*) AS n FROM category_attribute"
     ).fetchone()["n"]
     seed_from_yaml(
         seeded_db.connection,
@@ -207,8 +232,8 @@ def test_seed_is_idempotent(seeded_db: Database) -> None:
         == before_mappings
     )
     assert (
-        seeded_db.connection.execute("SELECT COUNT(*) AS n FROM category_default").fetchone()["n"]
-        == before_defaults
+        seeded_db.connection.execute("SELECT COUNT(*) AS n FROM category_attribute").fetchone()["n"]
+        == before_attributes
     )
 
 

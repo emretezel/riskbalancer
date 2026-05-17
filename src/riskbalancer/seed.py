@@ -54,10 +54,12 @@ def seed_from_yaml(
     database in its prior state. Behaviour:
 
     - `seed_plan_path` is walked depth-first; every category node becomes
-      (or matches) a row in `category`, and every leaf records a
-      `category_default` row carrying the seed's suggested volatility and
-      adjustment. Categories that already exist are kept as-is; rows are
-      never deleted.
+      (or matches) a row in `category`, and every node records a
+      `category_attribute` row carrying its parent-relative `weight`.
+      Seed leaves additionally store `volatility` and `adjustment`; seed
+      branches leave both NULL (their effective values are computed as
+      weighted averages of children at report time). Categories that
+      already exist are kept as-is; rows are never deleted.
     - For each `<adapter>.yaml` in `mappings_dir`, every mapping row for
       that adapter is deleted up-front (so removed allocations actually
       go away on re-seed) and replaced with the file's contents. The
@@ -81,7 +83,7 @@ def seed_from_yaml(
 
 
 def _seed_categories_from_plan(connection: sqlite3.Connection, path: Path) -> None:
-    """Walk the seed plan YAML and ensure category + category_default rows."""
+    """Walk the seed plan YAML and ensure category + category_attribute rows."""
     if not path.exists():
         return
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -101,37 +103,54 @@ def _walk_seed_node(
 ) -> None:
     """Recursive walker: insert category for `payload`, recurse into children.
 
-    Leaves (no `children`) additionally upsert a row into `category_default`
-    with the seed's suggested volatility and adjustment, so the interactive
-    plan walker can present them as defaults later.
+    Every seed node — branch and leaf alike — upserts a `category_attribute`
+    row carrying its parent-relative `weight`. Leaves additionally store
+    `volatility` and `adjustment`; branches store NULL for both because
+    their effective values are derived as weighted averages of children
+    at report time (so storing a value here would duplicate a derived fact).
     """
     raw_name = payload.get("name")
     if not isinstance(raw_name, str) or not raw_name.strip():
         return
     name = raw_name.strip()
     category_id = _find_or_create_category(connection, parent_id=parent_id, name=name)
+    weight_raw = payload.get("weight", 0.0)
+    weight_micros = fraction_to_micros(float(weight_raw))
     children = payload.get("children") or []
-    if isinstance(children, list) and children:
-        for child in children:
-            if isinstance(child, dict):
-                _walk_seed_node(connection, parent_id=category_id, payload=child)
-        return
-    # Leaf — record the suggestion. Volatility may be absent (e.g. for a
-    # placeholder leaf); leave it NULL in that case.
-    volatility_raw = payload.get("volatility")
-    adjustment_raw = payload.get("adjustment", 1.0)
-    vol_micros = fraction_to_micros(float(volatility_raw)) if volatility_raw is not None else None
-    adj_micros = fraction_to_micros(float(adjustment_raw))
+    is_branch = isinstance(children, list) and bool(children)
+    if is_branch:
+        vol_micros: Optional[int] = None
+        adj_micros: Optional[int] = None
+    else:
+        volatility_raw = payload.get("volatility")
+        adjustment_raw = payload.get("adjustment", 1.0)
+        vol_micros = (
+            fraction_to_micros(float(volatility_raw)) if volatility_raw is not None else None
+        )
+        adj_micros = (
+            fraction_to_micros(float(adjustment_raw)) if adjustment_raw is not None else None
+        )
+        # Leaves carry both vol+adj or neither — the table's CHECK
+        # enforces it. Normalise so we never write a mixed row.
+        if vol_micros is None or adj_micros is None:
+            vol_micros = None
+            adj_micros = None
     connection.execute(
         """
-        INSERT INTO category_default (category_id, volatility_micros, adjustment_micros)
-        VALUES (?, ?, ?)
+        INSERT INTO category_attribute
+            (category_id, weight_micros, volatility_micros, adjustment_micros)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(category_id) DO UPDATE SET
+            weight_micros = excluded.weight_micros,
             volatility_micros = excluded.volatility_micros,
             adjustment_micros = excluded.adjustment_micros
         """,
-        (category_id, vol_micros, adj_micros),
+        (category_id, weight_micros, vol_micros, adj_micros),
     )
+    if is_branch:
+        for child in children:
+            if isinstance(child, dict):
+                _walk_seed_node(connection, parent_id=category_id, payload=child)
 
 
 def _find_or_create_category(

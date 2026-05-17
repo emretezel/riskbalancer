@@ -148,18 +148,29 @@ A category named `Govt` can exist under `Bonds / Developed / NAM` *and*
 under `Bonds / Developed / Europe` simultaneously — different parents,
 different IDs. The schema deliberately supports this.
 
-### 3.4 `category_default`
+### 3.4 `category_attribute`
 
-Seed-derived volatility / adjustment **suggestions** per category. Used
-by the interactive plan walker (`rb plan create`) to pre-populate
-prompts; not consulted at report time. Populated by `rb db seed` from
-the leaf entries in `config/seed_plan.yaml`.
+Authoritative per-category attributes drawn from `config/seed_plan.yaml`.
+One row per seed-plan node — branches and leaves alike. **This is the
+single source of truth for a category's volatility and adjustment**;
+neither value is stored on `plan_node`. Used at report time as well as
+by the interactive plan walker.
 
 | Column | Type | Notes |
 |---|---|---|
 | `category_id` | `INTEGER PRIMARY KEY REFERENCES category(id) ON DELETE CASCADE` | One row per category, at most. |
-| `volatility_micros` | `INTEGER` | `NULL OR volatility_micros >= 0`. |
-| `adjustment_micros` | `INTEGER NOT NULL DEFAULT 1000000` | `adjustment_micros >= 0`. Not clamped to ≤1.0 — the seed's `Bonds / Developed / NAM / Inflation` has `1.35`. |
+| `weight_micros` | `INTEGER NOT NULL` | `0 <= weight_micros <= 1_000_000`. The seed plan's parent-relative weight (siblings sum to 1.0 under their parent). Used to combine children when a plan terminates above a seed leaf. |
+| `volatility_micros` | `INTEGER NULL` | `NULL OR volatility_micros >= 0`. NULL on seed branches; set on seed leaves. |
+| `adjustment_micros` | `INTEGER NULL` | `NULL OR adjustment_micros >= 0`. NULL on seed branches; set on seed leaves. Not clamped to ≤1.0 — the seed's `Bonds / Developed / NAM / Inflation` has `1.35`. |
+
+Table-level `CHECK ((volatility_micros IS NULL) = (adjustment_micros IS NULL))`
+keeps the two leaf-only columns in lockstep: a row is either a branch
+(both NULL) or a leaf (both set). When a user's plan treats a seed
+branch as a leaf — e.g. holding `Equities / EM` rather than splitting it
+into `Asia` / `Americas` / `EMEA` — the effective volatility and
+adjustment are computed at read time as the weight-weighted average of
+the branch's children, where weights come from each child's
+`weight_micros` here. This keeps a derived value out of the schema.
 
 ### 3.5 `source`
 
@@ -291,27 +302,28 @@ be a leaf in one user's plan and a branch in another's.
 | `parent_id` | `INTEGER NULL REFERENCES plan_node(id) ON DELETE CASCADE` | `NULL` for top-level. |
 | `category_id` | `INTEGER NOT NULL REFERENCES category(id) ON DELETE RESTRICT` | |
 | `weight_micros` | `INTEGER NOT NULL` | `0 <= weight_micros <= 1000000`. Zero is permitted for "category I want to keep visible but currently hold 0%" (e.g. `Cash` in the seed). |
-| `volatility_micros` | `INTEGER NULL` | `NULL OR volatility_micros >= 0`. Branches carry `NULL`; leaves typically carry a value, but `NULL` is allowed for the seed's `Cash` leaf and similar — readers apply a `default_leaf_volatility` fallback. |
-| `adjustment_micros` | `INTEGER NOT NULL DEFAULT 1000000` | `>= 0`. Meaningful only on leaves; defaults to 1.0 on branches and is ignored when normalising risk weights. |
 
 `UNIQUE (user_id, parent_id, category_id)`.
 
-Application-level invariants (enforced in `repositories.write_plan_tree`):
+Volatility and adjustment are **not** stored here — they live on
+`category_attribute` (single source of truth). For a plan-leaf that
+sits on a seed-branch (e.g. a user holding `Equities / EM` as a leaf
+without splitting it further), the effective values are computed at
+read time as the weight-weighted average of the branch's children.
+See `repositories.compute_category_volatility` and
+`compute_category_adjustment`.
 
-1. Sibling weights at every level sum to `1_000_000` (within the YAML
-   loader's tolerance of `1e-6` when expressed as fractions).
-2. A node has `volatility_micros IS NULL` if and only if it has
-   `plan_node` children — branches never carry volatility, leaves
-   typically do.
+Application-level invariant (enforced in `repositories.write_plan_tree`):
+sibling weights at every level sum to `1_000_000` (within the YAML
+loader's tolerance of `1e-6` when expressed as fractions).
 
 ### 3.11 `statement_import`
 
 An import event. One row per `(account_id, as_of)` — re-importing the
 same statement for the same as-of replaces the previous import in a
 single transaction (the runner deletes the old row, cascading through
-`position` and `import_fx`, then inserts the new one). Different
-`as_of` dates for the same account coexist and form the historical
-timeline.
+`position`, then inserts the new one). Different `as_of` dates for the
+same account coexist and form the historical timeline.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -323,25 +335,13 @@ timeline.
 
 `UNIQUE (account_id, as_of)`.
 
-### 3.12 `import_fx`
-
-FX rates as observed at the moment of an import. Frozen per-import so
-the GBP-equivalent value of historical positions is reproducible even
-if `fx_rate` is later corrected upstream.
-
-| Column | Type | Notes |
-|---|---|---|
-| `statement_import_id` | `INTEGER NOT NULL REFERENCES statement_import(id) ON DELETE CASCADE` | Compound PK with `currency`. |
-| `currency` | `TEXT NOT NULL` | `length(currency) = 3`. |
-| `gbp_rate_micros` | `INTEGER NOT NULL` | `> 0`. |
-
-`PRIMARY KEY (statement_import_id, currency)`.
-
-### 3.13 `position`
+### 3.12 `position`
 
 One holding inside an import. Native amounts only — the GBP-equivalent
-is **never stored**, only computed by joining `import_fx` on `currency`
-at query time (single source of truth).
+is **never stored**, only computed at query time by joining `fx_rate`
+on `currency` and taking the most recent row with `rate_date <=
+statement_import.as_of`. `fx_rate` is treated as append-only
+authoritative history, so no per-import FX snapshot is needed.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -481,5 +481,5 @@ Why this design:
 - **No global UNIQUE on `category(name)`.** Two `Govt` leaves with
   different parents are legitimately distinct rows.
 - **No "is_seed" flag on user or plan_node.** The seed plan is loaded
-  into `category` + `category_default` only; it never appears as a
+  into `category` + `category_attribute` only; it never appears as a
   fake "_seed" user.
