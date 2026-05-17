@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime
-from typing import Callable, Iterator, Optional, Sequence
+from typing import Iterator, Optional, Sequence
 
 from .configuration import CategoryNode
 from .seed import MICROS_SCALE, fraction_to_micros
@@ -38,13 +38,6 @@ def _utc_now_iso() -> str:
     formatting that the CHECK constraints expect.
     """
     return datetime.now(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _micros_to_fraction(micros: Optional[int]) -> Optional[float]:
-    """Inverse of `fraction_to_micros`. NULL micros round-trip to None."""
-    if micros is None:
-        return None
-    return micros / MICROS_SCALE
 
 
 # ---------------------------------------------------------------------------
@@ -186,12 +179,14 @@ def load_plan_tree(
     """Reconstruct the user's plan as a `CategoryNode` tree.
 
     Returns an empty list when the user has no plan rows. Each row's
-    weight is read from `plan_node`; volatility and adjustment are
-    looked up on `category_attribute` (or computed as a weighted average
-    of children for plan-leaves that sit on a seed-branch) via
-    `compute_category_volatility` / `compute_category_adjustment`.
-    Branch nodes (those with plan children) carry `None` for vol/adj
-    since they are summary nodes, not allocation targets.
+    weight is read from `plan_node`; volatility and adjustment for
+    plan-leaves are read directly from `category_attribute` and raise
+    if a leaf has no row (a plan should never have been saved without
+    explicit fundamentals on every leaf — the walker enforces this on
+    creation). Branch nodes (those with plan children) carry `None` for
+    volatility and `_DEFAULT_ADJUSTMENT` for adjustment; they are summary
+    nodes, not allocation targets, and downstream code recognises them
+    by `children` being non-empty rather than by sentinel values.
     """
     rows = connection.execute(
         """
@@ -216,7 +211,6 @@ def load_plan_tree(
             name=str(row["name"]),
             weight=row["weight_micros"] / MICROS_SCALE,
             volatility=None,
-            adjustment=1.0,
             children=[],
         )
         node_id = int(row["id"])
@@ -230,16 +224,22 @@ def load_plan_tree(
             roots.append(node)
         else:
             by_id[parent].children.append(node)
-    # Populate vol/adj on leaves only. A node is a leaf iff it has no
-    # plan children. The lookup walks down through `category_attribute`
-    # if the plan-leaf sits on a seed-branch.
+    # Populate vol/adj on plan-leaves only. A node is a leaf iff it has
+    # no plan children. The schema guarantees `category_attribute` carries
+    # both columns NOT NULL, so a hit yields a complete pair; a miss is a
+    # data-integrity error and surfaces as a typed exception.
     for node_id, node in by_id.items():
         if node.children:
             continue
         category_id = category_of[node_id]
-        node.volatility = compute_category_volatility(connection, category_id)
-        adj = compute_category_adjustment(connection, category_id)
-        node.adjustment = adj if adj is not None else 1.0
+        attr = get_category_attribute(connection, category_id)
+        if attr is None:
+            raise ValueError(
+                f"Plan-leaf {node.name!r} (category_id={category_id}) has no "
+                "category_attribute row; vol/adj must be set explicitly before "
+                "the plan can be loaded."
+            )
+        node.volatility, node.adjustment = attr
     return roots
 
 
@@ -283,14 +283,11 @@ def _insert_plan_subtree(
     """Insert one plan_node row and recurse into its children.
 
     `plan_node` stores tree structure and the user's parent-relative
-    weight only — volatility and adjustment live on `category_attribute`
-    (single source of truth). For plan-leaves (no children), the in-
-    memory node's vol/adj are upserted into `category_attribute`,
-    preserving any existing `weight_micros` (which is the seed-relative
-    parent weight and is not a per-user concept). Categories that don't
-    yet have a row are inserted with `weight_micros = 0`; the seed loader
-    is responsible for setting the real seed weight when the category is
-    a seed-plan node.
+    weight only. For plan-leaves (no children), the in-memory node's
+    vol/adj are upserted into `category_attribute`, which is the single
+    source of truth for intrinsic per-category fundamentals. Plan-leaves
+    must carry a concrete volatility — the walker enforces this — so a
+    missing value here is a programmer error and raises.
     """
     category_id = find_or_create_category(connection, parent_id=parent_category_id, name=node.name)
     cursor = connection.execute(
@@ -310,12 +307,29 @@ def _insert_plan_subtree(
         raise RuntimeError(f"Failed to insert plan_node for {node.name!r}")
     new_plan_id = int(cursor.lastrowid)
     if not node.children:
-        _upsert_leaf_attribute(
-            connection,
-            category_id=category_id,
-            volatility=node.volatility,
-            adjustment=node.adjustment,
-        )
+        if node.volatility is None:
+            # The YAML loader returns None for `volatility: 0.0` (a legacy
+            # parser quirk in `configuration._parse_optional_volatility`),
+            # so a missing in-memory volatility is tolerated iff an existing
+            # `category_attribute` row already covers this category —
+            # typically because the seed loader populated it. Without such
+            # a row there is no information to fall back on and the plan
+            # is invalid; the walker is responsible for collecting vol/adj
+            # before reaching this point.
+            if get_category_attribute(connection, category_id) is None:
+                raise ValueError(
+                    f"Plan-leaf {node.name!r} (category_id={category_id}) "
+                    "has no in-memory volatility and no category_attribute "
+                    "row to fall back on; the walker must collect explicit "
+                    "vol/adj before persisting a leaf."
+                )
+        else:
+            upsert_category_attribute(
+                connection,
+                category_id=category_id,
+                volatility=node.volatility,
+                adjustment=node.adjustment,
+            )
     for child in node.children:
         _insert_plan_subtree(
             connection,
@@ -326,37 +340,30 @@ def _insert_plan_subtree(
         )
 
 
-def _upsert_leaf_attribute(
+def upsert_category_attribute(
     connection: sqlite3.Connection,
     *,
     category_id: int,
-    volatility: Optional[float],
+    volatility: float,
     adjustment: float,
 ) -> None:
-    """Push a plan-leaf's vol/adj into `category_attribute`.
+    """Upsert intrinsic `(volatility, adjustment)` for a category.
 
-    The `(vol IS NULL) = (adj IS NULL)` invariant on the table requires
-    the two columns to move together: when the in-memory node carries no
-    volatility, we store NULL for adjustment too, even if the caller's
-    `adjustment` defaulted to 1.0 — otherwise the CHECK would reject the
-    row. Existing `weight_micros` is preserved.
+    The schema declares both columns NOT NULL with `>= 0` CHECKs, so the
+    caller passes concrete values. Used by the seed loader for seed
+    leaves and by the plan walker whenever a user adopts a category as a
+    plan-leaf — that is the only path through which a row can land here.
     """
-    if volatility is None:
-        vol_micros: Optional[int] = None
-        adj_micros: Optional[int] = None
-    else:
-        vol_micros = fraction_to_micros(volatility)
-        adj_micros = fraction_to_micros(adjustment)
     connection.execute(
         """
         INSERT INTO category_attribute
-            (category_id, weight_micros, volatility_micros, adjustment_micros)
-        VALUES (?, 0, ?, ?)
+            (category_id, volatility_micros, adjustment_micros)
+        VALUES (?, ?, ?)
         ON CONFLICT(category_id) DO UPDATE SET
             volatility_micros = excluded.volatility_micros,
             adjustment_micros = excluded.adjustment_micros
         """,
-        (category_id, vol_micros, adj_micros),
+        (category_id, fraction_to_micros(volatility), fraction_to_micros(adjustment)),
     )
 
 
@@ -396,25 +403,27 @@ def iter_peer_plans(
 
 
 # ---------------------------------------------------------------------------
-# Category attributes (weight / volatility / adjustment from the seed plan)
+# Category attributes (intrinsic volatility / adjustment per category)
 # ---------------------------------------------------------------------------
 
 
 def get_category_attribute(
     connection: sqlite3.Connection,
     category_id: int,
-) -> Optional[tuple[float, Optional[float], Optional[float]]]:
-    """Return `(weight, volatility, adjustment)` from `category_attribute`.
+) -> Optional[tuple[float, float]]:
+    """Return `(volatility, adjustment)` for a category, or `None`.
 
-    Returns `None` when the category has no `category_attribute` row at
-    all (i.e. it was created by a mapping or by a user's plan but never
-    appeared in the seed plan). For seed branches, `weight` is non-None
-    while `volatility` and `adjustment` are both `None`; for seed leaves,
-    all three are non-None.
+    Both columns are NOT NULL in the schema, so a hit always yields a
+    concrete pair. `None` means the category has no row — typically a
+    branch the seed declared or a leaf no user has adopted yet — and
+    the caller should surface it (the walker prompts for vol/adj; the
+    plan loader treats it as a data-integrity error). There is no
+    fallback lookup or derivation; every plan-leaf names its own
+    fundamentals.
     """
     row = connection.execute(
         """
-        SELECT weight_micros, volatility_micros, adjustment_micros
+        SELECT volatility_micros, adjustment_micros
         FROM category_attribute
         WHERE category_id = ?
         """,
@@ -422,99 +431,7 @@ def get_category_attribute(
     ).fetchone()
     if row is None:
         return None
-    weight = row["weight_micros"] / MICROS_SCALE
-    vol = _micros_to_fraction(row["volatility_micros"])
-    adj = _micros_to_fraction(row["adjustment_micros"])
-    return weight, vol, adj
-
-
-def compute_category_volatility(
-    connection: sqlite3.Connection,
-    category_id: int,
-) -> Optional[float]:
-    """Effective volatility of a category, computed on the fly when needed.
-
-    Resolution:
-
-    1. If `category_attribute(category_id)` has a non-NULL
-       `volatility_micros` (seed leaf), return it directly.
-    2. Otherwise (seed branch, or category with no attribute row), walk
-       the children in `category` and combine their effective volatilities
-       by the weight stored on each child's `category_attribute` row. The
-       weighted average uses the children's normalised weights — i.e.
-       each child's weight divided by the sum of weights for the children
-       that actually contribute a non-None volatility — so missing data
-       on one child does not corrupt the answer for its siblings.
-    3. If no children contribute, return `None`. Callers decide how to
-       handle missing data; this function never substitutes a sentinel.
-    """
-    attr = get_category_attribute(connection, category_id)
-    if attr is not None:
-        _, vol, _ = attr
-        if vol is not None:
-            return vol
-    return _weighted_attribute(connection, category_id, _volatility_of)
-
-
-def compute_category_adjustment(
-    connection: sqlite3.Connection,
-    category_id: int,
-) -> Optional[float]:
-    """Effective adjustment of a category. Mirrors `compute_category_volatility`."""
-    attr = get_category_attribute(connection, category_id)
-    if attr is not None:
-        _, _, adj = attr
-        if adj is not None:
-            return adj
-    return _weighted_attribute(connection, category_id, _adjustment_of)
-
-
-def _weighted_attribute(
-    connection: sqlite3.Connection,
-    category_id: int,
-    resolver: Callable[[sqlite3.Connection, int], Optional[float]],
-) -> Optional[float]:
-    """Weighted average of `resolver(child)` over the category's children.
-
-    Weights come from each child's `category_attribute.weight_micros` and
-    are renormalised over the children that actually produce a value, so
-    a child with no metadata contributes nothing instead of dragging the
-    average toward zero.
-    """
-    rows = connection.execute(
-        """
-        SELECT c.id AS child_id, ca.weight_micros AS weight_micros
-        FROM category c
-        LEFT JOIN category_attribute ca ON ca.category_id = c.id
-        WHERE c.parent_id = ?
-        """,
-        (category_id,),
-    ).fetchall()
-    total_weight = 0.0
-    weighted_sum = 0.0
-    for row in rows:
-        weight_raw = row["weight_micros"]
-        if weight_raw is None:
-            continue
-        value = resolver(connection, int(row["child_id"]))
-        if value is None:
-            continue
-        weight = weight_raw / MICROS_SCALE
-        total_weight += weight
-        weighted_sum += weight * value
-    if total_weight <= 0.0:
-        return None
-    return weighted_sum / total_weight
-
-
-def _volatility_of(connection: sqlite3.Connection, category_id: int) -> Optional[float]:
-    """Bridge used by `_weighted_attribute` for the volatility resolver."""
-    return compute_category_volatility(connection, category_id)
-
-
-def _adjustment_of(connection: sqlite3.Connection, category_id: int) -> Optional[float]:
-    """Bridge used by `_weighted_attribute` for the adjustment resolver."""
-    return compute_category_adjustment(connection, category_id)
+    return row["volatility_micros"] / MICROS_SCALE, row["adjustment_micros"] / MICROS_SCALE
 
 
 # ---------------------------------------------------------------------------

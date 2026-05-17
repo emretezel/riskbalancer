@@ -18,7 +18,14 @@ from pathlib import Path
 import pytest
 import yaml
 
+from riskbalancer.configuration import CategoryNode
 from riskbalancer.db import Database
+from riskbalancer.repositories import (
+    find_or_create_user,
+    load_plan_tree,
+    upsert_category_attribute,
+    write_plan_tree,
+)
 from riskbalancer.seed import (
     MICROS_SCALE,
     fraction_to_micros,
@@ -92,10 +99,15 @@ def test_seed_distinguishes_same_leaf_name_under_distinct_parents(
 
 
 def test_seed_records_category_attribute_for_leaves(seeded_db: Database) -> None:
-    """`category_attribute` carries the seed leaf's weight / volatility / adjustment."""
+    """`category_attribute` carries the seed leaf's volatility and adjustment.
+
+    Both columns are NOT NULL in the new schema, and the row holds the
+    leaf's intrinsic fundamentals — no parent-relative weight, no
+    derivation. Plan weights live on `plan_node`.
+    """
     nam_row = seeded_db.connection.execute(
         """
-        SELECT ca.weight_micros, ca.volatility_micros, ca.adjustment_micros
+        SELECT ca.volatility_micros, ca.adjustment_micros
         FROM category_attribute ca
         JOIN category_path cp ON cp.id = ca.category_id
         WHERE cp.path = ?
@@ -103,34 +115,29 @@ def test_seed_records_category_attribute_for_leaves(seeded_db: Database) -> None
         ("Equities / Developed / NAM",),
     ).fetchone()
     assert nam_row is not None
-    # seed_plan.yaml: weight 0.34, volatility 0.175, adjustment 1.0
-    assert nam_row["weight_micros"] == fraction_to_micros(0.34)
+    # seed_plan.yaml: volatility 0.175, adjustment 1.0
     assert nam_row["volatility_micros"] == fraction_to_micros(0.175)
     assert nam_row["adjustment_micros"] == fraction_to_micros(1.0)
 
 
-def test_seed_records_branches_with_weight_and_null_vol_adj(seeded_db: Database) -> None:
-    """Seed branches carry a weight but no vol/adj — derived at report time.
+def test_seed_does_not_record_branches_in_category_attribute(seeded_db: Database) -> None:
+    """Seed branches contribute their `category` row only — no `category_attribute` row.
 
-    `Equities / Developed` is a branch in `seed_plan.yaml`; it gets a
-    `category_attribute` row with its parent-relative weight (0.75) but
-    `volatility_micros` and `adjustment_micros` are both NULL because
-    the branch's effective values are computed as weighted averages of
-    its children rather than stored.
+    Branch-level volatility/adjustment is not a fact the schema holds;
+    a user who wants to hold a branch (e.g. `Equities / Developed`) as
+    a plan-leaf must supply explicit vol/adj at plan-creation time
+    rather than rely on a stored derivation.
     """
     row = seeded_db.connection.execute(
         """
-        SELECT ca.weight_micros, ca.volatility_micros, ca.adjustment_micros
+        SELECT 1
         FROM category_attribute ca
         JOIN category_path cp ON cp.id = ca.category_id
         WHERE cp.path = ?
         """,
         ("Equities / Developed",),
     ).fetchone()
-    assert row is not None
-    assert row["weight_micros"] == fraction_to_micros(0.75)
-    assert row["volatility_micros"] is None
-    assert row["adjustment_micros"] is None
+    assert row is None
 
 
 def test_seed_default_supports_adjustment_above_one(seeded_db: Database) -> None:
@@ -308,6 +315,115 @@ def test_seed_refuses_to_map_to_branch_category(tmp_path: Path) -> None:
     )
     with pytest.raises(sqlite3.IntegrityError, match="leaf"):
         seed_from_yaml(db.connection, seed_plan_path=SEED_PLAN, mappings_dir=fake_mappings)
+
+
+def test_load_plan_tree_raises_when_leaf_has_no_category_attribute(tmp_path: Path) -> None:
+    """A plan-leaf on a category with no `category_attribute` row cannot load.
+
+    This is the H2 invariant in action: vol/adj live on
+    `category_attribute` and must be explicit. If a developer (or a buggy
+    write path) leaves a plan-leaf pointing at a category with no
+    attribute row, `load_plan_tree` refuses to invent fallback values
+    and instead raises a typed error pinpointing the offending leaf.
+    """
+    db = Database.connect(":memory:")
+    user_id = find_or_create_user(db.connection, "emre")
+    # Build the category row but deliberately skip the category_attribute
+    # row so the schema's "no derived vol/adj" rule is exercised end-to-end.
+    cash_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Cash",),
+    ).fetchone()["id"]
+    db.connection.execute(
+        "INSERT INTO plan_node (user_id, parent_id, category_id, weight_micros) "
+        "VALUES (?, NULL, ?, ?)",
+        (user_id, cash_id, MICROS_SCALE),
+    )
+    with pytest.raises(ValueError, match="has no category_attribute row"):
+        load_plan_tree(db.connection, user_id)
+
+
+def test_plan_tree_round_trip_preserves_explicit_leaf_attributes(tmp_path: Path) -> None:
+    """Writing a plan-leaf and reading it back returns the same vol/adj.
+
+    Exercises the canonical path: the walker collects explicit vol/adj
+    for a plan-leaf, `write_plan_tree` upserts them into
+    `category_attribute`, and `load_plan_tree` reads them back without
+    transformation. No derivation, no fallback — what goes in comes out.
+    """
+    db = Database.connect(":memory:")
+    user_id = find_or_create_user(db.connection, "emre")
+    plan = [
+        CategoryNode(
+            name="Equities",
+            weight=0.6,
+            volatility=0.18,
+            adjustment=0.95,
+            children=[],
+        ),
+        CategoryNode(
+            name="Bonds",
+            weight=0.4,
+            volatility=0.05,
+            adjustment=1.10,
+            children=[],
+        ),
+    ]
+    write_plan_tree(db.connection, user_id, plan)
+    loaded = load_plan_tree(db.connection, user_id)
+    by_name = {node.name: node for node in loaded}
+    assert by_name["Equities"].volatility == pytest.approx(0.18)
+    assert by_name["Equities"].adjustment == pytest.approx(0.95)
+    assert by_name["Bonds"].volatility == pytest.approx(0.05)
+    assert by_name["Bonds"].adjustment == pytest.approx(1.10)
+
+
+def test_branch_as_leaf_requires_explicit_vol_adj(seeded_db: Database) -> None:
+    """A user holding a seed-branch as a plan-leaf must set vol/adj explicitly.
+
+    The seed plan declares `Equities / EM` as a branch (Asia / EMEA /
+    Americas children), so no `category_attribute` row exists for it.
+    A user whose plan stops at EM-as-a-leaf without supplying explicit
+    vol/adj on the in-memory node and without an existing attribute row
+    cannot be persisted: the writer raises rather than fabricating values.
+    """
+    user_id = find_or_create_user(seeded_db.connection, "emre")
+    em_id = seeded_db.connection.execute(
+        "SELECT id FROM category_path WHERE path = ?",
+        ("Equities / EM",),
+    ).fetchone()["id"]
+    # Sanity check: the seed-loaded branch indeed has no attribute row.
+    assert (
+        seeded_db.connection.execute(
+            "SELECT COUNT(*) AS n FROM category_attribute WHERE category_id = ?",
+            (em_id,),
+        ).fetchone()["n"]
+        == 0
+    )
+    plan = [
+        CategoryNode(
+            name="Equities",
+            weight=1.0,
+            children=[
+                CategoryNode(name="EM", weight=1.0, volatility=None),
+            ],
+        ),
+    ]
+    with pytest.raises(ValueError, match="has no in-memory volatility"):
+        write_plan_tree(seeded_db.connection, user_id, plan)
+    # And once the walker has collected explicit fundamentals, the same
+    # plan persists successfully because the attribute row now exists.
+    upsert_category_attribute(
+        seeded_db.connection,
+        category_id=em_id,
+        volatility=0.22,
+        adjustment=0.9,
+    )
+    write_plan_tree(seeded_db.connection, user_id, plan)
+    loaded = load_plan_tree(seeded_db.connection, user_id)
+    em_node = loaded[0].children[0]
+    assert em_node.volatility == pytest.approx(0.22)
+    assert em_node.adjustment == pytest.approx(0.9)
 
 
 def test_resolve_category_path_is_find_or_create() -> None:

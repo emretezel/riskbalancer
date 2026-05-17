@@ -54,12 +54,13 @@ def seed_from_yaml(
     database in its prior state. Behaviour:
 
     - `seed_plan_path` is walked depth-first; every category node becomes
-      (or matches) a row in `category`, and every node records a
-      `category_attribute` row carrying its parent-relative `weight`.
-      Seed leaves additionally store `volatility` and `adjustment`; seed
-      branches leave both NULL (their effective values are computed as
-      weighted averages of children at report time). Categories that
-      already exist are kept as-is; rows are never deleted.
+      (or matches) a row in `category`. Seed leaves additionally upsert
+      a `category_attribute` row carrying their intrinsic `volatility`
+      and `adjustment`. Seed branches do NOT get a `category_attribute`
+      row at all — branch-level vol/adj is not a fact the schema holds;
+      a user who wants to hold a branch as a plan-leaf must supply
+      explicit vol/adj at plan-creation time. Categories that already
+      exist are kept as-is; rows are never deleted.
     - For each `<adapter>.yaml` in `mappings_dir`, every mapping row for
       that adapter is deleted up-front (so removed allocations actually
       go away on re-seed) and replaced with the file's contents. The
@@ -103,54 +104,47 @@ def _walk_seed_node(
 ) -> None:
     """Recursive walker: insert category for `payload`, recurse into children.
 
-    Every seed node — branch and leaf alike — upserts a `category_attribute`
-    row carrying its parent-relative `weight`. Leaves additionally store
-    `volatility` and `adjustment`; branches store NULL for both because
-    their effective values are derived as weighted averages of children
-    at report time (so storing a value here would duplicate a derived fact).
+    Seed leaves upsert a `category_attribute` row holding their intrinsic
+    `volatility` and `adjustment`. Seed branches contribute their
+    `category` row only — no `category_attribute` row is written, because
+    branch-level vol/adj is not a fact the schema holds. A leaf with no
+    explicit `volatility` is silently skipped at the attribute write step:
+    its `category` row still exists for the hierarchy, but it cannot serve
+    as a plan-leaf until the walker collects vol/adj from the user.
     """
     raw_name = payload.get("name")
     if not isinstance(raw_name, str) or not raw_name.strip():
         return
     name = raw_name.strip()
     category_id = _find_or_create_category(connection, parent_id=parent_id, name=name)
-    weight_raw = payload.get("weight", 0.0)
-    weight_micros = fraction_to_micros(float(weight_raw))
     children = payload.get("children") or []
     is_branch = isinstance(children, list) and bool(children)
-    if is_branch:
-        vol_micros: Optional[int] = None
-        adj_micros: Optional[int] = None
-    else:
-        volatility_raw = payload.get("volatility")
-        adjustment_raw = payload.get("adjustment", 1.0)
-        vol_micros = (
-            fraction_to_micros(float(volatility_raw)) if volatility_raw is not None else None
-        )
-        adj_micros = (
-            fraction_to_micros(float(adjustment_raw)) if adjustment_raw is not None else None
-        )
-        # Leaves carry both vol+adj or neither — the table's CHECK
-        # enforces it. Normalise so we never write a mixed row.
-        if vol_micros is None or adj_micros is None:
-            vol_micros = None
-            adj_micros = None
-    connection.execute(
-        """
-        INSERT INTO category_attribute
-            (category_id, weight_micros, volatility_micros, adjustment_micros)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(category_id) DO UPDATE SET
-            weight_micros = excluded.weight_micros,
-            volatility_micros = excluded.volatility_micros,
-            adjustment_micros = excluded.adjustment_micros
-        """,
-        (category_id, weight_micros, vol_micros, adj_micros),
-    )
     if is_branch:
         for child in children:
             if isinstance(child, dict):
                 _walk_seed_node(connection, parent_id=category_id, payload=child)
+        return
+    volatility_raw = payload.get("volatility")
+    adjustment_raw = payload.get("adjustment", 1.0)
+    if volatility_raw is None or adjustment_raw is None:
+        # The schema requires both columns; a seed leaf without an explicit
+        # volatility is incomplete data, not a row we silently materialise
+        # with placeholders. The walker is responsible for filling it in
+        # when (and only when) a user actually adopts the category.
+        return
+    vol_micros = fraction_to_micros(float(volatility_raw))
+    adj_micros = fraction_to_micros(float(adjustment_raw))
+    connection.execute(
+        """
+        INSERT INTO category_attribute
+            (category_id, volatility_micros, adjustment_micros)
+        VALUES (?, ?, ?)
+        ON CONFLICT(category_id) DO UPDATE SET
+            volatility_micros = excluded.volatility_micros,
+            adjustment_micros = excluded.adjustment_micros
+        """,
+        (category_id, vol_micros, adj_micros),
+    )
 
 
 def _find_or_create_category(

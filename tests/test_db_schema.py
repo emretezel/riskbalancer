@@ -211,49 +211,38 @@ def test_category_same_name_under_different_parents_ok(db: Database) -> None:
     )
 
 
-def test_category_attribute_requires_weight(db: Database) -> None:
-    """`category_attribute.weight_micros` is NOT NULL — every seed node has one."""
+def test_category_attribute_requires_volatility(db: Database) -> None:
+    """`category_attribute.volatility_micros` is NOT NULL — vol must be explicit."""
     cash_id = db.connection.execute(
         "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
         ("Cash",),
     ).fetchone()["id"]
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
-            "INSERT INTO category_attribute (category_id, weight_micros) VALUES (?, NULL)",
-            (cash_id,),
+            "INSERT INTO category_attribute "
+            "(category_id, volatility_micros, adjustment_micros) "
+            "VALUES (?, NULL, ?)",
+            (cash_id, 1_000_000),
         )
 
 
-def test_category_attribute_weight_bounds(db: Database) -> None:
-    """`weight_micros` must be in [0, 1_000_000]. 0 is allowed for the seed's Cash leaf."""
+def test_category_attribute_requires_adjustment(db: Database) -> None:
+    """`category_attribute.adjustment_micros` is NOT NULL — adj must be explicit."""
     cash_id = db.connection.execute(
         "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
         ("Cash",),
     ).fetchone()["id"]
-    db.connection.execute(
-        "INSERT INTO category_attribute (category_id, weight_micros, "
-        "volatility_micros, adjustment_micros) VALUES (?, 0, 0, 0)",
-        (cash_id,),
-    )
-    bonds_id = db.connection.execute(
-        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
-        ("Bonds",),
-    ).fetchone()["id"]
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
-            "INSERT INTO category_attribute (category_id, weight_micros) VALUES (?, ?)",
-            (bonds_id, 1_000_001),
+            "INSERT INTO category_attribute "
+            "(category_id, volatility_micros, adjustment_micros) "
+            "VALUES (?, ?, NULL)",
+            (cash_id, 0),
         )
 
 
-def test_category_attribute_vol_and_adj_nullness_locked_together(db: Database) -> None:
-    """A row must carry both vol and adj or neither — leaf or branch, not mixed.
-
-    The CHECK constraint `(vol IS NULL) = (adj IS NULL)` rejects rows
-    that would store a vol without an adj or vice versa, which would
-    otherwise let a seed leaf silently inherit a default 1.0 adjustment
-    when the seed plan deliberately omits it.
-    """
+def test_category_attribute_vol_and_adj_must_be_non_negative(db: Database) -> None:
+    """Both `volatility_micros` and `adjustment_micros` reject negative values."""
     nam_id = db.connection.execute(
         "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
         ("NAM",),
@@ -261,21 +250,44 @@ def test_category_attribute_vol_and_adj_nullness_locked_together(db: Database) -
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
             "INSERT INTO category_attribute "
-            "(category_id, weight_micros, volatility_micros, adjustment_micros) "
-            "VALUES (?, ?, ?, NULL)",
-            (nam_id, 340_000, 175_000),
+            "(category_id, volatility_micros, adjustment_micros) VALUES (?, ?, ?)",
+            (nam_id, -1, 1_000_000),
         )
-    other_id = db.connection.execute(
+    em_id = db.connection.execute(
         "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
-        ("Other",),
+        ("EM",),
     ).fetchone()["id"]
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
             "INSERT INTO category_attribute "
-            "(category_id, weight_micros, volatility_micros, adjustment_micros) "
-            "VALUES (?, ?, NULL, ?)",
-            (other_id, 340_000, 1_000_000),
+            "(category_id, volatility_micros, adjustment_micros) VALUES (?, ?, ?)",
+            (em_id, 1_000_000, -1),
         )
+
+
+def test_category_attribute_cascades_on_category_delete(db: Database) -> None:
+    """Dropping a `category` cascades to its `category_attribute` row.
+
+    Categories referenced by other rows (mapping, plan_node) cannot be
+    deleted thanks to ON DELETE RESTRICT on those FKs; but a standalone
+    category with only its own attribute row goes away cleanly, and
+    SQLite removes the dependent attribute row as part of the cascade.
+    """
+    cash_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Cash",),
+    ).fetchone()["id"]
+    db.connection.execute(
+        "INSERT INTO category_attribute "
+        "(category_id, volatility_micros, adjustment_micros) VALUES (?, ?, ?)",
+        (cash_id, 0, 0),
+    )
+    db.connection.execute("DELETE FROM category WHERE id = ?", (cash_id,))
+    remaining = db.connection.execute(
+        "SELECT COUNT(*) AS n FROM category_attribute WHERE category_id = ?",
+        (cash_id,),
+    ).fetchone()["n"]
+    assert remaining == 0
 
 
 def test_mapping_unique_per_instrument_category(db: Database) -> None:

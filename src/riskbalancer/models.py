@@ -74,8 +74,13 @@ class CategoryTarget:
             raise ValueError("risk_weight must be non-negative")
         if self.volatility <= 0:
             raise ValueError("volatility must be positive")
-        if self.adjustment <= 0:
-            raise ValueError("adjustment must be positive")
+        # `adjustment == 0` is permitted for leaves like seed `Cash` that
+        # are catalogued but carry zero allocation: `risk_weight = weight *
+        # adjustment` is well-defined at zero, and the leaf still needs a
+        # `CategoryTarget` so the plan-index lookups (used by the portfolio
+        # walker) can find it by path.
+        if self.adjustment < 0:
+            raise ValueError("adjustment must be non-negative")
 
     @property
     def target_weight(self) -> float:

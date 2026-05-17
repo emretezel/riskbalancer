@@ -372,8 +372,64 @@ def _migration_1(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+# ---------------------------------------------------------------------------
+# Migration 2: split `category_attribute` from holding the seed's
+# parent-relative weight.
+#
+# Motivation: the column conflated two unrelated facts. For seed-known
+# categories it held the seed's reference weight; for user-invented
+# plan-leaves it held a placeholder `0`. The weighted-average code path
+# that consumed it could not produce a per-plan answer when different
+# plans weight a branch's children differently — there is no single
+# "true" weight for a child that is independent of the plan that owns it.
+# Plan weights now live exclusively on `plan_node`; this table is reduced
+# to the intrinsic per-category fundamentals (`volatility`, `adjustment`).
+#
+# Effects on existing rows:
+#   - Seed leaves had non-NULL vol/adj → carried forward unchanged.
+#   - Seed branches had NULL vol/adj → dropped (their parent-relative
+#     weight is no longer needed; nothing else on the row was meaningful).
+#   - User-only plan-leaves with weight=0 and non-NULL vol/adj are
+#     carried forward; the weight column simply disappears.
+#
+# No other table holds a foreign key into `category_attribute`, so the
+# DROP/RENAME pattern works with `PRAGMA foreign_keys = ON`.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_2_STATEMENTS: tuple[str, ...] = (
+    # New shape: vol/adj are intrinsic, both NOT NULL. Row existence
+    # encodes "this category has canonical fundamentals"; absence means
+    # the category cannot be a plan-leaf until the walker fills it in.
+    """
+    CREATE TABLE category_attribute_new (
+        category_id INTEGER PRIMARY KEY REFERENCES category(id) ON DELETE CASCADE,
+        volatility_micros INTEGER NOT NULL CHECK (volatility_micros >= 0),
+        adjustment_micros INTEGER NOT NULL CHECK (adjustment_micros >= 0)
+    ) STRICT
+    """,
+    # Carry forward only the rows that actually carry vol/adj. Seed branches
+    # had NULL on both and no longer have a reason to exist; the weighted-
+    # average code path that consumed their weight is gone.
+    """
+    INSERT INTO category_attribute_new (category_id, volatility_micros, adjustment_micros)
+    SELECT category_id, volatility_micros, adjustment_micros
+    FROM category_attribute
+    WHERE volatility_micros IS NOT NULL AND adjustment_micros IS NOT NULL
+    """,
+    "DROP TABLE category_attribute",
+    "ALTER TABLE category_attribute_new RENAME TO category_attribute",
+)
+
+
+def _migration_2(connection: sqlite3.Connection) -> None:
+    """Drop `weight_micros` from `category_attribute`; promote vol/adj to NOT NULL."""
+    for statement in _MIGRATION_2_STATEMENTS:
+        connection.execute(statement)
+
+
 MIGRATIONS: List[Migration] = [
     _migration_1,
+    _migration_2,
 ]
 
 

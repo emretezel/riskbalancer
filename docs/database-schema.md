@@ -150,27 +150,34 @@ different IDs. The schema deliberately supports this.
 
 ### 3.4 `category_attribute`
 
-Authoritative per-category attributes drawn from `config/seed_plan.yaml`.
-One row per seed-plan node — branches and leaves alike. **This is the
-single source of truth for a category's volatility and adjustment**;
-neither value is stored on `plan_node`. Used at report time as well as
-by the interactive plan walker.
+The single source of truth for a category's **intrinsic** volatility
+and adjustment. Both columns are NOT NULL; row existence means
+"this category has explicit canonical fundamentals and can serve as a
+plan-leaf for any user who adopts it". Categories without a row exist
+in `category` purely as structural nodes — a user who wants to hold
+such a category as a plan-leaf must supply explicit vol/adj at
+plan-creation time, which the walker upserts here. Plan weights live
+exclusively on `plan_node` and are not represented here.
 
 | Column | Type | Notes |
 |---|---|---|
-| `category_id` | `INTEGER PRIMARY KEY REFERENCES category(id) ON DELETE CASCADE` | One row per category, at most. |
-| `weight_micros` | `INTEGER NOT NULL` | `0 <= weight_micros <= 1_000_000`. The seed plan's parent-relative weight (siblings sum to 1.0 under their parent). Used to combine children when a plan terminates above a seed leaf. |
-| `volatility_micros` | `INTEGER NULL` | `NULL OR volatility_micros >= 0`. NULL on seed branches; set on seed leaves. |
-| `adjustment_micros` | `INTEGER NULL` | `NULL OR adjustment_micros >= 0`. NULL on seed branches; set on seed leaves. Not clamped to ≤1.0 — the seed's `Bonds / Developed / NAM / Inflation` has `1.35`. |
+| `category_id` | `INTEGER PRIMARY KEY REFERENCES category(id) ON DELETE CASCADE` | One row per category, at most. Cascade fires only when the bare `category` row is deleted, which is blocked by `RESTRICT` on `mapping` and `plan_node` first. |
+| `volatility_micros` | `INTEGER NOT NULL` | `volatility_micros >= 0`. Annualised volatility as a fraction of unit value, stored as parts-per-million. |
+| `adjustment_micros` | `INTEGER NOT NULL` | `adjustment_micros >= 0`. Multiplicative risk adjustment, parts-per-million. Not clamped to ≤1.0 — the seed's `Bonds / Developed / NAM / Inflation` has `1.35`. Zero is allowed (e.g. seed `Cash`); a category with `adjustment = 0` contributes zero risk weight regardless of its `plan_node.weight_micros`. |
 
-Table-level `CHECK ((volatility_micros IS NULL) = (adjustment_micros IS NULL))`
-keeps the two leaf-only columns in lockstep: a row is either a branch
-(both NULL) or a leaf (both set). When a user's plan treats a seed
-branch as a leaf — e.g. holding `Equities / EM` rather than splitting it
-into `Asia` / `Americas` / `EMEA` — the effective volatility and
-adjustment are computed at read time as the weight-weighted average of
-the branch's children, where weights come from each child's
-`weight_micros` here. This keeps a derived value out of the schema.
+**Branches do not appear here.** The seed loader writes a row only for
+seed leaves. A user's plan that terminates above a seed leaf — e.g.
+holding `Equities / EM` as a single plan-leaf rather than splitting it
+into Asia / Americas / EMEA — requires the walker to collect explicit
+vol/adj for `Equities / EM` and upsert a row for it. There is no
+derived-value path: no weighted average over children, no fallback to
+the seed's reference figures. Every plan-leaf names its own fundamentals.
+
+**Why this shape.** Plans differ in how they weight a branch's
+children, so deriving a branch's effective vol/adj from any single
+"seed" weighting would silently impose one plan's choices on another.
+Splitting weights (per-plan, in `plan_node`) from fundamentals
+(per-category, here) keeps both facts in exactly one place.
 
 ### 3.5 `source`
 
@@ -305,13 +312,15 @@ be a leaf in one user's plan and a branch in another's.
 
 `UNIQUE (user_id, parent_id, category_id)`.
 
-Volatility and adjustment are **not** stored here — they live on
-`category_attribute` (single source of truth). For a plan-leaf that
-sits on a seed-branch (e.g. a user holding `Equities / EM` as a leaf
-without splitting it further), the effective values are computed at
-read time as the weight-weighted average of the branch's children.
-See `repositories.compute_category_volatility` and
-`compute_category_adjustment`.
+`weight_micros` is **the sole source of plan weight** — at compute time
+no other table is consulted for the parent-relative weight of a user's
+plan node. Volatility and adjustment are not stored here; they live on
+`category_attribute` and are looked up per plan-leaf at read time. For
+a plan-leaf that sits above any seed leaf (e.g. a user holding
+`Equities / EM` as a leaf without splitting it further), the walker
+must have collected explicit vol/adj for that category and written a
+`category_attribute` row before the plan was persisted. There is no
+weighted-average derivation: every plan-leaf names its own fundamentals.
 
 Application-level invariant (enforced in `repositories.write_plan_tree`):
 sibling weights at every level sum to `1_000_000` (within the YAML
@@ -455,6 +464,10 @@ The resolver bridges the two trees:
    user — surface as a warning, do not silently drop the value.
 
 This is implemented in `repositories.resolve_category_to_plan_leaf`.
+Note that the resolver only re-targets a position to the user's
+plan-leaf; it does not borrow vol/adj from the mapping's deeper leaf.
+The plan-leaf's own `category_attribute` row supplies the
+fundamentals, as for any other leaf.
 
 Why this design:
 
@@ -483,3 +496,14 @@ Why this design:
 - **No "is_seed" flag on user or plan_node.** The seed plan is loaded
   into `category` + `category_attribute` only; it never appears as a
   fake "_seed" user.
+- **No derived vol/adj.** A category's volatility and adjustment are
+  either explicit in `category_attribute` or absent. There is no
+  weighted-average computation over children, no fallback to a parent's
+  fundamentals, no `default_leaf_volatility` baked into the schema.
+  Every plan-leaf names its own fundamentals; the walker collects them
+  at plan-creation time when no row exists yet.
+- **No plan-weight lookup outside `plan_node`.** Per-plan weights live
+  exclusively on `plan_node.weight_micros`. The seed plan's reference
+  weights are an input to plan creation (read directly from
+  `config/seed_plan.yaml` by the walker) and are not persisted in any
+  table.

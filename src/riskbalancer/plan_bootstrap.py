@@ -146,21 +146,20 @@ def _merge_seed_leaves_into_catalog(
 ) -> None:
     """Fill in volatility / adjustment suggestions from `category_attribute`.
 
-    Each row with non-NULL `volatility_micros` corresponds to a seed-plan
-    leaf. Walking the row's full path ensures the catalog has the
-    ancestor chain and the leaf node's suggestions are filled in
-    (without overwriting an earlier peer-derived value, since gap-fill
-    is the convention everywhere else in this module). Seed branches —
-    rows where vol/adj are NULL — are skipped here; the walker derives
-    branch-level suggestions from peer plans, not from the attribute
-    table.
+    Every `category_attribute` row corresponds to a category whose
+    intrinsic vol/adj is known — typically a seed leaf, but also any
+    category a user has already adopted as a plan-leaf. Walking the
+    row's full path ensures the catalog has the ancestor chain and the
+    leaf node's suggestions are filled in (without overwriting an earlier
+    peer-derived value, since gap-fill is the convention everywhere else
+    in this module). Branches in the seed plan have no row here; their
+    branch-level suggestions come from peer plans if at all.
     """
     rows = connection.execute(
         """
         SELECT ca.volatility_micros, ca.adjustment_micros, cp.path
         FROM category_attribute ca
         JOIN category_path cp ON cp.id = ca.category_id
-        WHERE ca.volatility_micros IS NOT NULL
         ORDER BY cp.path
         """
     ).fetchall()
@@ -168,10 +167,8 @@ def _merge_seed_leaves_into_catalog(
         path = tuple(part.strip() for part in str(row["path"]).split("/") if part.strip())
         if not path:
             continue
-        vol_raw = row["volatility_micros"]
-        adj_raw = row["adjustment_micros"]
-        vol = vol_raw / MICROS_SCALE if vol_raw is not None else None
-        adj = adj_raw / MICROS_SCALE if adj_raw is not None else None
+        vol = row["volatility_micros"] / MICROS_SCALE
+        adj = row["adjustment_micros"] / MICROS_SCALE
         cursor = catalog
         for index, segment in enumerate(path):
             is_leaf = index == len(path) - 1
@@ -184,7 +181,7 @@ def _merge_seed_leaves_into_catalog(
                 )
                 cursor.append(existing)
             elif is_leaf:
-                if existing.suggested_volatility is None and vol is not None:
+                if existing.suggested_volatility is None:
                     existing.suggested_volatility = vol
                 if existing.suggested_adjustment is None:
                     existing.suggested_adjustment = adj
@@ -900,11 +897,9 @@ def describe_catalog_sources_from_db(
     if peer_rows:
         names = [row["name"] for row in peer_rows]
         parts.append(f"{len(names)} peer plan(s): {', '.join(names)}")
-    seed_count = connection.execute(
-        "SELECT COUNT(*) AS n FROM category_attribute WHERE volatility_micros IS NOT NULL"
-    ).fetchone()["n"]
+    seed_count = connection.execute("SELECT COUNT(*) AS n FROM category_attribute").fetchone()["n"]
     if seed_count:
-        parts.append(f"{seed_count} seed leaf default(s)")
+        parts.append(f"{seed_count} category default(s)")
     mapping_count = connection.execute("SELECT COUNT(*) AS n FROM mapping").fetchone()["n"]
     if mapping_count:
         parts.append(f"{mapping_count} mapping row(s)")
