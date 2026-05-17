@@ -40,12 +40,10 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
 
 EXPECTED_INDEXES: frozenset[str] = frozenset(
     {
-        # idx_mapping_instrument lingers from migration 1; it is dropped in
-        # a later migration as redundant with the UNIQUE autoindex.
-        "idx_mapping_instrument",
-        # idx_position_instrument was retired by migration 3 — it had no
-        # caller in the codebase, so it was let die with the recreated
-        # `position` table rather than reinstated.
+        # idx_mapping_instrument was dropped in migration 4 as redundant
+        # with the UNIQUE autoindex; idx_position_instrument was retired
+        # in migration 3 as having no caller. Only the partial unique
+        # index on top-level category names remains.
         "idx_category_top_level_name",
     }
 )
@@ -830,6 +828,188 @@ def test_fresh_db_has_no_dangling_foreign_keys() -> None:
     db = Database.connect(":memory:")
     violations = db.connection.execute("PRAGMA foreign_key_check").fetchall()
     assert violations == []
+
+
+# ---------------------------------------------------------------------------
+# Migration 4 — cross-row invariant triggers, index drop, depth-capped view.
+# ---------------------------------------------------------------------------
+
+
+def test_idx_mapping_instrument_is_dropped(db: Database) -> None:
+    """Migration 4 drops the index — the UNIQUE autoindex covers the lookup."""
+    indexes = _names_of(db.connection, "index")
+    assert "idx_mapping_instrument" not in indexes
+
+
+def test_category_path_view_caps_recursion_depth(db: Database) -> None:
+    """The view's depth cap stops recursion after 32 levels.
+
+    Defence-in-depth: a chain longer than 32 levels (or, in a
+    malformed-data scenario the cycle triggers should already prevent,
+    a cycle the recursion could reach) would otherwise let the CTE
+    walk indefinitely. The cap surfaces a bounded result instead of
+    a hang.
+    """
+    parent_id: int | None = None
+    for i in range(40):
+        cursor = db.connection.execute(
+            "INSERT INTO category (parent_id, name) VALUES (?, ?) RETURNING id",
+            (parent_id, f"L{i}"),
+        ).fetchone()
+        parent_id = cursor["id"]
+    rows = db.connection.execute("SELECT id, path FROM category_path").fetchall()
+    # The cap holds the row count to exactly 32 (one per level kept).
+    assert len(rows) == 32
+    deepest = max(rows, key=lambda r: len(r["path"]))
+    # Path is `L0 / L1 / ... / L31` — 32 segments, 31 separators.
+    assert deepest["path"].count("/") == 31
+
+
+def test_category_cycle_trigger_blocks_multi_row_cycle(db: Database) -> None:
+    """The cycle trigger aborts a parent_id update that would close a cycle."""
+    a = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("A",),
+    ).fetchone()["id"]
+    b = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (?, ?) RETURNING id",
+        (a, "B"),
+    ).fetchone()["id"]
+    c = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (?, ?) RETURNING id",
+        (b, "C"),
+    ).fetchone()["id"]
+    # A → B → C is the current shape. Re-parenting A under C would make A
+    # its own grand-ancestor — the trigger must abort.
+    with pytest.raises(sqlite3.IntegrityError, match="cycle"):
+        db.connection.execute("UPDATE category SET parent_id = ? WHERE id = ?", (c, a))
+
+
+def test_plan_node_cycle_trigger_present(db: Database) -> None:
+    """`plan_node_no_cycle_update` is wired up.
+
+    A direct end-to-end demonstration is hard to construct because the
+    lineage trigger fires on the same UPDATE OF parent_id and would
+    typically abort first (a lineage-valid reparenting that also creates
+    a cycle is geometrically impossible in a tree that mirrors the
+    category structure). The trigger's body is identical in shape to
+    `category_no_cycle_update`, which IS exercised end-to-end above. So
+    we settle for confirming the trigger exists; if it ever disappears,
+    a future migration that loosens the lineage rule would reintroduce
+    the multi-row cycle risk.
+    """
+    names = _names_of(db.connection, "trigger")
+    assert "plan_node_no_cycle_update" in names
+
+
+def test_plan_node_parent_must_share_user(db: Database) -> None:
+    """Trigger aborts when a plan_node's parent belongs to a different user."""
+    user_id = _seed_minimal_user(db.connection)
+    db.connection.execute(
+        "INSERT INTO user (name, created_at) VALUES (?, ?)",
+        ("tani", "2026-05-17T00:00:00Z"),
+    )
+    other_user_id = db.connection.execute(
+        "SELECT id FROM user WHERE name = ?", ("tani",)
+    ).fetchone()["id"]
+    eq_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Equities",),
+    ).fetchone()["id"]
+    dev_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (?, ?) RETURNING id",
+        (eq_id, "Developed"),
+    ).fetchone()["id"]
+    parent = db.connection.execute(
+        "INSERT INTO plan_node (user_id, parent_id, category_id, weight_micros) "
+        "VALUES (?, NULL, ?, ?) RETURNING id",
+        (user_id, eq_id, 1_000_000),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError, match="same user"):
+        db.connection.execute(
+            "INSERT INTO plan_node (user_id, parent_id, category_id, weight_micros) "
+            "VALUES (?, ?, ?, ?)",
+            (other_user_id, parent, dev_id, 1_000_000),
+        )
+
+
+def test_plan_node_root_must_reference_root_category(db: Database) -> None:
+    """Trigger aborts when a top-level plan_node references a non-root category."""
+    user_id = _seed_minimal_user(db.connection)
+    eq_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Equities",),
+    ).fetchone()["id"]
+    dev_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (?, ?) RETURNING id",
+        (eq_id, "Developed"),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError, match="lineage"):
+        db.connection.execute(
+            "INSERT INTO plan_node (user_id, parent_id, category_id, weight_micros) "
+            "VALUES (?, NULL, ?, ?)",
+            (user_id, dev_id, 1_000_000),
+        )
+
+
+def test_plan_node_child_category_must_descend_from_parent(db: Database) -> None:
+    """Trigger aborts when child plan_node's category is not a child of parent's."""
+    user_id = _seed_minimal_user(db.connection)
+    eq_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Equities",),
+    ).fetchone()["id"]
+    bonds_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Bonds",),
+    ).fetchone()["id"]
+    dev_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (?, ?) RETURNING id",
+        (bonds_id, "Developed"),
+    ).fetchone()["id"]
+    eq_plan = db.connection.execute(
+        "INSERT INTO plan_node (user_id, parent_id, category_id, weight_micros) "
+        "VALUES (?, NULL, ?, ?) RETURNING id",
+        (user_id, eq_id, 1_000_000),
+    ).fetchone()["id"]
+    # Inserting a plan_node whose parent is the Equities plan node but
+    # whose category is `Bonds / Developed` is a lineage violation.
+    with pytest.raises(sqlite3.IntegrityError, match="lineage"):
+        db.connection.execute(
+            "INSERT INTO plan_node (user_id, parent_id, category_id, weight_micros) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, eq_plan, dev_id, 1_000_000),
+        )
+
+
+def test_position_instrument_source_must_match_account_source(db: Database) -> None:
+    """Trigger aborts when an IBKR instrument lands on an AJ Bell statement_import."""
+    user_id = _seed_minimal_user(db.connection)
+    ibkr_source_id = _source_id_for(db.connection, "ibkr")
+    ajbell_source_id = _source_id_for(db.connection, "ajbell")
+    ibkr_account_id = db.connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?) RETURNING id",
+        (user_id, ibkr_source_id, "taxable"),
+    ).fetchone()["id"]
+    ibkr_si_id = db.connection.execute(
+        "INSERT INTO statement_import "
+        "(account_id, as_of, statement_path, imported_at) "
+        "VALUES (?, ?, NULL, ?) RETURNING id",
+        (ibkr_account_id, "2026-05-17", "2026-05-17T12:00:00Z"),
+    ).fetchone()["id"]
+    # An AJ Bell-sourced instrument cannot attach to an IBKR statement.
+    ajbell_instr_id = db.connection.execute(
+        "INSERT INTO instrument (source_id, instrument_id_text) VALUES (?, ?) RETURNING id",
+        (ajbell_source_id, "SPAG"),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError, match="same broker"):
+        db.connection.execute(
+            "INSERT INTO position "
+            "(statement_import_id, instrument_id, "
+            "market_value_native_decithou, currency) "
+            "VALUES (?, ?, ?, ?)",
+            (ibkr_si_id, ajbell_instr_id, 100, "GBP"),
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -383,7 +383,6 @@ distributes it across categories on the fly.
 
 | Index | Columns | Purpose |
 |---|---|---|
-| `idx_mapping_instrument` | `mapping(instrument_id)` | Drives per-import mapping lookup — the resolver fetches every `mapping` row for one instrument at a time. (Slated for removal in a later migration: redundant with the `UNIQUE (instrument_id, category_id)` autoindex whose leading column already covers `WHERE instrument_id = ?`.) |
 | `idx_category_top_level_name` | `category(name) WHERE parent_id IS NULL` | Partial unique index that closes the gap left by `UNIQUE (parent_id, name)` when `parent_id IS NULL` — see §3.3. |
 
 `UNIQUE` constraints implicitly create indexes. The
@@ -396,15 +395,19 @@ unique index; per-user queries reach `statement_import` via
 `account.user_id`, covered by the leading column of the `account`
 unique.
 
-**Deliberately not present** (was migration 1, retired in migration 3):
+**Deliberately not present:**
 
-- `idx_position_instrument ON position(instrument_id)` — the
-  cross-import "every position ever held in EMIM" query the index was
-  meant to serve was never actually written, so the index is gone
-  pending a real caller. The `position` autoindex from
-  `UNIQUE (statement_import_id, instrument_id)` leads with
-  `statement_import_id`, so `WHERE instrument_id = ?` cannot use it;
-  the day that query appears, this index needs reinstating.
+- `idx_position_instrument ON position(instrument_id)` (retired in
+  migration 3) — the cross-import "every position ever held in EMIM"
+  query the index was meant to serve was never actually written. The
+  `position` autoindex from `UNIQUE (statement_import_id, instrument_id)`
+  leads with `statement_import_id`, so `WHERE instrument_id = ?` cannot
+  use it; the day that query appears, this index needs reinstating.
+- `idx_mapping_instrument ON mapping(instrument_id)` (retired in
+  migration 4) — verified redundant via `EXPLAIN QUERY PLAN`. The
+  autoindex SQLite generates for `UNIQUE (instrument_id, category_id)`
+  leads with `instrument_id` and services `WHERE instrument_id = ?`
+  lookups with the same plan, so the explicit index added no value.
 
 ---
 
@@ -431,7 +434,10 @@ the underlying schema normalised.
 A recursive CTE that materialises the full ` / `-joined path for every
 category. Used wherever we need to render or match a path string
 (seed loading, mapping lookups, interactive prompts). The recursion
-walks down from `parent_id IS NULL`.
+walks down from `parent_id IS NULL`. Migration 4 added a `depth < 32`
+guard to the CTE so a malformed parent chain (which the cycle triggers
+in §10 should already prevent) produces a bounded result instead of
+exhausting memory.
 
 ---
 
@@ -529,3 +535,53 @@ Why this design:
   and `position.quantity_micro_units` are constrained non-negative. A
   household portfolio tool has no business modelling shorts, and the
   asymmetry would propagate into the risk-weight math.
+
+---
+
+## 10. Triggers
+
+Triggers enforce cross-row invariants that CHECK constraints cannot
+express (CHECK only sees one row's values at a time). Every trigger is
+`BEFORE` and uses `RAISE(ABORT, …)` so a violation aborts the write
+rather than committing a broken graph.
+
+### 10.1 Mapping leaf invariant (migration 1)
+
+- **`mapping_target_must_be_leaf_insert`** — `BEFORE INSERT ON mapping`,
+  aborts when `NEW.category_id` has children in the global category
+  tree. See §3.8.
+- **`mapping_target_must_be_leaf_update`** — `BEFORE UPDATE OF category_id ON mapping`,
+  same check.
+
+### 10.2 Cycle prevention (migration 4)
+
+- **`category_no_cycle_update`** — `BEFORE UPDATE OF parent_id ON category`,
+  fires when `NEW.parent_id IS NOT NULL`. Walks ancestors via a
+  recursive CTE capped at depth 32; aborts if `NEW.id` appears in the
+  ancestor chain. The CHECK constraint `parent_id != id` (migration 3)
+  already blocks the trivial single-row case.
+- **`plan_node_no_cycle_update`** — same pattern on `plan_node`.
+- INSERT cannot create a cycle (the new row's id is not referenced
+  anywhere yet), so neither trigger fires on INSERT.
+
+### 10.3 plan_node parent invariants (migration 4)
+
+- **`plan_node_parent_same_user_insert` / `_update`** —
+  `NEW.parent_id` must reference a plan_node owned by `NEW.user_id`.
+  Without this guard a buggy write path could splice one user's plan
+  into another's.
+- **`plan_node_parent_category_lineage_insert` / `_update`** — the
+  plan tree mirrors the category tree's lineage: a root plan_node
+  (`parent_id IS NULL`) must reference a root category
+  (`category.parent_id IS NULL`); a non-root plan_node must reference
+  a category whose `parent_id` matches the parent plan_node's
+  `category_id`. `IS NOT` is used in place of `!=` because
+  `category.parent_id` is nullable and `NULL != X` evaluates to NULL.
+
+### 10.4 Position attribution (migration 4)
+
+- **`position_instrument_source_matches_insert` / `_update`** — a
+  position's `instrument.source_id` must equal the `account.source_id`
+  reached through `statement_import.account_id`. Catches the
+  worst-case mis-attribution where an IBKR instrument lands on an AJ
+  Bell statement_import.

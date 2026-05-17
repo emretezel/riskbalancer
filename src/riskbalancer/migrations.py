@@ -665,10 +665,213 @@ def _migration_3(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+# ---------------------------------------------------------------------------
+# Migration 4: cross-row invariant triggers, redundant-index cleanup, and a
+# depth-capped `category_path` view.
+#
+# Adds:
+#   - `category_no_cycle_update` / `plan_node_no_cycle_update`:
+#       BEFORE UPDATE OF parent_id triggers using a recursive CTE with a
+#       depth cap of 32 to detect multi-row cycles. The single-row case
+#       (parent_id = id) is already blocked by a CHECK from migration 3.
+#       INSERT cannot create a cycle (the new row's id is not referenced
+#       by anything yet), so these triggers fire on UPDATE only.
+#   - `plan_node_parent_same_user_*`:
+#       A plan_node's parent must belong to the same user_id as the
+#       node itself — otherwise a buggy write path could splice one
+#       user's plan into another's. Fires on INSERT and on UPDATE OF
+#       user_id, parent_id.
+#   - `plan_node_parent_category_lineage_*`:
+#       The plan tree mirrors the category tree's parent/child lineage:
+#       a root plan_node references a root category, and a non-root
+#       plan_node's category is a child (in the global category tree)
+#       of its parent plan_node's category. Fires on INSERT and on
+#       UPDATE OF parent_id, category_id.
+#   - `position_instrument_source_matches_*`:
+#       A position's instrument must come from the same broker (source)
+#       as the statement_import's account. Catches the worst-case
+#       mis-attribution where an IBKR instrument lands on an AJ Bell
+#       statement_import. Fires on INSERT and on UPDATE OF instrument_id,
+#       statement_import_id.
+#
+# Drops:
+#   - `idx_mapping_instrument`: redundant with the autoindex over
+#     `UNIQUE (instrument_id, category_id)` whose leading column already
+#     services `WHERE instrument_id = ?` lookups (verified via
+#     `EXPLAIN QUERY PLAN`). See CLAUDE.md "Avoid redundant indexes".
+#
+# Replaces:
+#   - `category_path`: same recursive structure, but the CTE carries an
+#     explicit `depth` column and caps recursion at 32 levels. If a
+#     malformed parent chain ever creates a cycle (the cycle triggers
+#     above are the primary guard, this is defence in depth), the view
+#     terminates rather than looping until SQLite exhausts memory.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_4_DROP_BEFORE: tuple[str, ...] = (
+    # idx_mapping_instrument first — the autoindex already covers the
+    # query pattern.
+    "DROP INDEX idx_mapping_instrument",
+    # Replace category_path with the depth-capped version. SQLite has no
+    # CREATE OR REPLACE VIEW, so drop+create.
+    "DROP VIEW category_path",
+)
+
+_MIGRATION_4_CREATE_VIEW: str = """
+CREATE VIEW category_path AS
+WITH RECURSIVE walk(id, parent_id, path, depth) AS (
+    SELECT id, parent_id, name, 1
+    FROM category
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT c.id, c.parent_id, walk.path || ' / ' || c.name, walk.depth + 1
+    FROM category c
+    JOIN walk ON c.parent_id = walk.id
+    WHERE walk.depth < 32
+)
+SELECT id, path FROM walk
+"""
+
+_MIGRATION_4_TRIGGERS: tuple[str, ...] = (
+    # ---- Cycle prevention ------------------------------------------------
+    """
+    CREATE TRIGGER category_no_cycle_update
+    BEFORE UPDATE OF parent_id ON category
+    FOR EACH ROW
+    WHEN NEW.parent_id IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'category parent_id would create a cycle')
+        WHERE EXISTS (
+            WITH RECURSIVE ancestors(id, depth) AS (
+                SELECT NEW.parent_id, 1
+                UNION ALL
+                SELECT c.parent_id, a.depth + 1
+                FROM category c
+                JOIN ancestors a ON c.id = a.id
+                WHERE c.parent_id IS NOT NULL AND a.depth < 32
+            )
+            SELECT 1 FROM ancestors WHERE id = NEW.id
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER plan_node_no_cycle_update
+    BEFORE UPDATE OF parent_id ON plan_node
+    FOR EACH ROW
+    WHEN NEW.parent_id IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_node parent_id would create a cycle')
+        WHERE EXISTS (
+            WITH RECURSIVE ancestors(id, depth) AS (
+                SELECT NEW.parent_id, 1
+                UNION ALL
+                SELECT pn.parent_id, a.depth + 1
+                FROM plan_node pn
+                JOIN ancestors a ON pn.id = a.id
+                WHERE pn.parent_id IS NOT NULL AND a.depth < 32
+            )
+            SELECT 1 FROM ancestors WHERE id = NEW.id
+        );
+    END
+    """,
+    # ---- plan_node parent must belong to same user ----------------------
+    """
+    CREATE TRIGGER plan_node_parent_same_user_insert
+    BEFORE INSERT ON plan_node
+    FOR EACH ROW
+    WHEN NEW.parent_id IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_node parent must belong to the same user')
+        WHERE NEW.user_id != (SELECT user_id FROM plan_node WHERE id = NEW.parent_id);
+    END
+    """,
+    """
+    CREATE TRIGGER plan_node_parent_same_user_update
+    BEFORE UPDATE OF user_id, parent_id ON plan_node
+    FOR EACH ROW
+    WHEN NEW.parent_id IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_node parent must belong to the same user')
+        WHERE NEW.user_id != (SELECT user_id FROM plan_node WHERE id = NEW.parent_id);
+    END
+    """,
+    # ---- plan_node category lineage mirrors category tree ---------------
+    # The two cases are combined into one WHERE so the trigger covers both
+    # root and non-root cases. `IS NOT` is used instead of `!=` because
+    # `category.parent_id` is nullable and `!=` against NULL is NULL (not
+    # TRUE), which would silently let mismatches through.
+    """
+    CREATE TRIGGER plan_node_parent_category_lineage_insert
+    BEFORE INSERT ON plan_node
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_node category lineage must mirror the category tree')
+        WHERE
+            (NEW.parent_id IS NULL
+                AND (SELECT parent_id FROM category WHERE id = NEW.category_id) IS NOT NULL)
+            OR (NEW.parent_id IS NOT NULL
+                AND (SELECT category_id FROM plan_node WHERE id = NEW.parent_id)
+                    IS NOT (SELECT parent_id FROM category WHERE id = NEW.category_id));
+    END
+    """,
+    """
+    CREATE TRIGGER plan_node_parent_category_lineage_update
+    BEFORE UPDATE OF parent_id, category_id ON plan_node
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_node category lineage must mirror the category tree')
+        WHERE
+            (NEW.parent_id IS NULL
+                AND (SELECT parent_id FROM category WHERE id = NEW.category_id) IS NOT NULL)
+            OR (NEW.parent_id IS NOT NULL
+                AND (SELECT category_id FROM plan_node WHERE id = NEW.parent_id)
+                    IS NOT (SELECT parent_id FROM category WHERE id = NEW.category_id));
+    END
+    """,
+    # ---- position instrument source must match account source -----------
+    """
+    CREATE TRIGGER position_instrument_source_matches_insert
+    BEFORE INSERT ON position
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'position instrument must come from the same broker as the statement')
+        WHERE (SELECT source_id FROM instrument WHERE id = NEW.instrument_id)
+            != (SELECT a.source_id
+                FROM statement_import si
+                JOIN account a ON a.id = si.account_id
+                WHERE si.id = NEW.statement_import_id);
+    END
+    """,
+    """
+    CREATE TRIGGER position_instrument_source_matches_update
+    BEFORE UPDATE OF instrument_id, statement_import_id ON position
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'position instrument must come from the same broker as the statement')
+        WHERE (SELECT source_id FROM instrument WHERE id = NEW.instrument_id)
+            != (SELECT a.source_id
+                FROM statement_import si
+                JOIN account a ON a.id = si.account_id
+                WHERE si.id = NEW.statement_import_id);
+    END
+    """,
+)
+
+
+def _migration_4(connection: sqlite3.Connection) -> None:
+    """Add cross-row triggers, drop the redundant mapping index, cap the path view."""
+    for statement in _MIGRATION_4_DROP_BEFORE:
+        connection.execute(statement)
+    connection.execute(_MIGRATION_4_CREATE_VIEW)
+    for statement in _MIGRATION_4_TRIGGERS:
+        connection.execute(statement)
+
+
 MIGRATIONS: List[Migration] = [
     Migration(_migration_1),
     Migration(_migration_2),
     Migration(_migration_3, requires_fk_off=True),
+    Migration(_migration_4),
 ]
 
 
