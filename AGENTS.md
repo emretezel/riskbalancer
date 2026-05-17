@@ -181,10 +181,90 @@ Persistence rules:
   changes, update `docs/architecture.md` (or the relevant doc) in the same
   commit and consider whether a one-shot migration of existing local files is
   needed.
-- **If a real database is ever introduced**, replace this section with the
-  full schema design rules (single source of truth, normalisation,
-  FK/UNIQUE/CHECK constraints, indexed query patterns, etc.) before any
-  persistence code is written against it.
+
+---
+
+## Database and SQL Design
+
+This section is **conditional** — it applies only if and when the project adopts a
+relational database. Until then, the file-based persistence rules above are the
+authoritative guide. When a database is introduced, this section becomes binding
+*before* any persistence code is written against it.
+
+### Schema Design Principles
+
+- **Single source of truth.** Every fact lives in exactly one place. Never
+  replicate a value across tables to avoid a join.
+- **One table, one thing.** A table models exactly one entity, event, or
+  relationship. Mixing concerns is a design smell.
+- **Normalise to at least 3NF by default.** Deviate only when a clear, justified
+  performance need exists — and document the deviation explicitly.
+- **Primary keys: meaningful and minimal.** Prefer natural keys when they are
+  genuinely stable and unique; use surrogate keys only when no natural key exists
+  or the natural key is composite and unwieldy.
+- **Always declare foreign keys.** Referential integrity is enforced at the schema
+  level, not in application code. Ensure SQLite is opened with
+  `PRAGMA foreign_keys = ON` so the constraints are actually enforced.
+- **Always declare `UNIQUE` constraints** on every column or combination that is
+  semantically unique, regardless of whether it is also the primary key.
+- **Default to `NOT NULL`.** A column is nullable only when the absence of a value
+  is a meaningful, valid state.
+- **Use the most precise data type** that correctly represents the domain
+  (`DATE` / ISO-8601 `TEXT` for dates, integer minor units or `NUMERIC` affinity
+  for money and prices — never `REAL`/floating point for monetary or price values,
+  since floating-point error is unacceptable for money).
+- **No magic values.** Never use sentinel values (`0`, `-1`, `"N/A"`) to represent
+  absence or special states — use `NULL` or a proper status column with a `CHECK`
+  constraint.
+- **`CHECK` constraints encode invariants.** Domain rules (e.g. `quantity > 0`,
+  `side IN ('BUY','SELL')`, valid enum values, currency code length) must be
+  `CHECK` constraints so the database enforces them.
+
+### Indexes
+
+- **Add indexes after the schema is correct.** Never let a performance desire
+  drive a denormalisation decision.
+- **Justify each index:** name the query pattern it serves.
+- **Avoid redundant indexes** (e.g. an index whose leading columns are already
+  covered by another).
+- **Use views** to pre-compose common joins or projections without duplicating
+  data.
+
+### Schema Evolution
+
+Whenever features are added or code is refactored, re-evaluate the schema. If the
+design can be improved, plan and apply the necessary migrations — do not silently
+preserve a bad design because it already exists. Migrations for this project will
+live in `src/riskbalancer/migrations.py`; add new migrations there in order, and
+call out any impact on `private/riskbalancer.db`.
+
+### SQL Style
+
+- Write correct SQL first; optimise second.
+- **Never use `SELECT *`** in production code — name every column explicitly.
+- Do not repeat logic that belongs in the schema (e.g. filtering soft-deleted
+  rows in every query instead of defining a view).
+- Check whether each important query can use an index efficiently; use
+  `EXPLAIN QUERY PLAN` for non-trivial queries.
+
+### Review Expectations
+
+Flag — and propose corrections for — any schema that:
+
+- Duplicates a fact or violates normal form without justification
+- Uses an imprecise data type (especially `REAL`/floating point for money or
+  prices)
+- Omits a constraint that should exist (`NOT NULL`, `UNIQUE`, `FOREIGN KEY`,
+  `CHECK`)
+- Conflates multiple entities in one table
+- Uses magic values instead of proper nullability or `CHECK` constraints
+
+When proposing schema changes, always include:
+
+- Recommended schema with all constraints stated explicitly
+- Normalisation rationale (target normal form and why)
+- Index recommendations with the query patterns they serve
+- Justification for any deliberate deviation from normal form
 
 ---
 
