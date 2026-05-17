@@ -97,7 +97,6 @@ class Investment:
     market_value: float
     category: CategoryPath
     volatility: float
-    quantity: Optional[float] = None
     source: str = "unknown"
     # `adapter` and `account` together identify the brokerage account that
     # produced this position. They are absent on manual entries.

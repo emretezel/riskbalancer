@@ -715,34 +715,6 @@ def test_instrument_description_must_be_null_or_trimmed_non_empty(db: Database) 
     )
 
 
-def test_position_quantity_must_be_non_negative(db: Database) -> None:
-    """`position.quantity_micro_units >= 0` enforces the long-only model."""
-    user_id = _seed_minimal_user(db.connection)
-    source_id = _source_id_for(db.connection, "ibkr")
-    account_id = db.connection.execute(
-        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?) RETURNING id",
-        (user_id, source_id, "taxable"),
-    ).fetchone()["id"]
-    statement_import_id = db.connection.execute(
-        "INSERT INTO statement_import "
-        "(account_id, as_of, statement_path, imported_at) "
-        "VALUES (?, ?, NULL, ?) RETURNING id",
-        (account_id, "2026-05-17", "2026-05-17T12:00:00Z"),
-    ).fetchone()["id"]
-    instrument_id = db.connection.execute(
-        "INSERT INTO instrument (source_id, instrument_id_text) VALUES (?, ?) RETURNING id",
-        (source_id, "EMIM"),
-    ).fetchone()["id"]
-    with pytest.raises(sqlite3.IntegrityError):
-        db.connection.execute(
-            "INSERT INTO position "
-            "(statement_import_id, instrument_id, quantity_micro_units, "
-            "market_value_native_decithou, currency) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (statement_import_id, instrument_id, -1, 100, "USD"),
-        )
-
-
 def test_position_currency_must_be_uppercase(db: Database) -> None:
     """`position.currency = upper(currency)` blocks lowercase or mixed-case."""
     user_id = _seed_minimal_user(db.connection)

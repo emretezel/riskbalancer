@@ -94,7 +94,6 @@ def test_aegon_adapter_parses_and_skips_total():
     # Fund name with spaces and parentheses must round-trip verbatim.
     assert world.description == "AGN BLK World (ex UK) Eq Idx (BLK)"
     assert world.market_value == 20000.00
-    assert world.quantity == 10000.0
     assert world.source == "aegon"
     assert world.volatility == 0.18
     assert world.category.levels()[0] == "Uncategorized"

@@ -64,9 +64,6 @@ class Migration:
 #   `INTEGER` parts-per-million (suffix `_micros`). 0.55 is 550000; 1.0 is
 #   1_000_000. We never store fractions as REAL.
 #
-# - Quantities (number of units of a holding) are stored as `INTEGER` micro-
-#   units, allowing fractional shares to six decimal places.
-#
 # - Dates use ISO-8601 `TEXT` (`YYYY-MM-DD`) with a GLOB CHECK so the
 #   database rejects malformed inputs at write time.
 #
@@ -876,11 +873,71 @@ def _migration_4(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+# ---------------------------------------------------------------------------
+# Migration 5: drop `position.quantity_micro_units`.
+#
+# Motivation: the column was preserved-but-unused metadata. Adapters parsed
+# it from broker statements and the application round-tripped it through
+# `Investment` objects and `portfolio.json`, but nothing actually consumed
+# it — risk-parity, FX conversion, and reporting all operate on
+# `market_value_native_decithou` alone. Per CLAUDE.md ("Don't add features
+# beyond what the task requires"), the column and the application-layer
+# `Investment.quantity` field are removed together. A future need
+# (dividends, splits, transaction matching, reconciliation against the
+# broker statement) can reintroduce both with a clear use case.
+#
+# `position` is currently a write-once-via-migration table — no
+# application code reads or writes it (the codebase still uses
+# `portfolio.json` for positions). The column drop is therefore safe even
+# on a populated DB: any existing rows remain valid after the drop.
+#
+# SQLite >= 3.35 supports `ALTER TABLE ... DROP COLUMN` directly, so we
+# avoid the full table-recreate pattern. `db._require_modern_sqlite`
+# already gates the connection at SQLite >= 3.37. `current_position`
+# SELECTs the column and would otherwise be left in a broken state
+# (SQLite errors at next query, not at the drop), so we explicitly drop
+# and recreate the view around the column drop. The
+# `position_instrument_source_matches_*` triggers do not reference the
+# column and survive `ALTER TABLE` untouched.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_5_STATEMENTS: tuple[str, ...] = (
+    # Drop `current_position` first — it SELECTs `p.quantity_micro_units`.
+    "DROP VIEW current_position",
+    "ALTER TABLE position DROP COLUMN quantity_micro_units",
+    # Recreate `current_position` without the column. Same shape and
+    # column ordering as before, minus `quantity_micro_units`.
+    """
+    CREATE VIEW current_position AS
+    SELECT
+        p.id AS id,
+        p.statement_import_id AS statement_import_id,
+        p.instrument_id AS instrument_id,
+        p.description AS description,
+        p.market_value_native_decithou AS market_value_native_decithou,
+        p.currency AS currency,
+        a.user_id AS user_id,
+        ci.account_id AS account_id,
+        ci.as_of AS as_of
+    FROM position p
+    JOIN current_import ci ON ci.id = p.statement_import_id
+    JOIN account a ON a.id = ci.account_id
+    """,
+)
+
+
+def _migration_5(connection: sqlite3.Connection) -> None:
+    """Drop `position.quantity_micro_units` and refresh `current_position`."""
+    for statement in _MIGRATION_5_STATEMENTS:
+        connection.execute(statement)
+
+
 MIGRATIONS: List[Migration] = [
     Migration(_migration_1),
     Migration(_migration_2),
     Migration(_migration_3, requires_fk_off=True),
     Migration(_migration_4),
+    Migration(_migration_5),
 ]
 
 

@@ -72,13 +72,10 @@ class AegonCSVAdapter(StatementAdapter):
         if market_value == 0:
             return None
 
-        quantity_value = self._parse_optional_number(row.get("Units"))
-
         return Investment(
             instrument_id=name,
             description=name,
             market_value=market_value,
-            quantity=quantity_value,
             category=self.default_category,
             volatility=self.default_volatility,
             source="aegon",
@@ -91,9 +88,3 @@ class AegonCSVAdapter(StatementAdapter):
         if not sanitized:
             return 0.0
         return float(sanitized)
-
-    @classmethod
-    def _parse_optional_number(cls, value: Optional[str]) -> Optional[float]:
-        if value is None or not value.strip():
-            return None
-        return cls._parse_number(value)

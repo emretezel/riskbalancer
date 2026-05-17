@@ -52,7 +52,6 @@ class AJBellCSVAdapter(StatementAdapter):
         name = row.get("Investment")
         value_raw = self._get_first(row, ["Value (£)", "Value (Â£)", "Value (£ )", "Value"])
         ticker = row.get("Ticker") or row.get("Symbol")
-        quantity = row.get("Quantity")
         if not name or not value_raw:
             return None
 
@@ -60,17 +59,12 @@ class AJBellCSVAdapter(StatementAdapter):
         if market_value == 0:
             return None
 
-        resolved_category = self.default_category
-        volatility = self.default_volatility
-        quantity_value = self._parse_optional_number(quantity)
-
         return Investment(
             instrument_id=ticker or name,
             description=name,
             market_value=market_value,
-            quantity=quantity_value,
-            category=resolved_category,
-            volatility=volatility,
+            category=self.default_category,
+            volatility=self.default_volatility,
             source="aj_bell",
         )
 
@@ -81,12 +75,6 @@ class AJBellCSVAdapter(StatementAdapter):
         if not sanitized:
             return 0.0
         return float(sanitized)
-
-    @classmethod
-    def _parse_optional_number(cls, value: Optional[str]) -> Optional[float]:
-        if value is None or not value.strip():
-            return None
-        return cls._parse_number(value)
 
     @staticmethod
     def _get_first(row: Mapping[str, str], keys: Sequence[str]) -> Optional[str]:

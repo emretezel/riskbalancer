@@ -552,8 +552,6 @@ def investment_to_dict(investment: Investment) -> Dict[str, object]:
         "volatility": investment.volatility,
         "source": investment.source,
     }
-    if investment.quantity is not None:
-        payload["quantity"] = investment.quantity
     if investment.adapter is not None:
         payload["adapter"] = investment.adapter
     if investment.account is not None:
@@ -571,12 +569,6 @@ def _coerce_float(value: object, *, field_name: str) -> float:
     if isinstance(value, (int, float, str)):
         return float(value)
     raise ValueError(f"{field_name} must be numeric")
-
-
-def _coerce_optional_float(value: object, *, field_name: str) -> Optional[float]:
-    if value is None:
-        return None
-    return _coerce_float(value, field_name=field_name)
 
 
 def import_record_to_dict(record: ImportRecord) -> Dict[str, str]:
@@ -680,7 +672,6 @@ def investment_from_dict(payload: Mapping[str, object]) -> Investment:
         market_value=_coerce_float(payload.get("market_value", 0.0), field_name="market_value"),
         category=_parse_category_label(category_label),
         volatility=_coerce_float(payload.get("volatility", 0.0), field_name="volatility") or 0.0001,
-        quantity=_coerce_optional_float(payload.get("quantity"), field_name="quantity"),
         source=str(payload.get("source", "portfolio")),
         adapter=cast(Optional[str], adapter_value),
         account=cast(Optional[str], account_value),
@@ -995,15 +986,11 @@ def apply_mappings_to_investments(
         normalized_allocations = mapping.normalized_allocations()
         for allocation in normalized_allocations:
             value = investment.market_value * allocation.weight
-            quantity = (
-                investment.quantity * allocation.weight if investment.quantity is not None else None
-            )
             expanded.append(
                 Investment(
                     instrument_id=investment.instrument_id,
                     description=investment.description,
                     market_value=value,
-                    quantity=quantity,
                     category=allocation.path,
                     volatility=mapping.volatility or investment.volatility,
                     source=investment.source,

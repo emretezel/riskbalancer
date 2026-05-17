@@ -7,7 +7,7 @@ Author: Emre Tezel
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Sequence
 
 from .models import (
     CategoryPath,
@@ -80,13 +80,11 @@ class Portfolio:
         market_value: float,
         category: CategoryPath,
         volatility: float,
-        quantity: Optional[float] = None,
     ) -> Investment:
         investment = Investment(
             instrument_id=instrument_id,
             description=description,
             market_value=market_value,
-            quantity=quantity,
             category=category,
             volatility=volatility,
             source="manual",

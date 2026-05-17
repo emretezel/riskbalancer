@@ -49,18 +49,7 @@ parts-per-million (suffix `_micros`). `0.55` is `550000`; `1.0` is
 `0.62 + 0.05 + 0.13 + 0.2` round-trips to exactly `1_000_000`, not
 `999_999`.
 
-### 2.3 Quantities
-
-Number-of-units holdings (e.g. fractional shares) are stored as `INTEGER`
-micro-units (×1e6). `NULL` is allowed — adapters that don't report
-quantity (broker statements that only give value) leave it null. The
-project is **long-only by design**: a non-NULL `quantity_micro_units`
-is non-negative, and `market_value_native_decithou` is non-negative.
-A short position would need both columns to admit negative values and
-the FX / risk math to handle the sign; that complexity is out of scope
-for a household portfolio tool. See §3.12 and §8.
-
-### 2.4 Dates and timestamps
+### 2.3 Dates and timestamps
 
 | Kind | Format | CHECK pattern |
 |---|---|---|
@@ -75,7 +64,7 @@ Note: SQLite `GLOB` uses `?` for single-char and `*` for many-char.
 `_` is **literal** in GLOB (it is the single-char wildcard in `LIKE`,
 not here). Patterns above use `?`.
 
-### 2.5 Currency codes
+### 2.4 Currency codes
 
 3-letter uppercase `TEXT` enforced by
 `CHECK (length(currency) = 3 AND currency = upper(currency))` on every
@@ -83,13 +72,13 @@ column that carries a currency. The uppercase guard exists so a
 casing-only drift between writer and reader never silently breaks a
 join against `fx_rate`.
 
-### 2.6 Strict mode
+### 2.5 Strict mode
 
 Every table is declared `STRICT`, so the type listed on each column is
 actually enforced. Stuffing a string into an `INTEGER` column raises at
 write time — type affinity is off.
 
-### 2.7 No magic values
+### 2.6 No magic values
 
 Per CLAUDE.md, missing values are `NULL` and meaningful states are
 encoded by proper columns, never by sentinels like `0`, `-1`, or `"N/A"`.
@@ -367,7 +356,6 @@ authoritative history, so no per-import FX snapshot is needed.
 | `statement_import_id` | `INTEGER NOT NULL REFERENCES statement_import(id) ON DELETE CASCADE` | |
 | `instrument_id` | `INTEGER NOT NULL REFERENCES instrument(id) ON DELETE RESTRICT` | |
 | `description` | `TEXT NULL` | Free-form, taken from the statement. `NULL` or a trimmed non-empty string; the empty string is rejected. |
-| `quantity_micro_units` | `INTEGER NULL` | `NULL` when the broker doesn't report it; otherwise non-negative (the project is long-only; see §1). |
 | `market_value_native_decithou` | `INTEGER NOT NULL` | `>= 0`. In the position's `currency`. Zero is allowed (e.g. an option that expired worthless but is still on the statement); negative would mean a short position, which the long-only model excludes. |
 | `currency` | `TEXT NOT NULL` | `length(currency) = 3 AND currency = upper(currency)`. |
 
@@ -531,10 +519,10 @@ Why this design:
   weights are an input to plan creation (read directly from
   `config/seed_plan.yaml` by the walker) and are not persisted in any
   table.
-- **No short positions.** Both `position.market_value_native_decithou`
-  and `position.quantity_micro_units` are constrained non-negative. A
-  household portfolio tool has no business modelling shorts, and the
-  asymmetry would propagate into the risk-weight math.
+- **No short positions.** `position.market_value_native_decithou` is
+  constrained non-negative. A household portfolio tool has no business
+  modelling shorts, and the asymmetry would propagate into the
+  risk-weight math.
 
 ---
 

@@ -317,7 +317,6 @@ def test_investment_serialization_round_trip_preserves_account_provenance():
         instrument_id="ETF",
         description="Global ETF",
         market_value=1000.0,
-        quantity=10.0,
         category=CategoryPath("Equities", "Developed", "NAM"),
         volatility=0.2,
         source="aj_bell",
@@ -329,7 +328,6 @@ def test_investment_serialization_round_trip_preserves_account_provenance():
     assert restored.instrument_id == investment.instrument_id
     assert restored.market_value == investment.market_value
     assert restored.category.levels() == investment.category.levels()
-    assert restored.quantity == 10.0
     assert restored.adapter == "ajbell"
     assert restored.account == "sipp"
 
