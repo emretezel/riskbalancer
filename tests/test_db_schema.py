@@ -40,8 +40,12 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
 
 EXPECTED_INDEXES: frozenset[str] = frozenset(
     {
+        # idx_mapping_instrument lingers from migration 1; it is dropped in
+        # a later migration as redundant with the UNIQUE autoindex.
         "idx_mapping_instrument",
-        "idx_position_instrument",
+        # idx_position_instrument was retired by migration 3 — it had no
+        # caller in the codebase, so it was let die with the recreated
+        # `position` table rather than reinstated.
         "idx_category_top_level_name",
     }
 )
@@ -618,6 +622,258 @@ def test_category_path_view_resolves_hierarchy(db: Database) -> None:
         "SELECT path FROM category_path WHERE id = ?", (govt_id,)
     ).fetchone()
     assert row["path"] == "Bonds / Developed / NAM / Govt"
+
+
+# ---------------------------------------------------------------------------
+# Migration 3 — defence-in-depth CHECK constraints across recreated tables.
+# ---------------------------------------------------------------------------
+
+
+def test_category_parent_id_rejects_self_reference(db: Database) -> None:
+    """`category.parent_id != id` blocks the trivial single-row cycle."""
+    db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?)",
+        ("Equities",),
+    )
+    cat_id = db.connection.execute(
+        "SELECT id FROM category WHERE name = ?", ("Equities",)
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute("UPDATE category SET parent_id = ? WHERE id = ?", (cat_id, cat_id))
+
+
+def test_category_name_must_be_trimmed(db: Database) -> None:
+    """`category.name = trim(name)` blocks space-padded names.
+
+    SQLite's `trim()` (no second argument) strips only ASCII spaces, so
+    the schema-level guard targets the realistic copy-paste case where a
+    name arrives with leading or trailing spaces. Tabs and other
+    whitespace are caught by the application's `.strip()` before they
+    reach the database.
+    """
+    for bad_name in (" Equities", "Equities ", "  Equities  "):
+        with pytest.raises(sqlite3.IntegrityError):
+            db.connection.execute(
+                "INSERT INTO category (parent_id, name) VALUES (NULL, ?)",
+                (bad_name,),
+            )
+
+
+def test_account_name_must_be_trimmed(db: Database) -> None:
+    """`account.name = trim(name)` blocks leading/trailing whitespace."""
+    user_id = _seed_minimal_user(db.connection)
+    source_id = _source_id_for(db.connection, "ibkr")
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?)",
+            (user_id, source_id, " taxable"),
+        )
+
+
+def test_instrument_description_must_be_null_or_trimmed_non_empty(db: Database) -> None:
+    """`instrument.description` is NULL or a trimmed non-empty string."""
+    source_id = _source_id_for(db.connection, "ibkr")
+    # Empty string is rejected (use NULL for "no description").
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO instrument (source_id, instrument_id_text, description) VALUES (?, ?, ?)",
+            (source_id, "EMIM", ""),
+        )
+    # Leading whitespace is rejected.
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO instrument (source_id, instrument_id_text, description) VALUES (?, ?, ?)",
+            (source_id, "EMIM", "  iShares EM"),
+        )
+    # NULL is accepted.
+    db.connection.execute(
+        "INSERT INTO instrument (source_id, instrument_id_text, description) VALUES (?, ?, NULL)",
+        (source_id, "EMIM"),
+    )
+
+
+def test_position_quantity_must_be_non_negative(db: Database) -> None:
+    """`position.quantity_micro_units >= 0` enforces the long-only model."""
+    user_id = _seed_minimal_user(db.connection)
+    source_id = _source_id_for(db.connection, "ibkr")
+    account_id = db.connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?) RETURNING id",
+        (user_id, source_id, "taxable"),
+    ).fetchone()["id"]
+    statement_import_id = db.connection.execute(
+        "INSERT INTO statement_import "
+        "(account_id, as_of, statement_path, imported_at) "
+        "VALUES (?, ?, NULL, ?) RETURNING id",
+        (account_id, "2026-05-17", "2026-05-17T12:00:00Z"),
+    ).fetchone()["id"]
+    instrument_id = db.connection.execute(
+        "INSERT INTO instrument (source_id, instrument_id_text) VALUES (?, ?) RETURNING id",
+        (source_id, "EMIM"),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO position "
+            "(statement_import_id, instrument_id, quantity_micro_units, "
+            "market_value_native_decithou, currency) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (statement_import_id, instrument_id, -1, 100, "USD"),
+        )
+
+
+def test_position_currency_must_be_uppercase(db: Database) -> None:
+    """`position.currency = upper(currency)` blocks lowercase or mixed-case."""
+    user_id = _seed_minimal_user(db.connection)
+    source_id = _source_id_for(db.connection, "ibkr")
+    account_id = db.connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?) RETURNING id",
+        (user_id, source_id, "taxable"),
+    ).fetchone()["id"]
+    statement_import_id = db.connection.execute(
+        "INSERT INTO statement_import "
+        "(account_id, as_of, statement_path, imported_at) "
+        "VALUES (?, ?, NULL, ?) RETURNING id",
+        (account_id, "2026-05-17", "2026-05-17T12:00:00Z"),
+    ).fetchone()["id"]
+    instrument_id = db.connection.execute(
+        "INSERT INTO instrument (source_id, instrument_id_text) VALUES (?, ?) RETURNING id",
+        (source_id, "EMIM"),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO position "
+            "(statement_import_id, instrument_id, "
+            "market_value_native_decithou, currency) "
+            "VALUES (?, ?, ?, ?)",
+            (statement_import_id, instrument_id, 100, "usd"),
+        )
+
+
+def test_position_description_must_be_null_or_trimmed_non_empty(db: Database) -> None:
+    """`position.description` is NULL or a trimmed non-empty string."""
+    user_id = _seed_minimal_user(db.connection)
+    source_id = _source_id_for(db.connection, "ibkr")
+    account_id = db.connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?) RETURNING id",
+        (user_id, source_id, "taxable"),
+    ).fetchone()["id"]
+    statement_import_id = db.connection.execute(
+        "INSERT INTO statement_import "
+        "(account_id, as_of, statement_path, imported_at) "
+        "VALUES (?, ?, NULL, ?) RETURNING id",
+        (account_id, "2026-05-17", "2026-05-17T12:00:00Z"),
+    ).fetchone()["id"]
+    instrument_id = db.connection.execute(
+        "INSERT INTO instrument (source_id, instrument_id_text) VALUES (?, ?) RETURNING id",
+        (source_id, "EMIM"),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO position "
+            "(statement_import_id, instrument_id, description, "
+            "market_value_native_decithou, currency) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (statement_import_id, instrument_id, "", 100, "USD"),
+        )
+
+
+def test_statement_import_path_must_be_null_or_trimmed_non_empty(db: Database) -> None:
+    """`statement_import.statement_path` rejects `""` and untrimmed strings."""
+    user_id = _seed_minimal_user(db.connection)
+    source_id = _source_id_for(db.connection, "ibkr")
+    account_id = db.connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?) RETURNING id",
+        (user_id, source_id, "taxable"),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO statement_import "
+            "(account_id, as_of, statement_path, imported_at) "
+            "VALUES (?, ?, ?, ?)",
+            (account_id, "2026-05-17", "", "2026-05-17T12:00:00Z"),
+        )
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO statement_import "
+            "(account_id, as_of, statement_path, imported_at) "
+            "VALUES (?, ?, ?, ?)",
+            (account_id, "2026-05-17", "  /tmp/foo.csv", "2026-05-17T12:00:00Z"),
+        )
+
+
+def test_fx_rate_currency_must_be_uppercase(db: Database) -> None:
+    """`fx_rate.currency = upper(currency)` blocks lowercase or mixed-case."""
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute(
+            "INSERT INTO fx_rate (rate_date, currency, gbp_rate_micros) VALUES (?, ?, ?)",
+            ("2026-05-17", "usd", 760_000),
+        )
+
+
+def test_plan_node_parent_id_rejects_self_reference(db: Database) -> None:
+    """`plan_node.parent_id != id` blocks the trivial single-row cycle."""
+    user_id = _seed_minimal_user(db.connection)
+    cat_id = db.connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
+        ("Equities",),
+    ).fetchone()["id"]
+    plan_id = db.connection.execute(
+        "INSERT INTO plan_node (user_id, parent_id, category_id, weight_micros) "
+        "VALUES (?, NULL, ?, ?) RETURNING id",
+        (user_id, cat_id, 1_000_000),
+    ).fetchone()["id"]
+    with pytest.raises(sqlite3.IntegrityError):
+        db.connection.execute("UPDATE plan_node SET parent_id = ? WHERE id = ?", (plan_id, plan_id))
+
+
+def test_fresh_db_has_no_dangling_foreign_keys() -> None:
+    """`PRAGMA foreign_key_check` is clean after every migration applies."""
+    db = Database.connect(":memory:")
+    violations = db.connection.execute("PRAGMA foreign_key_check").fetchall()
+    assert violations == []
+
+
+# ---------------------------------------------------------------------------
+# Migration runner — FK-off envelope correctness.
+# ---------------------------------------------------------------------------
+
+
+def test_runner_restores_foreign_keys_after_fk_off_migration() -> None:
+    """After every migration applies, FK enforcement is back on.
+
+    Migration 3 turns FK off internally to allow the table-recreate
+    pattern; this test pins the post-condition that the runner restores
+    it before returning, regardless of which migrations ran.
+    """
+    db = Database.connect(":memory:")
+    assert db.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_runner_restores_foreign_keys_when_migration_body_fails() -> None:
+    """A failure inside an FK-off migration still restores FK to ON.
+
+    The runner's `finally` clause is the only barrier between a midway
+    failure and a connection that escapes with FK silently off. This
+    test wires a deliberately-broken migration into the list and asserts
+    the post-condition.
+    """
+    from riskbalancer.migrations import MIGRATIONS, Migration, apply_migrations
+
+    def _doomed_migration(conn: sqlite3.Connection) -> None:
+        conn.execute("CREATE TABLE _x (id INTEGER PRIMARY KEY)")
+        raise RuntimeError("forced failure")
+
+    # Bring up a fresh DB at the current head, then sabotage by appending
+    # a doomed migration that needs FK off. The runner should propagate
+    # the failure but still restore FK to ON.
+    db = Database.connect(":memory:")
+    original = list(MIGRATIONS)
+    MIGRATIONS.append(Migration(_doomed_migration, requires_fk_off=True))
+    try:
+        with pytest.raises(RuntimeError, match="forced failure"):
+            apply_migrations(db.connection)
+    finally:
+        MIGRATIONS[:] = original
+    assert db.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
 def _seed_minimal_user(connection: sqlite3.Connection) -> int:

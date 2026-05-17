@@ -16,6 +16,7 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, List
 
@@ -23,7 +24,26 @@ from typing import Callable, List
 # version order: index `i` is version `i + 1`. The runner reads
 # `PRAGMA user_version` to find where to resume and refuses to start if the
 # DB is newer than this binary knows about (downgrade protection).
-Migration = Callable[[sqlite3.Connection], None]
+#
+# `requires_fk_off=True` is for migrations that need the SQLite table-recreate
+# pattern (drop a table that has incoming FK references). FK enforcement is
+# toggled around the whole migration — the toggle has to happen outside any
+# transaction because `PRAGMA foreign_keys` is a no-op inside one. After the
+# body runs, the runner issues `PRAGMA foreign_key_check` to catch any
+# dangling references the recreate may have left behind.
+
+
+@dataclass(frozen=True)
+class Migration:
+    """One numbered DDL step plus the runtime knobs it needs.
+
+    `func` receives an already-open `sqlite3.Connection` and applies the
+    DDL for one schema version. `requires_fk_off` opts the migration into
+    the FK-off envelope described above.
+    """
+
+    func: Callable[[sqlite3.Connection], None]
+    requires_fk_off: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -427,9 +447,228 @@ def _migration_2(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+# ---------------------------------------------------------------------------
+# Migration 3: defence-in-depth CHECK constraints across seven tables.
+#
+# Adds the following table-level CHECKs that SQLite cannot retrofit via
+# `ALTER TABLE` on STRICT tables, so each affected table is recreated via
+# the SQLite 12-step pattern (create-new, copy, drop-old, rename). FK
+# enforcement is disabled around the whole step (see `requires_fk_off`
+# on the Migration record below) because dropping a table with incoming
+# FK references would otherwise abort.
+#
+#   category          parent_id != id    (self-cycle prevention)
+#                     name = trim(name)   (no leading/trailing whitespace)
+#   account           name = trim(name)
+#   instrument        description trimmed and non-empty when not NULL
+#   position          quantity_micro_units IS NULL OR >= 0   (long-only)
+#                     description trimmed and non-empty when not NULL
+#                     currency = upper(currency)
+#   statement_import  statement_path trimmed and non-empty when not NULL
+#   fx_rate           currency = upper(currency)
+#   plan_node         parent_id != id    (self-cycle prevention)
+#
+# `position` is also recreated WITHOUT `idx_position_instrument` — that
+# index has no caller in the current codebase (the cross-import "every
+# position ever held in EMIM" query is documented but not yet written),
+# so we let it die with the old table per CLAUDE.md's "justify each
+# index by the query pattern it serves". `idx_mapping_instrument`
+# (independently redundant with the UNIQUE autoindex) is dropped in a
+# later migration; `mapping` is not recreated here.
+#
+# `category_path`, `current_import`, and `current_position` are dropped
+# before the table teardown and recreated afterwards with their original
+# definitions, because SQLite would leave them silently stale otherwise.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_3_DROP_DEPENDENTS: tuple[str, ...] = (
+    # Views first — current_position depends on current_import (a view),
+    # so drop in this order.
+    "DROP VIEW current_position",
+    "DROP VIEW current_import",
+    "DROP VIEW category_path",
+    # The leaf-only mapping triggers reference `category` in their body.
+    # SQLite refuses to drop a table referenced from a trigger body, so we
+    # drop these triggers before recreating `category` and recreate them
+    # with identical bodies once the dust settles.
+    "DROP TRIGGER mapping_target_must_be_leaf_update",
+    "DROP TRIGGER mapping_target_must_be_leaf_insert",
+)
+
+_MIGRATION_3_RECREATE_TABLES: tuple[str, ...] = (
+    # category — parent_id self-cycle prevention + trim invariant on name.
+    """
+    CREATE TABLE category_new (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES category(id) ON DELETE RESTRICT
+            CHECK (parent_id IS NULL OR parent_id != id),
+        name TEXT NOT NULL CHECK (length(name) > 0 AND name = trim(name)),
+        UNIQUE (parent_id, name)
+    ) STRICT
+    """,
+    """
+    INSERT INTO category_new (id, parent_id, name)
+    SELECT id, parent_id, name FROM category
+    """,
+    "DROP TABLE category",
+    "ALTER TABLE category_new RENAME TO category",
+    # account — name trim invariant.
+    """
+    CREATE TABLE account_new (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+        source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE RESTRICT,
+        name TEXT NOT NULL CHECK (length(name) > 0 AND name = trim(name)),
+        UNIQUE (user_id, source_id, name)
+    ) STRICT
+    """,
+    """
+    INSERT INTO account_new (id, user_id, source_id, name)
+    SELECT id, user_id, source_id, name FROM account
+    """,
+    "DROP TABLE account",
+    "ALTER TABLE account_new RENAME TO account",
+    # instrument — description must be NULL or trimmed+non-empty.
+    """
+    CREATE TABLE instrument_new (
+        id INTEGER PRIMARY KEY,
+        source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE RESTRICT,
+        instrument_id_text TEXT NOT NULL CHECK (length(instrument_id_text) > 0),
+        description TEXT CHECK (
+            description IS NULL
+            OR (length(description) > 0 AND description = trim(description))
+        ),
+        UNIQUE (source_id, instrument_id_text)
+    ) STRICT
+    """,
+    """
+    INSERT INTO instrument_new (id, source_id, instrument_id_text, description)
+    SELECT id, source_id, instrument_id_text, description FROM instrument
+    """,
+    "DROP TABLE instrument",
+    "ALTER TABLE instrument_new RENAME TO instrument",
+    # statement_import — statement_path trim+non-empty when present.
+    f"""
+    CREATE TABLE statement_import_new (
+        id INTEGER PRIMARY KEY,
+        account_id INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+        as_of TEXT NOT NULL CHECK (as_of GLOB '{_DATE_GLOB}'),
+        statement_path TEXT CHECK (
+            statement_path IS NULL
+            OR (length(statement_path) > 0 AND statement_path = trim(statement_path))
+        ),
+        imported_at TEXT NOT NULL CHECK (imported_at GLOB '{_TIMESTAMP_GLOB}'),
+        UNIQUE (account_id, as_of)
+    ) STRICT
+    """,
+    """
+    INSERT INTO statement_import_new (id, account_id, as_of, statement_path, imported_at)
+    SELECT id, account_id, as_of, statement_path, imported_at FROM statement_import
+    """,
+    "DROP TABLE statement_import",
+    "ALTER TABLE statement_import_new RENAME TO statement_import",
+    # position — long-only quantity, trimmed description, uppercase currency.
+    # The `idx_position_instrument` index is intentionally NOT recreated.
+    """
+    CREATE TABLE position_new (
+        id INTEGER PRIMARY KEY,
+        statement_import_id INTEGER NOT NULL
+            REFERENCES statement_import(id) ON DELETE CASCADE,
+        instrument_id INTEGER NOT NULL REFERENCES instrument(id) ON DELETE RESTRICT,
+        description TEXT CHECK (
+            description IS NULL
+            OR (length(description) > 0 AND description = trim(description))
+        ),
+        quantity_micro_units INTEGER
+            CHECK (quantity_micro_units IS NULL OR quantity_micro_units >= 0),
+        market_value_native_decithou INTEGER NOT NULL
+            CHECK (market_value_native_decithou >= 0),
+        currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
+        UNIQUE (statement_import_id, instrument_id)
+    ) STRICT
+    """,
+    """
+    INSERT INTO position_new (
+        id, statement_import_id, instrument_id, description,
+        quantity_micro_units, market_value_native_decithou, currency
+    )
+    SELECT id, statement_import_id, instrument_id, description,
+           quantity_micro_units, market_value_native_decithou, currency
+    FROM position
+    """,
+    "DROP TABLE position",
+    "ALTER TABLE position_new RENAME TO position",
+    # fx_rate — uppercase currency invariant.
+    f"""
+    CREATE TABLE fx_rate_new (
+        id INTEGER PRIMARY KEY,
+        rate_date TEXT NOT NULL CHECK (rate_date GLOB '{_DATE_GLOB}'),
+        currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
+        gbp_rate_micros INTEGER NOT NULL CHECK (gbp_rate_micros > 0),
+        UNIQUE (rate_date, currency)
+    ) STRICT
+    """,
+    """
+    INSERT INTO fx_rate_new (id, rate_date, currency, gbp_rate_micros)
+    SELECT id, rate_date, currency, gbp_rate_micros FROM fx_rate
+    """,
+    "DROP TABLE fx_rate",
+    "ALTER TABLE fx_rate_new RENAME TO fx_rate",
+    # plan_node — self-cycle prevention.
+    """
+    CREATE TABLE plan_node_new (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+        parent_id INTEGER REFERENCES plan_node(id) ON DELETE CASCADE
+            CHECK (parent_id IS NULL OR parent_id != id),
+        category_id INTEGER NOT NULL REFERENCES category(id) ON DELETE RESTRICT,
+        weight_micros INTEGER NOT NULL
+            CHECK (weight_micros >= 0 AND weight_micros <= 1000000),
+        UNIQUE (user_id, parent_id, category_id)
+    ) STRICT
+    """,
+    """
+    INSERT INTO plan_node_new (id, user_id, parent_id, category_id, weight_micros)
+    SELECT id, user_id, parent_id, category_id, weight_micros FROM plan_node
+    """,
+    "DROP TABLE plan_node",
+    "ALTER TABLE plan_node_new RENAME TO plan_node",
+)
+
+_MIGRATION_3_RECREATE_INDEXES: tuple[str, ...] = (
+    # Recreate the partial unique index that closed SQLite's NULL-distinct
+    # gap on top-level category names. The auto-indexes from UNIQUE
+    # constraints come back automatically with each new table; only this
+    # explicit one needs reinstating.
+    "CREATE UNIQUE INDEX idx_category_top_level_name ON category(name) WHERE parent_id IS NULL",
+)
+
+# Views and triggers are dropped before the table teardown and recreated
+# with their original definitions afterwards. The definitions match
+# migration 1 exactly; any change to them is the job of a later
+# migration, not this one.
+_MIGRATION_3_RECREATE_VIEWS: tuple[str, ...] = _MIGRATION_1_VIEWS
+_MIGRATION_3_RECREATE_TRIGGERS: tuple[str, ...] = _MIGRATION_1_TRIGGERS
+
+
+def _migration_3(connection: sqlite3.Connection) -> None:
+    """Recreate seven tables to add defence-in-depth CHECK constraints."""
+    for statement in _MIGRATION_3_DROP_DEPENDENTS:
+        connection.execute(statement)
+    for statement in _MIGRATION_3_RECREATE_TABLES:
+        connection.execute(statement)
+    for statement in _MIGRATION_3_RECREATE_INDEXES:
+        connection.execute(statement)
+    for statement in _MIGRATION_3_RECREATE_VIEWS:
+        connection.execute(statement)
+    for statement in _MIGRATION_3_RECREATE_TRIGGERS:
+        connection.execute(statement)
+
+
 MIGRATIONS: List[Migration] = [
-    _migration_1,
-    _migration_2,
+    Migration(_migration_1),
+    Migration(_migration_2),
+    Migration(_migration_3, requires_fk_off=True),
 ]
 
 
@@ -440,6 +679,15 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
     migration runs inside its own explicit transaction so a failed
     migration rolls back cleanly. Refuses to start if the DB is newer
     than this binary supports (downgrade protection).
+
+    Migrations declaring `requires_fk_off=True` are wrapped in an
+    explicit `PRAGMA foreign_keys = OFF` / `ON` envelope (toggled outside
+    the transaction, since the pragma is a no-op inside one). After the
+    body runs, `PRAGMA foreign_key_check` validates that nothing left
+    dangling — if it did, the migration aborts and rolls back rather
+    than committing a broken graph. The envelope's restore-to-ON happens
+    in a `finally` block so a failure inside the transaction can't leave
+    the connection with FK off.
     """
     current_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     target_version = len(MIGRATIONS)
@@ -450,21 +698,42 @@ def apply_migrations(connection: sqlite3.Connection) -> None:
         )
     for index in range(current_version, target_version):
         version = index + 1
-        connection.execute("BEGIN")
+        migration = MIGRATIONS[index]
+        # FK toggling must happen outside any transaction. The runner is
+        # the only piece of code that issues these PRAGMAs from inside
+        # the migration loop, so each step opens and closes its own FK
+        # envelope cleanly without affecting later steps.
+        if migration.requires_fk_off:
+            connection.execute("PRAGMA foreign_keys = OFF")
         try:
-            MIGRATIONS[index](connection)
-            connection.execute(
-                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
-                (version, _utc_now_iso()),
-            )
-            # `PRAGMA user_version = N` does not accept a bound parameter,
-            # so the literal is interpolated. `version` is a controlled
-            # integer from a known list, so there is no injection surface.
-            connection.execute(f"PRAGMA user_version = {version}")
-            connection.execute("COMMIT")
-        except Exception:
-            connection.execute("ROLLBACK")
-            raise
+            connection.execute("BEGIN")
+            try:
+                migration.func(connection)
+                if migration.requires_fk_off:
+                    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+                    if violations:
+                        raise RuntimeError(
+                            f"Migration {version} left {len(violations)} dangling "
+                            f"foreign key reference(s): {violations!r}"
+                        )
+                connection.execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                    (version, _utc_now_iso()),
+                )
+                # `PRAGMA user_version = N` does not accept a bound
+                # parameter, so the literal is interpolated. `version`
+                # is a controlled integer from a known list, so there is
+                # no injection surface.
+                connection.execute(f"PRAGMA user_version = {version}")
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        finally:
+            # Restore FK enforcement regardless of success or failure so
+            # the connection never escapes this function with FK off.
+            if migration.requires_fk_off:
+                connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _utc_now_iso() -> str:

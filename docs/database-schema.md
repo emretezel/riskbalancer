@@ -53,7 +53,12 @@ parts-per-million (suffix `_micros`). `0.55` is `550000`; `1.0` is
 
 Number-of-units holdings (e.g. fractional shares) are stored as `INTEGER`
 micro-units (×1e6). `NULL` is allowed — adapters that don't report
-quantity (broker statements that only give value) leave it null.
+quantity (broker statements that only give value) leave it null. The
+project is **long-only by design**: a non-NULL `quantity_micro_units`
+is non-negative, and `market_value_native_decithou` is non-negative.
+A short position would need both columns to admit negative values and
+the FX / risk math to handle the sign; that complexity is out of scope
+for a household portfolio tool. See §3.12 and §8.
 
 ### 2.4 Dates and timestamps
 
@@ -72,7 +77,11 @@ not here). Patterns above use `?`.
 
 ### 2.5 Currency codes
 
-3-letter `TEXT` enforced by `CHECK (length(currency) = 3)`.
+3-letter uppercase `TEXT` enforced by
+`CHECK (length(currency) = 3 AND currency = upper(currency))` on every
+column that carries a currency. The uppercase guard exists so a
+casing-only drift between writer and reader never silently breaks a
+join against `fx_rate`.
 
 ### 2.6 Strict mode
 
@@ -129,8 +138,8 @@ rows reference it — not by anything on the category itself.
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | |
-| `parent_id` | `INTEGER REFERENCES category(id) ON DELETE RESTRICT` | `NULL` for top-level. |
-| `name` | `TEXT NOT NULL` | `length(name) > 0`. |
+| `parent_id` | `INTEGER REFERENCES category(id) ON DELETE RESTRICT` | `NULL` for top-level. `CHECK (parent_id IS NULL OR parent_id != id)` blocks the trivial single-row cycle. |
+| `name` | `TEXT NOT NULL` | `length(name) > 0 AND name = trim(name)`. The trim guard rejects space-padded names (the realistic copy-paste case); the application's `.strip()` catches tabs and other whitespace before they reach the DB. |
 
 Constraints:
 
@@ -211,7 +220,7 @@ each have their own `account` rows.
 | `id` | `INTEGER PRIMARY KEY` | |
 | `user_id` | `INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE` | |
 | `source_id` | `INTEGER NOT NULL REFERENCES source(id) ON DELETE RESTRICT` | A broker cannot be removed while any account still references it. |
-| `name` | `TEXT NOT NULL` | `length(name) > 0`. |
+| `name` | `TEXT NOT NULL` | `length(name) > 0 AND name = trim(name)`. |
 
 `UNIQUE (user_id, source_id, name)`. The same account name can be used
 by different users — Emre and Tani can each have a `taxable` account at
@@ -230,7 +239,7 @@ adapter string lives on `source.adapter`, single source of truth).
 | `id` | `INTEGER PRIMARY KEY` | |
 | `source_id` | `INTEGER NOT NULL REFERENCES source(id) ON DELETE RESTRICT` | The broker. A `source` row cannot be deleted while instruments still reference it. |
 | `instrument_id_text` | `TEXT NOT NULL` | The broker's identifier, as it appears in the CSV. `length(instrument_id_text) > 0`. |
-| `description` | `TEXT NULL` | Human-readable description. The seed loader populates this from the YAML and refuses to overwrite a non-empty existing description. |
+| `description` | `TEXT NULL` | Human-readable description. `NULL` or a trimmed non-empty string; the empty string is rejected to keep "absent" unambiguous. The seed loader populates this from the YAML and refuses to overwrite a non-empty existing description. |
 
 `UNIQUE (source_id, instrument_id_text)`.
 
@@ -287,7 +296,7 @@ native unit (e.g. `760000` for USD on a day when 1 USD = 0.76 GBP).
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | |
 | `rate_date` | `TEXT NOT NULL` | `GLOB '????-??-??'`. |
-| `currency` | `TEXT NOT NULL` | `length(currency) = 3`. |
+| `currency` | `TEXT NOT NULL` | `length(currency) = 3 AND currency = upper(currency)`. The uppercase guard mirrors `position.currency` so joins on the column never silently miss because of case drift. |
 | `gbp_rate_micros` | `INTEGER NOT NULL` | `gbp_rate_micros > 0`. |
 
 `UNIQUE (rate_date, currency)`.
@@ -306,7 +315,7 @@ be a leaf in one user's plan and a branch in another's.
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | |
 | `user_id` | `INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE` | |
-| `parent_id` | `INTEGER NULL REFERENCES plan_node(id) ON DELETE CASCADE` | `NULL` for top-level. |
+| `parent_id` | `INTEGER NULL REFERENCES plan_node(id) ON DELETE CASCADE` | `NULL` for top-level. `CHECK (parent_id IS NULL OR parent_id != id)` blocks the trivial single-row cycle. |
 | `category_id` | `INTEGER NOT NULL REFERENCES category(id) ON DELETE RESTRICT` | |
 | `weight_micros` | `INTEGER NOT NULL` | `0 <= weight_micros <= 1000000`. Zero is permitted for "category I want to keep visible but currently hold 0%" (e.g. `Cash` in the seed). |
 
@@ -339,7 +348,7 @@ same account coexist and form the historical timeline.
 | `id` | `INTEGER PRIMARY KEY` | |
 | `account_id` | `INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE` | The owning user is reached via `account.user_id` — not denormalised here. |
 | `as_of` | `TEXT NOT NULL` | `GLOB '????-??-??'`. The "as-of date" the user supplied with `--as-of`. |
-| `statement_path` | `TEXT NULL` | Relative path to the filed CSV under `private/users/<user>/statements/…`. `NULL` for `adapter='manual'` imports. |
+| `statement_path` | `TEXT NULL` | Relative path to the filed CSV under `private/users/<user>/statements/…`. `NULL` for `adapter='manual'` imports; otherwise a trimmed non-empty string (the empty string is rejected to keep "no statement" unambiguous). |
 | `imported_at` | `TEXT NOT NULL` | Wall-clock UTC timestamp of the import action itself. |
 
 `UNIQUE (account_id, as_of)`.
@@ -357,10 +366,10 @@ authoritative history, so no per-import FX snapshot is needed.
 | `id` | `INTEGER PRIMARY KEY` | |
 | `statement_import_id` | `INTEGER NOT NULL REFERENCES statement_import(id) ON DELETE CASCADE` | |
 | `instrument_id` | `INTEGER NOT NULL REFERENCES instrument(id) ON DELETE RESTRICT` | |
-| `description` | `TEXT NULL` | Free-form, taken from the statement. |
-| `quantity_micro_units` | `INTEGER NULL` | `NULL` when the broker doesn't report it. |
-| `market_value_native_decithou` | `INTEGER NOT NULL` | `>= 0`. In the position's `currency`. |
-| `currency` | `TEXT NOT NULL` | `length(currency) = 3`. |
+| `description` | `TEXT NULL` | Free-form, taken from the statement. `NULL` or a trimmed non-empty string; the empty string is rejected. |
+| `quantity_micro_units` | `INTEGER NULL` | `NULL` when the broker doesn't report it; otherwise non-negative (the project is long-only; see §1). |
+| `market_value_native_decithou` | `INTEGER NOT NULL` | `>= 0`. In the position's `currency`. Zero is allowed (e.g. an option that expired worthless but is still on the statement); negative would mean a short position, which the long-only model excludes. |
+| `currency` | `TEXT NOT NULL` | `length(currency) = 3 AND currency = upper(currency)`. |
 
 `UNIQUE (statement_import_id, instrument_id)` — one row per
 `(import, instrument)`. To represent split allocations of a single
@@ -374,8 +383,7 @@ distributes it across categories on the fly.
 
 | Index | Columns | Purpose |
 |---|---|---|
-| `idx_mapping_instrument` | `mapping(instrument_id)` | Drives per-import mapping lookup — the resolver fetches every `mapping` row for one instrument at a time. |
-| `idx_position_instrument` | `position(instrument_id)` | Cross-import queries — "every position ever held in EMIM". Used by the interactive walker to suggest categories from history. |
+| `idx_mapping_instrument` | `mapping(instrument_id)` | Drives per-import mapping lookup — the resolver fetches every `mapping` row for one instrument at a time. (Slated for removal in a later migration: redundant with the `UNIQUE (instrument_id, category_id)` autoindex whose leading column already covers `WHERE instrument_id = ?`.) |
 | `idx_category_top_level_name` | `category(name) WHERE parent_id IS NULL` | Partial unique index that closes the gap left by `UNIQUE (parent_id, name)` when `parent_id IS NULL` — see §3.3. |
 
 `UNIQUE` constraints implicitly create indexes. The
@@ -387,6 +395,16 @@ scan `statement_import` by `(account_id, as_of DESC)` directly off the
 unique index; per-user queries reach `statement_import` via
 `account.user_id`, covered by the leading column of the `account`
 unique.
+
+**Deliberately not present** (was migration 1, retired in migration 3):
+
+- `idx_position_instrument ON position(instrument_id)` — the
+  cross-import "every position ever held in EMIM" query the index was
+  meant to serve was never actually written, so the index is gone
+  pending a real caller. The `position` autoindex from
+  `UNIQUE (statement_import_id, instrument_id)` leads with
+  `statement_import_id`, so `WHERE instrument_id = ?` cannot use it;
+  the day that query appears, this index needs reinstating.
 
 ---
 
@@ -507,3 +525,7 @@ Why this design:
   weights are an input to plan creation (read directly from
   `config/seed_plan.yaml` by the walker) and are not persisted in any
   table.
+- **No short positions.** Both `position.market_value_native_decithou`
+  and `position.quantity_micro_units` are constrained non-negative. A
+  household portfolio tool has no business modelling shorts, and the
+  asymmetry would propagate into the risk-weight math.
