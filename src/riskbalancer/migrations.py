@@ -79,6 +79,15 @@ class Migration:
 # `_ADAPTERS_LIST` is the SQL `IN (...)` literal derived from it for the
 # `source.adapter` CHECK clause. `manual` covers user-entered holdings
 # that did not originate from a broker statement.
+#
+# IMPORTANT: this tuple is **append-only**. Migration 1 stamps a
+# `source` row per entry (in sorted order, for stable surrogate ids).
+# Reordering entries or removing one would either break the CHECK
+# clause against existing rows or strand `instrument` / `account` rows
+# whose `source_id` was assigned from the old ordering. A new broker
+# is added by appending a new entry AND adding a migration that
+# INSERTs the corresponding `source` row. A regression test pins the
+# current ordered tuple so any accidental edit trips CI.
 KNOWN_ADAPTERS: tuple[str, ...] = (
     "ibkr",
     "ajbell",

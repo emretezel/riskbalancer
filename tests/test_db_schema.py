@@ -436,6 +436,31 @@ def test_source_is_prepopulated_with_known_adapters(db: Database) -> None:
     assert {row["adapter"] for row in rows} == set(KNOWN_ADAPTERS)
 
 
+def test_known_adapters_ordering_is_append_only() -> None:
+    """`KNOWN_ADAPTERS` is pinned tuple-equal to its committed ordering.
+
+    Migration 1 stamps surrogate `source.id` values from this tuple in
+    sorted order; existing `instrument.source_id` and `account.source_id`
+    rows were assigned from the same sorted view. Reordering or removing
+    entries would either break the `source.adapter IN (...)` CHECK
+    against legacy rows or strand FK references whose target id no
+    longer means what it did. Adding a broker is a strict append plus a
+    new migration that INSERTs its `source` row; this test trips CI if
+    that contract is broken.
+    """
+    from riskbalancer.migrations import KNOWN_ADAPTERS
+
+    assert KNOWN_ADAPTERS == (
+        "ibkr",
+        "ajbell",
+        "citi",
+        "ms401k",
+        "schwab",
+        "aegon",
+        "manual",
+    )
+
+
 def test_source_adapter_must_be_known(db: Database) -> None:
     """`source.adapter` is constrained to the recognised adapter list."""
     with pytest.raises(sqlite3.IntegrityError):
