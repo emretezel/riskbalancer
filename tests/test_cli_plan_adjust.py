@@ -7,15 +7,17 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from conftest import sandboxed_paths, write_plan_yaml_to_db
 from riskbalancer.cli import cmd_plan_adjust, cmd_plan_list
-from riskbalancer.configuration import load_category_nodes_from_yaml
+from riskbalancer.configuration import CategoryNode
+from riskbalancer.db import Database
 from riskbalancer.paths import UserPaths
 from riskbalancer.plan_adjust import iter_leaf_nodes
+from riskbalancer.repositories import find_user_id, load_plan_tree
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -67,26 +69,49 @@ assets:
 
 
 def _paths_for(tmp_path: Path, user: str = "emre") -> UserPaths:
-    """Sandbox a UserPaths under tmp_path with a per-user plan ready to write."""
-    users_root = tmp_path / "private" / "users"
-    user_dir = users_root / user
-    return replace(
-        UserPaths.for_user(user),
-        users_root=users_root,
-        user_dir=user_dir,
-        plan=user_dir / "plan.yaml",
-        portfolio=user_dir / "portfolio.json",
-        statements_dir=user_dir / "statements",
-        reports_dir=user_dir / "reports",
-        overrides_dir=user_dir / "mappings",
-        manual_mappings=user_dir / "mappings" / "manual.yaml",
-    )
+    """Sandbox a UserPaths under tmp_path. Delegates to the shared helper."""
+    return sandboxed_paths(tmp_path, user=user)
 
 
 def _seed_plan(paths: UserPaths, yaml_text: str = PLAN_YAML) -> None:
-    """Write `yaml_text` to the user's plan path, creating parents as needed."""
-    paths.plan.parent.mkdir(parents=True, exist_ok=True)
-    paths.plan.write_text(yaml_text, encoding="utf-8")
+    """Write `yaml_text` as the user's plan into the sandboxed database."""
+    write_plan_yaml_to_db(paths, yaml_text)
+
+
+def _load_plan(paths: UserPaths) -> list[CategoryNode]:
+    """Reload the user's plan from the sandboxed DB."""
+    db = Database.connect(paths.db_path)
+    try:
+        user_id = find_user_id(db.connection, paths.user)
+        assert user_id is not None, f"user {paths.user!r} missing from sandbox DB"
+        return load_plan_tree(db.connection, user_id)
+    finally:
+        db.close()
+
+
+def _plan_fingerprint(paths: UserPaths) -> list[tuple[tuple[str, ...], float, float, float]]:
+    """Stable, comparable summary of every leaf in the user's plan.
+
+    Each tuple is `(path, weight, volatility, adjustment)` — enough detail
+    to assert "the plan didn't change" without depending on YAML byte
+    equality, which no longer exists once writes go through the DB.
+    """
+    nodes = _load_plan(paths)
+
+    def walk(
+        children: list[CategoryNode],
+        prefix: tuple[str, ...],
+    ) -> list[tuple[tuple[str, ...], float, float, float]]:
+        out: list[tuple[tuple[str, ...], float, float, float]] = []
+        for node in children:
+            path = prefix + (node.name,)
+            if node.children:
+                out.extend(walk(node.children, path))
+            else:
+                out.append((path, node.weight, node.volatility or 0.0, node.adjustment))
+        return out
+
+    return walk(nodes, prefix=())
 
 
 def _args(**kwargs) -> argparse.Namespace:
@@ -121,7 +146,7 @@ def _script(monkeypatch, answers):
 def test_plan_list_prints_table_and_does_not_write(tmp_path, capsys):
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    mtime_before = paths.plan.stat().st_mtime_ns
+    before = _plan_fingerprint(paths)
 
     rc = cmd_plan_list(_list_args(), paths=paths)
 
@@ -130,8 +155,8 @@ def test_plan_list_prints_table_and_does_not_write(tmp_path, capsys):
     assert "PATH" in out
     assert "Equities / NAM" in out
     assert "Bonds" in out
-    # File is untouched.
-    assert paths.plan.stat().st_mtime_ns == mtime_before
+    # Plan is untouched.
+    assert _plan_fingerprint(paths) == before
 
 
 def test_plan_list_includes_zero_weight_leaves(tmp_path, capsys):
@@ -173,7 +198,7 @@ def test_targeted_writes_after_confirmation(tmp_path, monkeypatch, capsys):
 
     rc = cmd_plan_adjust(_args(path="Equities / EMEA", value=0.95), paths=paths)
     assert rc == 0
-    reloaded = load_category_nodes_from_yaml(paths.plan)
+    reloaded = _load_plan(paths)
     emea = next(n for p, n in iter_leaf_nodes(reloaded) if p[-1] == "EMEA")
     assert emea.adjustment == pytest.approx(0.95)
 
@@ -189,7 +214,7 @@ def test_targeted_yes_skips_prompt(tmp_path, monkeypatch, capsys):
 
     rc = cmd_plan_adjust(_args(path="Equities / EMEA", value=0.95, yes=True), paths=paths)
     assert rc == 0
-    reloaded = load_category_nodes_from_yaml(paths.plan)
+    reloaded = _load_plan(paths)
     emea = next(n for p, n in iter_leaf_nodes(reloaded) if p[-1] == "EMEA")
     assert emea.adjustment == pytest.approx(0.95)
 
@@ -207,12 +232,12 @@ def test_targeted_accepts_arrow_separator(tmp_path, monkeypatch):
 def test_targeted_no_confirm_leaves_plan_unchanged(tmp_path, monkeypatch, capsys):
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    original = paths.plan.read_text(encoding="utf-8")
+    original = _plan_fingerprint(paths)
     _script(monkeypatch, ["n"])
 
     rc = cmd_plan_adjust(_args(path="Equities / EMEA", value=0.95), paths=paths)
     assert rc == 0
-    assert paths.plan.read_text(encoding="utf-8") == original
+    assert _plan_fingerprint(paths) == original
 
 
 def test_targeted_rejects_branch_path(tmp_path, capsys):
@@ -248,7 +273,7 @@ def test_walker_writes_after_confirmation(tmp_path, monkeypatch):
 
     rc = cmd_plan_adjust(_args(), paths=paths)
     assert rc == 0
-    reloaded = load_category_nodes_from_yaml(paths.plan)
+    reloaded = _load_plan(paths)
     emea = next(n for p, n in iter_leaf_nodes(reloaded) if p[-1] == "EMEA")
     assert emea.adjustment == pytest.approx(0.95)
 
@@ -283,25 +308,25 @@ def test_walker_no_changes_returns_zero_silently(tmp_path, monkeypatch, capsys):
 def test_walker_decline_keeps_plan_unchanged(tmp_path, monkeypatch):
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    original = paths.plan.read_text(encoding="utf-8")
+    original = _plan_fingerprint(paths)
     _script(monkeypatch, ["0.95", "", "", "n"])
 
     rc = cmd_plan_adjust(_args(), paths=paths)
     assert rc == 0
-    assert paths.plan.read_text(encoding="utf-8") == original
+    assert _plan_fingerprint(paths) == original
 
 
 def test_walker_quit_aborts_with_non_zero_exit(tmp_path, monkeypatch, capsys):
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    original = paths.plan.read_text(encoding="utf-8")
+    original = _plan_fingerprint(paths)
     _script(monkeypatch, ["quit"])
 
     rc = cmd_plan_adjust(_args(), paths=paths)
     assert rc == 1
     err = capsys.readouterr().err
     assert "aborted" in err
-    assert paths.plan.read_text(encoding="utf-8") == original
+    assert _plan_fingerprint(paths) == original
 
 
 def test_walker_under_filters_to_subtree(tmp_path, monkeypatch):
@@ -313,7 +338,7 @@ def test_walker_under_filters_to_subtree(tmp_path, monkeypatch):
 
     rc = cmd_plan_adjust(_args(under="Equities"), paths=paths)
     assert rc == 0
-    reloaded = load_category_nodes_from_yaml(paths.plan)
+    reloaded = _load_plan(paths)
     bonds = next(n for p, n in iter_leaf_nodes(reloaded) if p[-1] == "Bonds")
     # Bonds is outside the subtree — its adjustment must not have changed.
     assert bonds.adjustment == pytest.approx(1.0)

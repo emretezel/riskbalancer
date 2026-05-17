@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import shutil
+import sqlite3
 import sys
 import urllib.error
 import urllib.request
@@ -22,6 +23,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 
 import yaml
 
+from . import repositories
 from .adapters import (
     AegonCSVAdapter,
     AJBellCSVAdapter,
@@ -38,6 +40,7 @@ from .configuration import (
     load_category_nodes_from_yaml,
     load_portfolio_plan_from_yaml,
 )
+from .db import Database
 from .models import CategoryPath, Investment
 from .paths import UserPaths, resolve_default_user
 from .plan_adjust import (
@@ -53,15 +56,14 @@ from .plan_bootstrap import (
     PlanCreationAborted,
     StdIO,
     _prompt_yes_no,
-    build_catalog,
-    clone_plan,
-    confirm_and_write_plan,
+    build_catalog_from_db,
     count_unique_categories,
-    describe_catalog_sources,
+    describe_catalog_sources_from_db,
     walk_catalog_interactive,
-    write_plan_yaml,
 )
 from .plan_csv import PlanCSVError, read_plan_csv, write_plan_csv
+from .portfolio import PortfolioPlan
+from .seed import seed_from_yaml
 
 DEFAULT_CATEGORY = CategoryPath("Uncategorized", "Pending Review")
 DEFAULT_LEAF_VOLATILITY = 0.15
@@ -158,6 +160,42 @@ def _require_user(paths: UserPaths) -> bool:
         file=sys.stderr,
     )
     return False
+
+
+def _open_database(paths: UserPaths) -> Database:
+    """Open (and migrate) the project database. Auto-seeds on first open.
+
+    The database lives at `paths.db_path` (`private/riskbalancer.db` by
+    default). On a brand-new repo the file is created automatically by
+    `Database.connect`; if the resulting database is empty (no shared
+    mappings), we run the seed loader so the user gets a usable catalog
+    without having to remember `db seed` manually before the first
+    `plan create`.
+    """
+    db = Database.connect(paths.db_path)
+    row = db.connection.execute("SELECT COUNT(*) AS n FROM mapping").fetchone()
+    if int(row["n"]) == 0 and paths.seed_plan.exists():
+        seed_from_yaml(
+            db.connection,
+            seed_plan_path=paths.seed_plan,
+            mappings_dir=paths.shared_mappings_dir,
+        )
+    return db
+
+
+def _ensure_user_in_db(
+    connection: sqlite3.Connection,
+    name: str,
+) -> int:
+    """Return the user's id, creating the row on first use.
+
+    Keeps `user create` and (e.g.) `plan create --user new-user` working
+    without forcing the caller to remember a separate `user create` step
+    once the on-disk directory exists. The CLI's user-CRUD commands still
+    explicitly create / delete rows via `repositories.create_user` and
+    `repositories.delete_user` so the lifecycle is observable.
+    """
+    return repositories.find_or_create_user(connection, name)
 
 
 ADAPTERS = {
@@ -1016,6 +1054,53 @@ def tag_imported_investments(
     return [replace(investment, adapter=adapter, account=account) for investment in investments]
 
 
+def cmd_db_init(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb db init` — create the database file and apply all migrations.
+
+    Idempotent: running it against an existing DB just verifies that
+    every migration is current. Useful as a sanity check or as the
+    first command in a fresh checkout. Subsequent commands open the
+    DB lazily, so `db init` is rarely required by itself.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    db = Database.connect(paths.db_path)
+    try:
+        version = int(db.connection.execute("PRAGMA user_version").fetchone()[0])
+        print(f"DB initialised at {paths.db_path} (schema version {version})")
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_db_seed(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb db seed` — load committed YAML catalog into the database.
+
+    Idempotent and YAML-authoritative for mapping rows: per-adapter
+    wipes wiping happens before each reload, so removing an entry from
+    `config/mappings/<adapter>.yaml` and re-running `db seed` actually
+    drops it. Per-user state (plans, statement imports, positions) is
+    never touched — those rows live only in the DB and the seed loader
+    has no concept of them.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    if not paths.seed_plan.exists():
+        print(f"Seed plan {paths.seed_plan} not found", file=sys.stderr)
+        return 1
+    db = Database.connect(paths.db_path)
+    try:
+        seed_from_yaml(
+            db.connection,
+            seed_plan_path=paths.seed_plan,
+            mappings_dir=paths.shared_mappings_dir,
+        )
+        category_count = db.connection.execute("SELECT COUNT(*) AS n FROM category").fetchone()["n"]
+        mapping_count = db.connection.execute("SELECT COUNT(*) AS n FROM mapping").fetchone()["n"]
+        print(f"Seeded {paths.db_path}: {category_count} categories, {mapping_count} mappings")
+    finally:
+        db.close()
+    return 0
+
+
 def cmd_fx_update(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     paths = paths if paths is not None else _default_paths()
     fx_path = Path(args.fx)
@@ -1044,8 +1129,12 @@ def cmd_categorize(args: argparse.Namespace, paths: Optional[UserPaths] = None) 
     if not _require_user(paths):
         return 1
     plan_arg = getattr(args, "plan", None)
-    plan_path = Path(plan_arg) if plan_arg else _resolve_user_plan_path(paths)
-    plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
+    if plan_arg is not None:
+        plan = load_portfolio_plan_from_yaml(
+            Path(plan_arg), default_leaf_volatility=DEFAULT_LEAF_VOLATILITY
+        )
+    else:
+        plan = _load_user_portfolio_plan_from_db(paths)
     plan_index = PlanIndex.from_plan(plan)
     mappings, write_path = resolve_mapping_sources(args.adapter, args.mappings, paths)
     fx_rates = load_fx_rates(paths=paths)
@@ -1065,10 +1154,38 @@ def cmd_categorize(args: argparse.Namespace, paths: Optional[UserPaths] = None) 
 
 
 def _resolve_user_plan_path(paths: UserPaths) -> Path:
-    """Return the plan file for this user, falling back to the seed plan."""
+    """Return the plan file for this user, falling back to the seed plan.
+
+    Deprecated: the database is the authoritative plan store now. Kept
+    here for the `cmd_categorize` / `portfolio_create` paths until they
+    are rewired to use `_load_user_portfolio_plan_from_db` directly.
+    """
     if paths.plan.exists():
         return paths.plan
     return paths.seed_plan
+
+
+def _load_user_portfolio_plan_from_db(paths: UserPaths) -> PortfolioPlan:
+    """Load the user's plan from the DB as a `PortfolioPlan`.
+
+    Raises `FileNotFoundError` (the existing portfolio-command failure
+    convention) when the user has no plan rows yet so the caller's
+    error-handling path doesn't need to change.
+    """
+    db = _open_database(paths)
+    try:
+        user_id = repositories.find_user_id(db.connection, paths.user)
+        if user_id is None or not repositories.plan_exists(db.connection, user_id):
+            raise FileNotFoundError(
+                f"No plan in the database for user '{paths.user}'. Run `rb plan create` first."
+            )
+        nodes = repositories.load_plan_tree(db.connection, user_id)
+        plan: PortfolioPlan = build_portfolio_plan_from_nodes(
+            nodes, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY
+        )
+        return plan
+    finally:
+        db.close()
 
 
 def cmd_portfolio_create(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
@@ -1102,8 +1219,11 @@ def cmd_portfolio_import(args: argparse.Namespace, paths: Optional[UserPaths] = 
         return 1
     _ensure_portfolio_exists(paths)
     snapshot = load_portfolio_snapshot(paths.portfolio)
+    # `plan_path` is preserved in the snapshot as an audit-trail string only.
+    # The actual `PortfolioPlan` is loaded from the database, which is now
+    # authoritative for plan content.
     plan_path = _snapshot_plan_path(snapshot, fallback=_resolve_user_plan_path(paths))
-    plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
+    plan = _load_user_portfolio_plan_from_db(paths)
     plan_index = PlanIndex.from_plan(plan)
 
     canonical_statement = _autofile_statement(
@@ -1201,20 +1321,21 @@ def cmd_portfolio_report(args: argparse.Namespace, paths: Optional[UserPaths] = 
         raise FileNotFoundError(f"Portfolio file {paths.portfolio} not found")
     snapshot = load_portfolio_snapshot(paths.portfolio)
     plan_arg = getattr(args, "plan", None)
-    plan_path = (
-        Path(plan_arg)
-        if plan_arg
-        else _snapshot_plan_path(snapshot, fallback=_resolve_user_plan_path(paths))
-    )
-    category_nodes = load_category_nodes_from_yaml(plan_path)
-    validation_failures = collect_category_weight_validation_failures(category_nodes)
-    if validation_failures:
-        print(format_category_weight_validation_failures(validation_failures), file=sys.stderr)
-        return 1
-    plan = build_portfolio_plan_from_nodes(
-        category_nodes,
-        default_leaf_volatility=DEFAULT_LEAF_VOLATILITY,
-    )
+    if plan_arg is not None:
+        category_nodes = load_category_nodes_from_yaml(Path(plan_arg))
+        validation_failures = collect_category_weight_validation_failures(category_nodes)
+        if validation_failures:
+            print(
+                format_category_weight_validation_failures(validation_failures),
+                file=sys.stderr,
+            )
+            return 1
+        plan = build_portfolio_plan_from_nodes(
+            category_nodes,
+            default_leaf_volatility=DEFAULT_LEAF_VOLATILITY,
+        )
+    else:
+        plan = _load_user_portfolio_plan_from_db(paths)
     investments = investments_from_dicts(_snapshot_investments(snapshot))
     total_value, summary = summarize_portfolio(plan, investments)
     source_total_value, source_rows = summarize_sources(investments)
@@ -1234,40 +1355,86 @@ def cmd_plan_create(args: argparse.Namespace, paths: Optional[UserPaths] = None)
     if not _require_user(paths):
         return 1
     overwrite = bool(getattr(args, "overwrite", False))
-    if paths.plan.exists() and not overwrite:
-        print(
-            f"Plan already exists at {paths.plan}. Use --overwrite to replace it.",
-            file=sys.stderr,
-        )
-        return 1
-
-    source_user = getattr(args, "from_user", None)
-    if source_user:
-        source_paths = UserPaths.for_user(source_user, root=paths.root)
-        clone_plan(source_paths, paths)
-        print(f"Cloned plan from {source_paths.plan} to {paths.plan}")
-        return 0
-
-    catalog = build_catalog(paths)
-    print(describe_catalog_sources(paths))
-    print(f"Catalog contains {count_unique_categories(catalog)} unique categories.")
-    io = StdIO()
+    db = _open_database(paths)
     try:
-        plan_nodes = walk_catalog_interactive(catalog, io)
-        failures = collect_category_weight_validation_failures(plan_nodes)
-        if failures:
-            print(format_category_weight_validation_failures(failures), file=sys.stderr)
+        user_id = _ensure_user_in_db(db.connection, paths.user)
+        if repositories.plan_exists(db.connection, user_id) and not overwrite:
+            print(
+                f"Plan already exists for user '{paths.user}'. Use --overwrite to replace it.",
+                file=sys.stderr,
+            )
             return 1
-        confirm_and_write_plan(paths.plan, plan_nodes, io)
-    except PlanCreationAborted as exc:
-        # User typed quit/exit, pressed Ctrl+C, sent EOF, or declined the
-        # final confirmation. Nothing is written; surface a single-line
-        # message and exit non-zero so scripts can detect the abort.
-        print(f"plan create aborted: {exc}", file=sys.stderr)
-        return 1
-    leaf_count = sum(1 for _ in _iter_leaves(plan_nodes))
-    print(f"Wrote plan to {paths.plan} ({leaf_count} leaf categories).")
-    return 0
+
+        source_user = getattr(args, "from_user", None)
+        if source_user:
+            source_user_id = repositories.find_user_id(db.connection, source_user)
+            if source_user_id is None:
+                print(
+                    f"Source user '{source_user}' has no plan in the database.",
+                    file=sys.stderr,
+                )
+                return 1
+            source_tree = repositories.load_plan_tree(db.connection, source_user_id)
+            if not source_tree:
+                print(
+                    f"Source user '{source_user}' has no plan to clone from.",
+                    file=sys.stderr,
+                )
+                return 1
+            failures = collect_category_weight_validation_failures(source_tree)
+            if failures:
+                print(format_category_weight_validation_failures(failures), file=sys.stderr)
+                return 1
+            repositories.write_plan_tree(db.connection, user_id, source_tree)
+            print(f"Cloned plan from user '{source_user}' to '{paths.user}'.")
+            return 0
+
+        catalog = build_catalog_from_db(db.connection, current_user_id=user_id)
+        print(describe_catalog_sources_from_db(db.connection, current_user_name=paths.user))
+        print(f"Catalog contains {count_unique_categories(catalog)} unique categories.")
+        io = StdIO()
+        try:
+            plan_nodes = walk_catalog_interactive(catalog, io)
+            failures = collect_category_weight_validation_failures(plan_nodes)
+            if failures:
+                print(format_category_weight_validation_failures(failures), file=sys.stderr)
+                return 1
+            if not _confirm_plan_summary(plan_nodes, io, paths.user):
+                raise PlanCreationAborted("user declined to save plan")
+        except PlanCreationAborted as exc:
+            # User typed quit/exit, pressed Ctrl+C, sent EOF, or declined the
+            # final confirmation. Nothing is written; surface a single-line
+            # message and exit non-zero so scripts can detect the abort.
+            print(f"plan create aborted: {exc}", file=sys.stderr)
+            return 1
+        repositories.write_plan_tree(db.connection, user_id, plan_nodes)
+        leaf_count = sum(1 for _ in _iter_leaves(plan_nodes))
+        print(f"Wrote plan for user '{paths.user}' ({leaf_count} leaf categories).")
+        return 0
+    finally:
+        db.close()
+
+
+def _confirm_plan_summary(
+    plan_nodes: Sequence[CategoryNode],
+    io: IO,
+    user: str,
+) -> bool:
+    """Print the plan summary and ask for y/N confirmation.
+
+    Mirrors what `confirm_and_write_plan` used to do for the YAML path —
+    factored out so the DB-backed write path can keep the same UX
+    without resurrecting the YAML writer.
+    """
+    from .plan_bootstrap import _render_plan_tree
+
+    io.info("\n—— Plan summary ——")
+    io.info(_render_plan_tree(plan_nodes))
+    return _prompt_yes_no(
+        io,
+        f"\nSave this plan for user '{user}'? [y/N]: ",
+        default=False,
+    )
 
 
 def _iter_leaves(nodes: Iterable) -> Iterable:
@@ -1279,21 +1446,59 @@ def _iter_leaves(nodes: Iterable) -> Iterable:
 
 
 def cmd_plan_validate(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb plan validate` — verify sibling weight totals sum to 100%.
+
+    With `--path`, validates a stand-alone YAML file (used for one-off
+    inspection of legacy or hand-authored plans). Otherwise loads the
+    user's plan from the database.
+    """
     paths = paths if paths is not None else _paths_from_args(args)
     explicit = getattr(args, "path", None)
-    if not explicit and not _require_user(paths):
+    if explicit is not None:
+        plan_path = Path(explicit)
+        if not plan_path.exists():
+            print(f"Plan file {plan_path} not found", file=sys.stderr)
+            return 1
+        nodes = load_category_nodes_from_yaml(plan_path)
+        failures = collect_category_weight_validation_failures(nodes)
+        if failures:
+            print(format_category_weight_validation_failures(failures), file=sys.stderr)
+            return 1
+        print(f"{plan_path} is valid.")
+        return 0
+
+    if not _require_user(paths):
         return 1
-    plan_path = Path(explicit) if explicit else paths.plan
-    if not plan_path.exists():
-        print(f"Plan file {plan_path} not found", file=sys.stderr)
+    db_nodes = _load_plan_tree_or_complain(paths)
+    if db_nodes is None:
         return 1
-    nodes = load_category_nodes_from_yaml(plan_path)
-    failures = collect_category_weight_validation_failures(nodes)
+    failures = collect_category_weight_validation_failures(db_nodes)
     if failures:
         print(format_category_weight_validation_failures(failures), file=sys.stderr)
         return 1
-    print(f"{plan_path} is valid.")
+    print(f"Plan for user '{paths.user}' is valid.")
     return 0
+
+
+def _load_plan_tree_or_complain(paths: UserPaths) -> Optional[list[CategoryNode]]:
+    """Return the user's DB-stored plan tree, or print a missing-plan error.
+
+    Returns `None` when the user is unknown to the database or has no
+    `plan_node` rows yet. Callers should propagate the `None` as an exit
+    code so the user sees a single, consistent "run plan create" hint.
+    """
+    db = _open_database(paths)
+    try:
+        user_id = repositories.find_user_id(db.connection, paths.user)
+        if user_id is None or not repositories.plan_exists(db.connection, user_id):
+            print(
+                f"No plan found for user '{paths.user}'. Run `rb plan create` first.",
+                file=sys.stderr,
+            )
+            return None
+        return repositories.load_plan_tree(db.connection, user_id)
+    finally:
+        db.close()
 
 
 def cmd_plan_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
@@ -1306,13 +1511,9 @@ def cmd_plan_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -
     paths = paths if paths is not None else _paths_from_args(args)
     if not _require_user(paths):
         return 1
-    if not paths.plan.exists():
-        print(
-            f"No plan found for user '{paths.user}' at {paths.plan}. Run `rb plan create` first.",
-            file=sys.stderr,
-        )
+    nodes = _load_plan_tree_or_complain(paths)
+    if nodes is None:
         return 1
-    nodes = load_category_nodes_from_yaml(paths.plan)
     print(render_list(list(iter_leaf_nodes(nodes))))
     return 0
 
@@ -1362,62 +1563,66 @@ def cmd_plan_adjust(args: argparse.Namespace, paths: Optional[UserPaths] = None)
         )
         return 1
 
-    if not paths.plan.exists():
-        print(
-            f"No plan found for user '{paths.user}' at {paths.plan}. Run `rb plan create` first.",
-            file=sys.stderr,
-        )
-        return 1
+    db = _open_database(paths)
+    try:
+        user_id = repositories.find_user_id(db.connection, paths.user)
+        if user_id is None or not repositories.plan_exists(db.connection, user_id):
+            print(
+                f"No plan found for user '{paths.user}'. Run `rb plan create` first.",
+                file=sys.stderr,
+            )
+            return 1
+        nodes = repositories.load_plan_tree(db.connection, user_id)
 
-    nodes = load_category_nodes_from_yaml(paths.plan)
+        io: IO = StdIO()
 
-    io: IO = StdIO()
+        if path_label is not None:
+            # Translate the doc/help-text `>` separator into the project's
+            # canonical `/` before handing off to the existing label parser.
+            parts = _parse_category_label(path_label.replace(">", "/")).parts
+            # The mutex check above guarantees `value is not None` whenever
+            # `path_label` is not None — this assert narrows the type for mypy.
+            assert value is not None
+            try:
+                change = apply_targeted(nodes, parts, float(value))
+            except ValueError as exc:
+                print(f"plan adjust failed: {exc}", file=sys.stderr)
+                return 1
+            try:
+                should_write = confirm_changes(paths.plan, [change], io, skip_prompt=skip_confirm)
+            except PlanCreationAborted as exc:
+                print(f"plan adjust aborted: {exc}", file=sys.stderr)
+                return 1
+            if not should_write:
+                print("plan adjust aborted: user declined.")
+                return 0
+            repositories.write_plan_tree(db.connection, user_id, nodes)
+            print(f"Wrote updated plan for user '{paths.user}' (1 leaf changed).")
+            return 0
 
-    if path_label is not None:
-        # Translate the doc/help-text `>` separator into the project's
-        # canonical `/` before handing off to the existing label parser.
-        parts = _parse_category_label(path_label.replace(">", "/")).parts
-        # The mutex check above guarantees `value is not None` whenever
-        # `path_label` is not None — this assert narrows the type for mypy.
-        assert value is not None
+        # Walker mode (with optional --under).
         try:
-            change = apply_targeted(nodes, parts, float(value))
+            leaves = filter_under(iter_leaf_nodes(nodes), under)
         except ValueError as exc:
             print(f"plan adjust failed: {exc}", file=sys.stderr)
             return 1
         try:
-            should_write = confirm_changes(paths.plan, [change], io, skip_prompt=skip_confirm)
+            changes = walk_adjustments(leaves, io)
+            if not changes:
+                print("No changes.")
+                return 0
+            should_write = confirm_changes(paths.plan, changes, io)
         except PlanCreationAborted as exc:
             print(f"plan adjust aborted: {exc}", file=sys.stderr)
             return 1
         if not should_write:
             print("plan adjust aborted: user declined.")
             return 0
-        write_plan_yaml(paths.plan, nodes)
-        print(f"Wrote updated plan to {paths.plan} (1 leaf changed).")
+        repositories.write_plan_tree(db.connection, user_id, nodes)
+        print(f"Wrote updated plan for user '{paths.user}' ({len(changes)} leaf changes).")
         return 0
-
-    # Walker mode (with optional --under).
-    try:
-        leaves = filter_under(iter_leaf_nodes(nodes), under)
-    except ValueError as exc:
-        print(f"plan adjust failed: {exc}", file=sys.stderr)
-        return 1
-    try:
-        changes = walk_adjustments(leaves, io)
-        if not changes:
-            print("No changes.")
-            return 0
-        should_write = confirm_changes(paths.plan, changes, io)
-    except PlanCreationAborted as exc:
-        print(f"plan adjust aborted: {exc}", file=sys.stderr)
-        return 1
-    if not should_write:
-        print("plan adjust aborted: user declined.")
-        return 0
-    write_plan_yaml(paths.plan, nodes)
-    print(f"Wrote updated plan to {paths.plan} ({len(changes)} leaf changes).")
-    return 0
+    finally:
+        db.close()
 
 
 def cmd_plan_export(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
@@ -1430,13 +1635,9 @@ def cmd_plan_export(args: argparse.Namespace, paths: Optional[UserPaths] = None)
     paths = paths if paths is not None else _paths_from_args(args)
     if not _require_user(paths):
         return 1
-    if not paths.plan.exists():
-        print(
-            f"No plan found for user '{paths.user}' at {paths.plan}. Run `rb plan create` first.",
-            file=sys.stderr,
-        )
+    nodes = _load_plan_tree_or_complain(paths)
+    if nodes is None:
         return 1
-    nodes = load_category_nodes_from_yaml(paths.plan)
 
     out_path: Optional[Path] = getattr(args, "out", None)
     if out_path is None:
@@ -1459,10 +1660,10 @@ def cmd_plan_import(args: argparse.Namespace, paths: Optional[UserPaths] = None)
 
     Reads and validates the CSV first (header shape, weight totals, leaf
     structure). On success, prints a leaves-added/removed/changed summary
-    and asks for y/N confirmation before overwriting `plan.yaml`. Pass
+    and asks for y/N confirmation before writing to the database. Pass
     `--yes` to skip the prompt. Any CSV-parse or validation error returns
-    exit code 2 with the failing row's number, and `plan.yaml` is left
-    untouched.
+    exit code 2 with the failing row's number, and the existing plan is
+    left untouched.
     """
     paths = paths if paths is not None else _paths_from_args(args)
     if not _require_user(paths):
@@ -1488,35 +1689,41 @@ def cmd_plan_import(args: argparse.Namespace, paths: Optional[UserPaths] = None)
 
     skip_confirm = bool(getattr(args, "yes", False))
 
-    if paths.plan.exists():
-        old_nodes = load_category_nodes_from_yaml(paths.plan)
-        print(_render_import_summary(old_nodes, new_nodes))
-    else:
-        new_leaf_count = sum(1 for _ in iter_leaf_nodes(new_nodes))
-        print(
-            f"No existing plan at {paths.plan}; importing will create a new plan "
-            f"with {new_leaf_count} leaves."
-        )
-
-    if not skip_confirm:
-        io: IO = StdIO()
-        try:
-            ok = _prompt_yes_no(
-                io,
-                f"\nReplace plan at {paths.plan}? [y/N]: ",
-                default=False,
+    db = _open_database(paths)
+    try:
+        user_id = _ensure_user_in_db(db.connection, paths.user)
+        had_plan = repositories.plan_exists(db.connection, user_id)
+        if had_plan:
+            old_nodes = repositories.load_plan_tree(db.connection, user_id)
+            print(_render_import_summary(old_nodes, new_nodes))
+        else:
+            new_leaf_count = sum(1 for _ in iter_leaf_nodes(new_nodes))
+            print(
+                f"User '{paths.user}' has no existing plan; importing will create "
+                f"a new plan with {new_leaf_count} leaves."
             )
-        except PlanCreationAborted as exc:
-            print(f"plan import aborted: {exc}", file=sys.stderr)
-            return 1
-        if not ok:
-            print("plan import aborted: user declined.")
-            return 0
 
-    write_plan_yaml(paths.plan, new_nodes)
-    leaf_count = sum(1 for _ in iter_leaf_nodes(new_nodes))
-    print(f"Wrote plan to {paths.plan} ({leaf_count} leaves).")
-    return 0
+        if not skip_confirm:
+            io: IO = StdIO()
+            try:
+                ok = _prompt_yes_no(
+                    io,
+                    f"\nReplace plan for user '{paths.user}'? [y/N]: ",
+                    default=False,
+                )
+            except PlanCreationAborted as exc:
+                print(f"plan import aborted: {exc}", file=sys.stderr)
+                return 1
+            if not ok:
+                print("plan import aborted: user declined.")
+                return 0
+
+        repositories.write_plan_tree(db.connection, user_id, new_nodes)
+        leaf_count = sum(1 for _ in iter_leaf_nodes(new_nodes))
+        print(f"Wrote plan for user '{paths.user}' ({leaf_count} leaves).")
+        return 0
+    finally:
+        db.close()
 
 
 def _render_import_summary(
@@ -1595,72 +1802,97 @@ def _collect_leaf_summary(
 
 
 def cmd_user_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb user list` — show every user in the database with a plan summary.
+
+    Database is authoritative for the user roster. A user with rows but no
+    plan yet is shown so the freshly-bootstrapped user remains discoverable.
+    """
     paths = paths if paths is not None else _paths_from_args(args)
-    root = paths.users_root
-    if not root.exists():
-        print("No stored users.")
+    db = _open_database(paths)
+    try:
+        names = repositories.list_user_names(db.connection)
+        if not names:
+            print("No stored users.")
+            return 0
+        for name in names:
+            user_id = repositories.find_user_id(db.connection, name)
+            assert user_id is not None
+            leaf_count = db.connection.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM plan_node pn
+                LEFT JOIN plan_node child ON child.parent_id = pn.id
+                WHERE pn.user_id = ? AND child.id IS NULL
+                """,
+                (user_id,),
+            ).fetchone()["n"]
+            if leaf_count:
+                print(f"{name:<25} plan_leaves={leaf_count}")
+            else:
+                print(f"{name:<25} (no plan yet)")
         return 0
-    # Each subdirectory of `private/users/` is a user. We deliberately do not
-    # filter by `portfolio.json` here: a user created via `user create` (or one
-    # that has only had `plan create` run against them) should still be
-    # discoverable, otherwise the freshly-bootstrapped user is invisible.
-    candidates = sorted(child for child in root.iterdir() if child.is_dir())
-    if not candidates:
-        print("No stored users.")
-        return 0
-    for user_dir in candidates:
-        portfolio_file = user_dir / "portfolio.json"
-        if portfolio_file.exists():
-            snapshot = load_portfolio_snapshot(portfolio_file)
-            created = snapshot.get("created_at", "?")
-            plan = snapshot.get("plan", "?")
-            print(f"{user_dir.name:<25} plan={plan} created={created}")
-        else:
-            print(f"{user_dir.name:<25} (no portfolio yet)")
-    return 0
+    finally:
+        db.close()
 
 
 def cmd_user_create(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
-    """Create an empty user directory under `private/users/`.
+    """Create a user row in the DB and the corresponding on-disk directory.
 
-    Plan bootstrap is intentionally not part of this command — `plan create`
-    owns that flow. The `user create` step is the explicit on-ramp that gives
-    a household member a home on disk before any other per-user command runs.
+    The DB row is the authoritative existence record for the user; the
+    directory under `private/users/<user>/` exists to hold statements
+    (raw broker CSVs) and reports (derived outputs). Plan bootstrap is
+    intentionally separate — `plan create` owns that flow.
     """
     paths = paths if paths is not None else _paths_from_args(args)
     if not _require_user(paths):
         return 1
-    if paths.user_dir.exists():
-        print(
-            f"User directory {paths.user_dir} already exists. "
-            f"Use `riskbalancer user delete --user {paths.user} --confirm` first "
-            "if you really want to start over.",
-            file=sys.stderr,
-        )
-        return 1
-    # Only the user dir itself — `statements/`, `mappings/`, `reports/` are
-    # created lazily by their owning commands, matching the rest of the CLI.
-    paths.user_dir.mkdir(parents=True, exist_ok=False)
-    print(f"Created {paths.user_dir}")
+    db = _open_database(paths)
+    try:
+        if repositories.find_user_id(db.connection, paths.user) is not None:
+            print(
+                f"User '{paths.user}' already exists. "
+                f"Use `riskbalancer user delete --user {paths.user} --confirm` "
+                "first if you really want to start over.",
+                file=sys.stderr,
+            )
+            return 1
+        repositories.create_user(db.connection, paths.user)
+    finally:
+        db.close()
+    # The on-disk directory holds statements and reports — both are still
+    # filesystem-backed in this milestone. `statements/`, `reports/` are
+    # created lazily by their owning commands.
+    paths.user_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Created user '{paths.user}' (DB row + {paths.user_dir}).")
     print(f"Next: riskbalancer plan create --user {paths.user} (or --from <peer>)")
     return 0
 
 
 def cmd_user_delete(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """Delete the user's DB row (cascades through plan/sources/positions)
+    and remove their on-disk directory."""
     paths = paths if paths is not None else _paths_from_args(args)
     if not _require_user(paths):
         return 1
-    if not paths.user_dir.exists():
-        raise FileNotFoundError(f"User directory {paths.user_dir} not found")
     if not getattr(args, "confirm", False):
         raise ValueError(
-            f"Refusing to delete {paths.user_dir} without --confirm "
-            "(this removes the entire user directory including statements and reports)"
+            f"Refusing to delete user '{paths.user}' without --confirm "
+            "(this removes the DB row, statements, reports — everything)."
         )
-    import shutil
-
-    shutil.rmtree(paths.user_dir)
-    print(f"Deleted {paths.user_dir}")
+    db = _open_database(paths)
+    try:
+        user_id = repositories.find_user_id(db.connection, paths.user)
+        if user_id is None and not paths.user_dir.exists():
+            raise FileNotFoundError(
+                f"User '{paths.user}' does not exist in the database or on disk."
+            )
+        if user_id is not None:
+            repositories.delete_user(db.connection, user_id)
+    finally:
+        db.close()
+    if paths.user_dir.exists():
+        shutil.rmtree(paths.user_dir)
+    print(f"Deleted user '{paths.user}'.")
     return 0
 
 
@@ -1673,7 +1905,7 @@ def cmd_portfolio_add_instrument(
     _ensure_portfolio_exists(paths)
     snapshot = load_portfolio_snapshot(paths.portfolio)
     plan_path = _snapshot_plan_path(snapshot, fallback=_resolve_user_plan_path(paths))
-    plan = load_portfolio_plan_from_yaml(plan_path, default_leaf_volatility=DEFAULT_LEAF_VOLATILITY)
+    plan = _load_user_portfolio_plan_from_db(paths)
     plan_index = PlanIndex.from_plan(plan)
 
     manual_path = paths.manual_mappings
@@ -1740,6 +1972,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="RiskBalancer CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
     user_parent = _user_parent_parser()
+
+    # db — schema lifecycle and seed-ingest. Shared across users; no --user.
+    db_parser = subparsers.add_parser("db", help="Manage the project database")
+    db_sub = db_parser.add_subparsers(dest="db_command", required=True)
+    db_init = db_sub.add_parser(
+        "init",
+        help="Create private/riskbalancer.db and apply pending migrations",
+    )
+    db_init.set_defaults(func=cmd_db_init)
+    db_seed = db_sub.add_parser(
+        "seed",
+        help=(
+            "Load committed YAML catalog (seed plan + adapter mappings) into the DB. "
+            "Idempotent and YAML-authoritative for mapping rows."
+        ),
+    )
+    db_seed.set_defaults(func=cmd_db_seed)
 
     # fx — shared across users; no --user.
     fx_parser = subparsers.add_parser("fx", help="Manage FX rate data")

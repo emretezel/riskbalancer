@@ -3,7 +3,10 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 import riskbalancer.cli as cli_module
+from conftest import write_plan_yaml_to_db
 from riskbalancer import CategoryPath, CategoryTarget, Investment
 from riskbalancer.cli import (
     CategoryAllocation,
@@ -24,23 +27,38 @@ from riskbalancer.cli import (
 from riskbalancer.paths import UserPaths
 from riskbalancer.portfolio import PortfolioPlan
 
+# Avoid an unused-import warning for `pytest`; it is imported because some
+# tests use `pytest.raises`. ruff would otherwise flag this.
+_ = pytest
+
 AJ_BELL_FIXTURE = Path("tests/fixtures/aj_bell_sample.csv")
+SEED_PLAN_YAML = Path("config/seed_plan.yaml").read_text(encoding="utf-8")
 
 
 def load_snapshot(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _paths_with(**overrides) -> UserPaths:
+def _paths_with(tmp_path: Path | None = None, **overrides) -> UserPaths:
     """Build a UserPaths for tests.
 
     Defaults to user="testuser" so the user-keyed CLI guard does not refuse
-    to run. Tests that exercise `cmd_portfolio_import` against a real source
-    file MUST override `statements_dir` to point at their `tmp_path` so the
+    to run. When `tmp_path` is provided, the database path is redirected
+    under it so tests cannot pollute the real `private/riskbalancer.db`.
+    Tests that exercise `cmd_portfolio_import` against a real source file
+    MUST override `statements_dir` to point at their `tmp_path` so the
     auto-filer doesn't leak copies into the repo's `private/` tree. Tests
     that mock out `_autofile_statement` are fine without the override.
     """
-    return replace(UserPaths.for_user("testuser"), **overrides)
+    base = UserPaths.for_user("testuser")
+    if tmp_path is not None:
+        base = replace(base, db_path=tmp_path / "riskbalancer.db")
+    return replace(base, **overrides)
+
+
+def _seed_user_plan(paths: UserPaths, yaml_text: str = SEED_PLAN_YAML) -> None:
+    """Write a plan into the sandboxed DB for the user named in `paths`."""
+    write_plan_yaml_to_db(paths, yaml_text)
 
 
 def test_resolve_mapping_path_defaults_by_adapter():
@@ -69,10 +87,8 @@ def test_cmd_portfolio_import_autofiles_external_source_and_handles_conflict(tmp
     # Plan + portfolio set up under tmp_path so the import has somewhere to land.
     user_dir = tmp_path / "users" / "wife"
     user_dir.mkdir(parents=True)
-    (user_dir / "plan.yaml").write_text(
-        Path("config/seed_plan.yaml").read_text(encoding="utf-8"), encoding="utf-8"
-    )
     paths = _paths_with(
+        tmp_path,
         user="wife",
         user_dir=user_dir,
         plan=user_dir / "plan.yaml",
@@ -81,6 +97,7 @@ def test_cmd_portfolio_import_autofiles_external_source_and_handles_conflict(tmp
         overrides_dir=user_dir / "mappings",
         manual_mappings=user_dir / "mappings" / "manual.yaml",
     )
+    _seed_user_plan(paths)
 
     # Pre-populate the override mapping file so the import doesn't try to prompt.
     paths.overrides_dir.mkdir(parents=True, exist_ok=True)
@@ -156,10 +173,8 @@ def test_cmd_portfolio_import_move_removes_source_and_prefiled_path_stays(tmp_pa
 
     user_dir = tmp_path / "users" / "wife"
     user_dir.mkdir(parents=True)
-    (user_dir / "plan.yaml").write_text(
-        Path("config/seed_plan.yaml").read_text(encoding="utf-8"), encoding="utf-8"
-    )
     paths = _paths_with(
+        tmp_path,
         user="wife",
         user_dir=user_dir,
         plan=user_dir / "plan.yaml",
@@ -168,6 +183,7 @@ def test_cmd_portfolio_import_move_removes_source_and_prefiled_path_stays(tmp_pa
         overrides_dir=user_dir / "mappings",
         manual_mappings=user_dir / "mappings" / "manual.yaml",
     )
+    _seed_user_plan(paths)
     paths.overrides_dir.mkdir(parents=True, exist_ok=True)
     save_mappings(
         paths.adapter_overrides_path("ajbell"),
@@ -407,9 +423,11 @@ def test_cmd_portfolio_import_prompts_and_persists_missing_mappings(tmp_path, mo
     # `statements_dir` lives inside tmp_path so the auto-filer's copy of
     # AJ_BELL_FIXTURE lands in the per-test scratch dir, not in the repo.
     paths = _paths_with(
+        tmp_path,
         portfolio=portfolio_path,
         statements_dir=tmp_path / "statements",
     )
+    _seed_user_plan(paths)
     cmd_portfolio_create(
         argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
         paths=paths,
@@ -454,7 +472,8 @@ def test_cmd_portfolio_import_prompts_and_persists_missing_mappings(tmp_path, mo
 def test_cmd_portfolio_import_replaces_existing_adapter_account(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "portfolio.json"
     mapping_path = tmp_path / "broker.yaml"
-    paths = _paths_with(portfolio=portfolio_path)
+    paths = _paths_with(tmp_path, portfolio=portfolio_path)
+    _seed_user_plan(paths)
     cmd_portfolio_create(
         argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
         paths=paths,
@@ -528,7 +547,8 @@ def test_cmd_portfolio_import_replaces_existing_adapter_account(tmp_path, monkey
 def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "portfolio.json"
     mapping_path = tmp_path / "broker.yaml"
-    paths = _paths_with(portfolio=portfolio_path)
+    paths = _paths_with(tmp_path, portfolio=portfolio_path)
+    _seed_user_plan(paths)
     cmd_portfolio_create(
         argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
         paths=paths,
@@ -621,7 +641,8 @@ def test_cmd_portfolio_import_preserves_other_sources(tmp_path, monkeypatch):
 def test_cmd_portfolio_add_with_explicit_category_splits_investment(tmp_path):
     portfolio_path = tmp_path / "portfolio.json"
     manual_mapping_path = tmp_path / "manual.yaml"
-    paths = _paths_with(portfolio=portfolio_path, manual_mappings=manual_mapping_path)
+    paths = _paths_with(tmp_path, portfolio=portfolio_path, manual_mappings=manual_mapping_path)
+    _seed_user_plan(paths)
     cmd_portfolio_create(
         argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
         paths=paths,
@@ -632,7 +653,7 @@ def test_cmd_portfolio_add_with_explicit_category_splits_investment(tmp_path):
             instrument_id="GOLD",
             description="Physical Gold",
             market_value=1000.0,
-            category="Alternative / Gold=60, Cash=40",
+            category="Alternatives / Gold=60, Cash=40",
         ),
         paths=paths,
     )
@@ -647,7 +668,8 @@ def test_cmd_portfolio_add_with_explicit_category_splits_investment(tmp_path):
 def test_cmd_portfolio_add_without_category_reuses_manual_mapping(tmp_path, monkeypatch):
     portfolio_path = tmp_path / "portfolio.json"
     manual_mapping_path = tmp_path / "manual.yaml"
-    paths = _paths_with(portfolio=portfolio_path, manual_mappings=manual_mapping_path)
+    paths = _paths_with(tmp_path, portfolio=portfolio_path, manual_mappings=manual_mapping_path)
+    _seed_user_plan(paths)
     cmd_portfolio_create(
         argparse.Namespace(plan="config/seed_plan.yaml", overwrite=False),
         paths=paths,
@@ -703,9 +725,11 @@ def test_cmd_portfolio_report_reads_legacy_snapshot_without_imports(tmp_path, ca
         encoding="utf-8",
     )
 
+    paths = _paths_with(tmp_path, portfolio=portfolio_path)
+    _seed_user_plan(paths)
     result = cmd_portfolio_report(
         argparse.Namespace(plan=None, export=None),
-        paths=_paths_with(portfolio=portfolio_path),
+        paths=paths,
     )
     assert result == 0
     captured = capsys.readouterr()
@@ -750,8 +774,8 @@ assets:
     )
 
     result = cmd_portfolio_report(
-        argparse.Namespace(plan=None, export=None),
-        paths=_paths_with(portfolio=portfolio_path),
+        argparse.Namespace(plan=str(plan_path), export=None),
+        paths=_paths_with(tmp_path, portfolio=portfolio_path),
     )
 
     assert result == 1
@@ -802,8 +826,8 @@ assets:
     )
 
     result = cmd_portfolio_report(
-        argparse.Namespace(plan=None, export=str(export_path)),
-        paths=_paths_with(portfolio=portfolio_path),
+        argparse.Namespace(plan=str(plan_path), export=str(export_path)),
+        paths=_paths_with(tmp_path, portfolio=portfolio_path),
     )
 
     assert result == 1
@@ -857,8 +881,8 @@ assets:
     )
 
     result = cmd_portfolio_report(
-        argparse.Namespace(plan=None, export=None),
-        paths=_paths_with(portfolio=portfolio_path),
+        argparse.Namespace(plan=str(plan_path), export=None),
+        paths=_paths_with(tmp_path, portfolio=portfolio_path),
     )
 
     assert result == 1
@@ -918,6 +942,8 @@ def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, 
     )
     monkeypatch.setattr(cli_module, "_autofile_statement", lambda source, paths, **kwargs: source)
 
+    paths = _paths_with(tmp_path, portfolio=portfolio_path)
+    _seed_user_plan(paths)
     result = cmd_portfolio_import(
         argparse.Namespace(
             adapter="ajbell",
@@ -927,7 +953,7 @@ def test_cmd_portfolio_import_adds_import_metadata_to_legacy_snapshot(tmp_path, 
             move=False,
             fx=None,
         ),
-        paths=_paths_with(portfolio=portfolio_path),
+        paths=paths,
     )
 
     assert result == 0
@@ -1000,7 +1026,7 @@ def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tm
                         "instrument_id": "GOLD",
                         "description": "Manual Gold",
                         "market_value": 200.0,
-                        "category": "Alternative / Gold",
+                        "category": "Alternatives / Gold",
                         "volatility": 0.15,
                         "source": "manual",
                     },
@@ -1010,9 +1036,11 @@ def test_cmd_portfolio_report_prints_source_breakdown_and_keeps_csv_unchanged(tm
         encoding="utf-8",
     )
 
+    paths = _paths_with(tmp_path, portfolio=portfolio_path)
+    _seed_user_plan(paths)
     result = cmd_portfolio_report(
         argparse.Namespace(plan=None, export=str(export_path)),
-        paths=_paths_with(portfolio=portfolio_path),
+        paths=paths,
     )
 
     assert result == 0
@@ -1069,9 +1097,11 @@ def test_cmd_portfolio_report_source_breakdown_sorts_by_value(tmp_path, capsys):
         encoding="utf-8",
     )
 
+    paths = _paths_with(tmp_path, portfolio=portfolio_path)
+    _seed_user_plan(paths)
     result = cmd_portfolio_report(
         argparse.Namespace(plan=None, export=None),
-        paths=_paths_with(portfolio=portfolio_path),
+        paths=paths,
     )
 
     assert result == 0

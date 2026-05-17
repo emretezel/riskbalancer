@@ -5,9 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "riskbalancer"
 version = "1.0.1"
-description = "Portfolio risk balancing toolkit for multi-broker statements"
+description = "Portfolio risk balancing toolkit for multi-broker statements (SQLite-backed)"
 readme = "README.md"
 authors = [{name = "RiskBalancer"}]
+# Python 3.12 ships with `sqlite3` in the standard library and bundles a
+# SQLite >= 3.37 on every supported platform, which is what this project
+# needs for the `STRICT` table syntax used in `migrations.py`. The runtime
+# also asserts the version at connect time via `db._require_modern_sqlite`,
+# so a stale system SQLite produces a clear error rather than a confusing
+# parse failure.
 requires-python = ">=3.12"
 dependencies = ["pyyaml>=6.0.3"]
 

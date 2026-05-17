@@ -1,0 +1,470 @@
+# RiskBalancer Database Schema
+
+> The authoritative reference for the on-disk database. Read this before
+> writing any code that touches `private/riskbalancer.db` or
+> `src/riskbalancer/repositories.py`.
+
+The database is SQLite. It is the single source of truth for every mutable
+concept in the project: users, categories, plans, instruments, mappings,
+statement imports, positions, and FX rates. Curated YAML files under
+`config/` (`seed_plan.yaml`, `mappings/<adapter>.yaml`, `fx.example.yaml`)
+are *seed inputs only* — loaded into the database once via `rb db seed`.
+
+The redesign rationale lives at `/Users/emre/.claude/plans/we-need-to-have-snappy-crescent.md`.
+
+---
+
+## 1. Location, connection, lifecycle
+
+| Concern | Convention |
+|---|---|
+| File path | `private/riskbalancer.db` (gitignored, like everything under `private/`). Tests pass `:memory:`. |
+| Open path | `Database.connect(path)` in `src/riskbalancer/db.py`. **Never construct a `sqlite3.Connection` directly** — that bypasses PRAGMA setup and migrations. |
+| FK enforcement | `PRAGMA foreign_keys = ON` is set on every connect. Required for any of the `REFERENCES` clauses below to do anything. |
+| Journaling | File-backed: `PRAGMA journal_mode = WAL` plus `synchronous = NORMAL` for crash safety. In-memory: `journal_mode = MEMORY`. |
+| Minimum SQLite | 3.37 (the `STRICT` table syntax used everywhere landed in 3.37.0). Older runtimes are rejected at connect time with a clear error. |
+| Schema version | Tracked in **two places** for safety: `PRAGMA user_version` is the authoritative integer that drives the migration runner; `schema_version` is a normal table with `(version, applied_at)` rows for human inspection. |
+| Migrations | Append-only list in `src/riskbalancer/migrations.py`. Each migration runs inside its own explicit transaction. A DB whose `user_version` is *higher* than this binary supports is rejected (downgrade protection). |
+
+---
+
+## 2. Storage conventions
+
+### 2.1 Money
+
+Stored as `INTEGER` ten-thousandths of a unit of currency (suffix
+`_decithou`). £1.2345 is `12345`. This gives four decimal places of
+precision without any floating-point error.
+
+CLAUDE.md's rule "integer minor units or `NUMERIC` affinity for money and
+prices — never `REAL`/floating point" is satisfied by the integer-minor-unit
+form throughout the schema. There is no `REAL`/`FLOAT` money column anywhere.
+
+### 2.2 Fractions
+
+Weights, volatility, adjustments, and FX rates are stored as `INTEGER`
+parts-per-million (suffix `_micros`). `0.55` is `550000`; `1.0` is
+`1000000`; an adjustment of `1.35` is `1350000`. The helper
+`riskbalancer.seed.fraction_to_micros(value)` rounds — so
+`0.62 + 0.05 + 0.13 + 0.2` round-trips to exactly `1_000_000`, not
+`999_999`.
+
+### 2.3 Quantities
+
+Number-of-units holdings (e.g. fractional shares) are stored as `INTEGER`
+micro-units (×1e6). `NULL` is allowed — adapters that don't report
+quantity (broker statements that only give value) leave it null.
+
+### 2.4 Dates and timestamps
+
+| Kind | Format | CHECK pattern |
+|---|---|---|
+| Date (no time) | ISO-8601 `TEXT` `YYYY-MM-DD` | `GLOB '????-??-??'` |
+| Timestamp | ISO-8601 UTC `TEXT` `YYYY-MM-DDTHH:MM:SSZ` | `GLOB '????-??-??T*Z'` |
+
+The `Z` suffix is required on every timestamp column. `repositories._utc_now_iso()`
+is the only sanctioned way to produce one — it canonicalises Python's
+default `+00:00` to `Z`.
+
+Note: SQLite `GLOB` uses `?` for single-char and `*` for many-char.
+`_` is **literal** in GLOB (it is the single-char wildcard in `LIKE`,
+not here). Patterns above use `?`.
+
+### 2.5 Currency codes
+
+3-letter `TEXT` enforced by `CHECK (length(currency) = 3)`.
+
+### 2.6 Strict mode
+
+Every table is declared `STRICT`, so the type listed on each column is
+actually enforced. Stuffing a string into an `INTEGER` column raises at
+write time — type affinity is off.
+
+### 2.7 No magic values
+
+Per CLAUDE.md, missing values are `NULL` and meaningful states are
+encoded by proper columns, never by sentinels like `0`, `-1`, or `"N/A"`.
+
+---
+
+## 3. Tables
+
+Each table is described with its purpose, primary key, columns, foreign
+keys, and unique constraints. `STRICT` is implied on every table —
+omitted from the column lists for brevity.
+
+### 3.1 `schema_version`
+
+Records every applied migration with an ISO-8601 UTC timestamp. The
+migration runner relies on `PRAGMA user_version` for sequencing — this
+table is purely human-readable.
+
+| Column | Type | Notes |
+|---|---|---|
+| `version` | `INTEGER PRIMARY KEY` | Matches `user_version` after the migration runs. |
+| `applied_at` | `TEXT NOT NULL` | `GLOB '????-??-??T*Z'`. |
+
+### 3.2 `user`
+
+Top-level namespace for everything per-user. `name` is the on-disk
+identifier the CLI accepts via `--user`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `name` | `TEXT NOT NULL UNIQUE` | `length(name) > 0`. |
+| `created_at` | `TEXT NOT NULL` | ISO-8601 UTC. |
+
+Deleting a row cascades through every per-user concept (plans, sources,
+accounts, statement imports, positions, user-scope mappings). Categories
+and instruments survive — they are global registries.
+
+### 3.3 `category`
+
+The single hierarchical registry of categories. **Pure structure only —
+no weight, no volatility, no adjustment.** A category is a leaf in one
+user's plan and a branch in another's by virtue of which `plan_node`
+rows reference it — not by anything on the category itself.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `parent_id` | `INTEGER REFERENCES category(id) ON DELETE RESTRICT` | `NULL` for top-level. |
+| `name` | `TEXT NOT NULL` | `length(name) > 0`. |
+
+Constraints:
+
+- `UNIQUE (parent_id, name)` — siblings under one parent cannot share a name.
+- `UNIQUE INDEX idx_category_top_level_name ON category(name) WHERE parent_id IS NULL` —
+  SQLite treats `NULL` as distinct in composite `UNIQUE`, so this partial
+  index is needed to also enforce uniqueness for the top-level case.
+
+`ON DELETE RESTRICT` (rather than `CASCADE`) is deliberate: a category
+referenced by any `plan_node` or `mapping` cannot be deleted, because
+those rows would otherwise lose their referent. The error surfaces at
+write time and forces the caller to clean up references first.
+
+A category named `Govt` can exist under `Bonds / Developed / NAM` *and*
+under `Bonds / Developed / Europe` simultaneously — different parents,
+different IDs. The schema deliberately supports this.
+
+### 3.4 `category_default`
+
+Seed-derived volatility / adjustment **suggestions** per category. Used
+by the interactive plan walker (`rb plan create`) to pre-populate
+prompts; not consulted at report time. Populated by `rb db seed` from
+the leaf entries in `config/seed_plan.yaml`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `category_id` | `INTEGER PRIMARY KEY REFERENCES category(id) ON DELETE CASCADE` | One row per category, at most. |
+| `volatility_micros` | `INTEGER` | `NULL OR volatility_micros >= 0`. |
+| `adjustment_micros` | `INTEGER NOT NULL DEFAULT 1000000` | `adjustment_micros >= 0`. Not clamped to ≤1.0 — the seed's `Bonds / Developed / NAM / Inflation` has `1.35`. |
+
+### 3.5 `source`
+
+A brokerage relationship for a user. One row per `(user, adapter)`:
+different accounts at the same broker share the same `source` row.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `user_id` | `INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE` | |
+| `adapter` | `TEXT NOT NULL` | `IN ('ibkr','ajbell','citi','ms401k','schwab','aegon','manual')`. |
+
+`UNIQUE (user_id, adapter)`.
+
+The adapter list is centralised in `migrations._ADAPTERS_LIST` so the
+`source`, `instrument`, and `mapping` constraints stay in lockstep.
+Adding a new broker means: new entry in the constant, new migration,
+new adapter module.
+
+### 3.6 `account`
+
+A named account inside a source. AJ Bell users typically have `isa` and
+`sipp`; IBKR users typically have one `taxable`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `source_id` | `INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE` | |
+| `name` | `TEXT NOT NULL` | `length(name) > 0`. |
+
+`UNIQUE (source_id, name)`.
+
+### 3.7 `instrument`
+
+Global registry of broker tickers / fund identifiers. The same ticker
+at two different brokers is two separate rows — the leading natural key
+is `(adapter, instrument_id_text)`.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `adapter` | `TEXT NOT NULL` | Same `IN (…)` as `source.adapter`. |
+| `instrument_id_text` | `TEXT NOT NULL` | The broker's identifier, as it appears in the CSV. `length(instrument_id_text) > 0`. |
+| `description` | `TEXT NULL` | Human-readable description. The seed loader populates this from the YAML and refuses to overwrite a non-empty existing description. |
+
+`UNIQUE (adapter, instrument_id_text)`.
+
+### 3.8 `mapping`
+
+Instrument-to-category mappings, split-aware (multiple rows per
+instrument when the holding maps across several categories with
+weights). **Mappings are global** — one canonical row set per
+instrument, shared across all users. The CLI is the only sanctioned
+edit surface; whoever runs the tool can change any mapping.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `instrument_id` | `INTEGER NOT NULL REFERENCES instrument(id) ON DELETE RESTRICT` | |
+| `category_id` | `INTEGER NOT NULL REFERENCES category(id) ON DELETE RESTRICT` | Must point at a **leaf** category — enforced by trigger. |
+| `weight_micros` | `INTEGER NOT NULL` | `weight_micros > 0 AND weight_micros <= 1000000`. |
+
+Constraints:
+
+- `UNIQUE (instrument_id, category_id)` — a given instrument can only
+  reference any one category at most once. Multiple rows per
+  instrument with different `category_id` values encode a split.
+
+Triggers (leaf-only invariant):
+
+- `mapping_target_must_be_leaf_insert` — `BEFORE INSERT` aborts when
+  the target category has children. A mapping must point at a leaf in
+  the global category tree (i.e. no other `category` row has
+  `parent_id = NEW.category_id`).
+- `mapping_target_must_be_leaf_update` — `BEFORE UPDATE OF category_id`
+  applies the same check.
+
+Why leaf-only: the resolver (see [§7](#7-mapping-resolution)) walks up
+the category tree from a mapping target to find the deepest plan-leaf
+ancestor in the user's plan, so mappings target the most-specific
+category they can. Allowing a mapping to point at a branch would let
+the seed silently outvote a per-user split — bad, because it would
+inject category weight a user didn't sign off on. By forcing every
+mapping to be at a leaf, the resolver is the *only* code path that
+ever rolls up.
+
+Application-level invariant (not enforced by SQL): the weights for
+each `instrument_id` group sum to `1_000_000`. The
+`fraction_to_micros` helper rounds so common multi-allocation splits
+(e.g. AJ Bell `SPAG` = 0.62 + 0.05 + 0.13 + 0.2) sum exactly.
+
+### 3.9 `fx_rate`
+
+Historical FX rates, keyed by date and currency. Rate is GBP per
+native unit (e.g. `760000` for USD on a day when 1 USD = 0.76 GBP).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `rate_date` | `TEXT NOT NULL` | `GLOB '????-??-??'`. |
+| `currency` | `TEXT NOT NULL` | `length(currency) = 3`. |
+| `gbp_rate_micros` | `INTEGER NOT NULL` | `gbp_rate_micros > 0`. |
+
+`UNIQUE (rate_date, currency)`.
+
+ECB publishes historical reference rates back to 1999; `rb fx update`
+will fetch and upsert for any date as needed.
+
+### 3.10 `plan_node`
+
+A user's target tree. One row per node in the plan. **The leaf/branch
+distinction is implicit and per-user**: a `plan_node` is a leaf iff no
+other `plan_node` row has it as `parent_id`. The same `category_id` can
+be a leaf in one user's plan and a branch in another's.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `user_id` | `INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE` | |
+| `parent_id` | `INTEGER NULL REFERENCES plan_node(id) ON DELETE CASCADE` | `NULL` for top-level. |
+| `category_id` | `INTEGER NOT NULL REFERENCES category(id) ON DELETE RESTRICT` | |
+| `weight_micros` | `INTEGER NOT NULL` | `0 <= weight_micros <= 1000000`. Zero is permitted for "category I want to keep visible but currently hold 0%" (e.g. `Cash` in the seed). |
+| `volatility_micros` | `INTEGER NULL` | `NULL OR volatility_micros >= 0`. Branches carry `NULL`; leaves typically carry a value, but `NULL` is allowed for the seed's `Cash` leaf and similar — readers apply a `default_leaf_volatility` fallback. |
+| `adjustment_micros` | `INTEGER NOT NULL DEFAULT 1000000` | `>= 0`. Meaningful only on leaves; defaults to 1.0 on branches and is ignored when normalising risk weights. |
+
+`UNIQUE (user_id, parent_id, category_id)`.
+
+Application-level invariants (enforced in `repositories.write_plan_tree`):
+
+1. Sibling weights at every level sum to `1_000_000` (within the YAML
+   loader's tolerance of `1e-6` when expressed as fractions).
+2. A node has `volatility_micros IS NULL` if and only if it has
+   `plan_node` children — branches never carry volatility, leaves
+   typically do.
+
+### 3.11 `statement_import`
+
+An import event. One row per `(account_id, as_of)` — re-importing the
+same statement for the same as-of replaces the previous import in a
+single transaction (the runner deletes the old row, cascading through
+`position` and `import_fx`, then inserts the new one). Different
+`as_of` dates for the same account coexist and form the historical
+timeline.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `user_id` | `INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE` | Denormalised for query convenience; redundant with `account.source.user_id` but cheap and avoids a join on every "user's portfolio" query. |
+| `account_id` | `INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE` | |
+| `as_of` | `TEXT NOT NULL` | `GLOB '????-??-??'`. The "as-of date" the user supplied with `--as-of`. |
+| `statement_path` | `TEXT NULL` | Relative path to the filed CSV under `private/users/<user>/statements/…`. `NULL` for `adapter='manual'` imports. |
+| `imported_at` | `TEXT NOT NULL` | Wall-clock UTC timestamp of the import action itself. |
+
+`UNIQUE (account_id, as_of)`.
+
+### 3.12 `import_fx`
+
+FX rates as observed at the moment of an import. Frozen per-import so
+the GBP-equivalent value of historical positions is reproducible even
+if `fx_rate` is later corrected upstream.
+
+| Column | Type | Notes |
+|---|---|---|
+| `statement_import_id` | `INTEGER NOT NULL REFERENCES statement_import(id) ON DELETE CASCADE` | Compound PK with `currency`. |
+| `currency` | `TEXT NOT NULL` | `length(currency) = 3`. |
+| `gbp_rate_micros` | `INTEGER NOT NULL` | `> 0`. |
+
+`PRIMARY KEY (statement_import_id, currency)`.
+
+### 3.13 `position`
+
+One holding inside an import. Native amounts only — the GBP-equivalent
+is **never stored**, only computed by joining `import_fx` on `currency`
+at query time (single source of truth).
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `INTEGER PRIMARY KEY` | |
+| `statement_import_id` | `INTEGER NOT NULL REFERENCES statement_import(id) ON DELETE CASCADE` | |
+| `instrument_id` | `INTEGER NOT NULL REFERENCES instrument(id) ON DELETE RESTRICT` | |
+| `description` | `TEXT NULL` | Free-form, taken from the statement. |
+| `quantity_micro_units` | `INTEGER NULL` | `NULL` when the broker doesn't report it. |
+| `market_value_native_decithou` | `INTEGER NOT NULL` | `>= 0`. In the position's `currency`. |
+| `currency` | `TEXT NOT NULL` | `length(currency) = 3`. |
+
+`UNIQUE (statement_import_id, instrument_id)` — one row per
+`(import, instrument)`. To represent split allocations of a single
+holding, the application splits at *mapping resolution* time; the
+position is a single row with the native value, and the mapping
+distributes it across categories on the fly.
+
+---
+
+## 4. Indexes
+
+| Index | Columns | Purpose |
+|---|---|---|
+| `idx_mapping_instrument` | `mapping(instrument_id)` | Drives per-import mapping lookup — the resolver fetches every `mapping` row for one instrument at a time. |
+| `idx_statement_import_user_account_asof` | `statement_import(user_id, account_id, as_of DESC)` | Powers both "current portfolio" (latest `as_of` per account) and "portfolio as of date X". |
+| `idx_position_instrument` | `position(instrument_id)` | Cross-import queries — "every position ever held in EMIM". Used by the interactive walker to suggest categories from history. |
+| `idx_category_top_level_name` | `category(name) WHERE parent_id IS NULL` | Partial unique index that closes the gap left by `UNIQUE (parent_id, name)` when `parent_id IS NULL` — see §3.3. |
+
+`UNIQUE` constraints implicitly create indexes. The `fx_rate(rate_date,
+currency)` and `instrument(adapter, instrument_id_text)` uniques are
+already indexed and need no explicit `CREATE INDEX`.
+
+---
+
+## 5. Views
+
+### 5.1 `current_import`
+
+The latest `statement_import` per `account`. The window-style "max
+per group" is expressed as a correlated `WHERE as_of = (SELECT MAX...)`
+because SQLite doesn't have a `DISTINCT ON`.
+
+### 5.2 `current_position`
+
+Joins `position` to `current_import` so callers can see every position
+in the user's current portfolio with a single `SELECT * FROM
+current_position WHERE user_id = ?`. The view also surfaces
+`user_id`, `account_id`, and `as_of` so reports don't need a second
+join.
+
+### 5.3 `category_path`
+
+A recursive CTE that materialises the full ` / `-joined path for every
+category. Used wherever we need to render or match a path string
+(seed loading, mapping lookups, interactive prompts). The recursion
+walks down from `parent_id IS NULL`.
+
+---
+
+## 6. Adding a new migration
+
+1. Append a new `_migration_N` function to `MIGRATIONS` in
+   `src/riskbalancer/migrations.py`. **Do not edit existing
+   migrations** — once they have shipped, they are frozen.
+2. The function takes a `sqlite3.Connection` and runs whatever DDL the
+   step needs. Use `connection.execute(...)` for each statement rather
+   than `executescript`, so the migration runner's `BEGIN/COMMIT` wrap
+   isn't broken by an implicit commit.
+3. Tests for the migration go in `tests/test_db_schema.py` (for purely
+   schema-level checks) or a new `tests/test_migration_N.py` (for
+   data-shape tests).
+
+The runner reads `PRAGMA user_version`, applies each pending migration
+in order under its own transaction, inserts the corresponding row into
+`schema_version`, and bumps `user_version`. A migration that raises
+rolls back cleanly and leaves the DB at the previous version.
+
+A DB whose `user_version` is *higher* than `len(MIGRATIONS)` (i.e. the
+user downgraded the binary) is rejected at connect time with
+`RuntimeError("Refusing to downgrade")`.
+
+---
+
+## 7. Mapping resolution
+
+Mappings target **leaf** categories in the global category tree (enforced
+by trigger — see §3.8). A user's plan, however, may stop the
+sub-categorisation earlier than the mapping does. For example, the
+seed maps EMIM into `Equities / EM / Asia`, but Tani's plan holds
+`Equities / EM` as a single leaf — there is no `Asia` plan node to
+attribute the value to.
+
+The resolver bridges the two trees:
+
+1. Look up every `mapping` row for the instrument (one or more rows; the
+   weights sum to 1.0 across them).
+2. For each mapping's `category_id`, walk up the `category.parent_id`
+   chain using a recursive CTE.
+3. The first ancestor (closest to the mapping leaf) that **is also a
+   leaf in the user's plan** wins. "Leaf in this user's plan" means a
+   `plan_node` row exists for this `(user_id, category_id)` and no
+   other `plan_node` row references it as `parent_id`.
+4. If no ancestor matches, the position is **uncategorised** for that
+   user — surface as a warning, do not silently drop the value.
+
+This is implemented in `repositories.resolve_category_to_plan_leaf`.
+
+Why this design:
+
+- The seed can ship maximally specific mappings without forcing every
+  user to adopt the deepest sub-tree.
+- Users can extend their plan over time (split `EM` into `Asia / EMEA /
+  Americas`) and existing imports automatically attribute at the new
+  granularity — no re-import required.
+- The reverse path is also clean: when a user splits a leaf into
+  children, the interactive walker prompts them to re-allocate any
+  affected mappings inline in the same transaction, so the leaf-only
+  invariant holds at every point in time.
+
+## 8. Things this schema deliberately does **not** do
+
+- **No `REAL` columns for money or prices.** All monetary values are
+  integer ten-thousandths.
+- **No denormalised GBP-converted columns** on `position`. The native
+  amount + import-time FX is the canonical pair; GBP is derived.
+- **No "current" flag** on `position`, `statement_import`, etc.
+  "Current" is computed via the `current_import` view, not stored.
+- **No magic-string sentinels.** `NULL` plus a proper status column is
+  always preferred when a state needs to be modelled.
+- **No global UNIQUE on `category(name)`.** Two `Govt` leaves with
+  different parents are legitimately distinct rows.
+- **No "is_seed" flag on user or plan_node.** The seed plan is loaded
+  into `category` + `category_default` only; it never appears as a
+  fake "_seed" user.

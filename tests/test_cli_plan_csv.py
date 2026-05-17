@@ -7,15 +7,16 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+from conftest import sandboxed_paths, write_plan_yaml_to_db
 from riskbalancer.cli import cmd_plan_export, cmd_plan_import
-from riskbalancer.configuration import load_category_nodes_from_yaml
+from riskbalancer.configuration import CategoryNode
+from riskbalancer.db import Database
 from riskbalancer.paths import UserPaths
-from riskbalancer.plan_bootstrap import write_plan_yaml
+from riskbalancer.repositories import find_user_id, load_plan_tree, plan_exists
 
 # ---------------------------------------------------------------------------
 # Fixtures (mirror the tests/test_cli_plan_adjust.py shape)
@@ -45,25 +46,56 @@ assets:
 
 
 def _paths_for(tmp_path: Path, user: str = "emre") -> UserPaths:
-    """Sandbox a UserPaths under `tmp_path` so tests never touch real `private/`."""
-    users_root = tmp_path / "private" / "users"
-    user_dir = users_root / user
-    return replace(
-        UserPaths.for_user(user),
-        users_root=users_root,
-        user_dir=user_dir,
-        plan=user_dir / "plan.yaml",
-        portfolio=user_dir / "portfolio.json",
-        statements_dir=user_dir / "statements",
-        reports_dir=user_dir / "reports",
-        overrides_dir=user_dir / "mappings",
-        manual_mappings=user_dir / "mappings" / "manual.yaml",
-    )
+    """Sandbox a UserPaths under `tmp_path`. Delegates to the shared helper."""
+    return sandboxed_paths(tmp_path, user=user)
 
 
 def _seed_plan(paths: UserPaths, yaml_text: str = PLAN_YAML) -> None:
-    paths.plan.parent.mkdir(parents=True, exist_ok=True)
-    paths.plan.write_text(yaml_text, encoding="utf-8")
+    """Persist `yaml_text` as the user's plan in the sandboxed database."""
+    write_plan_yaml_to_db(paths, yaml_text)
+
+
+def _load_plan(paths: UserPaths) -> list[CategoryNode]:
+    """Reload the user's plan from the sandboxed DB."""
+    db = Database.connect(paths.db_path)
+    try:
+        user_id = find_user_id(db.connection, paths.user)
+        assert user_id is not None, f"user {paths.user!r} missing from sandbox DB"
+        return load_plan_tree(db.connection, user_id)
+    finally:
+        db.close()
+
+
+def _plan_fingerprint(
+    paths: UserPaths,
+) -> list[tuple[tuple[str, ...], float, float, float]]:
+    """Stable representation of every leaf (path, weight, vol, adj) for diffs."""
+    nodes = _load_plan(paths)
+
+    def walk(
+        children: list[CategoryNode],
+        prefix: tuple[str, ...],
+    ) -> list[tuple[tuple[str, ...], float, float, float]]:
+        out: list[tuple[tuple[str, ...], float, float, float]] = []
+        for node in children:
+            path = prefix + (node.name,)
+            if node.children:
+                out.extend(walk(node.children, path))
+            else:
+                out.append((path, node.weight, node.volatility or 0.0, node.adjustment))
+        return out
+
+    return walk(nodes, prefix=())
+
+
+def _plan_exists_in_db(paths: UserPaths) -> bool:
+    """True when the sandboxed DB has at least one plan_node row for the user."""
+    db = Database.connect(paths.db_path)
+    try:
+        user_id = find_user_id(db.connection, paths.user)
+        return user_id is not None and plan_exists(db.connection, user_id)
+    finally:
+        db.close()
 
 
 def _export_args(out: Path | None = None, user: str = "emre") -> argparse.Namespace:
@@ -146,17 +178,15 @@ def test_export_missing_user_errors(tmp_path, capsys):
 
 
 def test_import_after_export_round_trips(tmp_path, capsys):
-    """Export → import (with --yes) reproduces the canonical plan byte-for-byte.
+    """Export → import (with --yes) reproduces the same plan in the DB.
 
-    Normalises the seed plan through `write_plan_yaml` first so the
-    comparison is against the writer's canonical formatting (no extra list
-    indent), which is what `cmd_plan_import` will write.
+    With the database-backed plan store, "round trip" means the leaf set
+    and per-leaf (weight, vol, adj) come back identical after a full
+    CSV export/import cycle.
     """
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    canonical_nodes = load_category_nodes_from_yaml(paths.plan)
-    write_plan_yaml(paths.plan, canonical_nodes)
-    canonical_yaml = paths.plan.read_text(encoding="utf-8")
+    before = _plan_fingerprint(paths)
 
     csv_path = tmp_path / "plan.csv"
     rc = cmd_plan_export(_export_args(out=csv_path), paths=paths)
@@ -166,13 +196,13 @@ def test_import_after_export_round_trips(tmp_path, capsys):
     rc = cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
     assert rc == 0
 
-    assert paths.plan.read_text(encoding="utf-8") == canonical_yaml
+    assert _plan_fingerprint(paths) == before
 
 
 def test_import_with_decline_leaves_plan_unchanged(tmp_path, monkeypatch):
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    original_yaml = paths.plan.read_text(encoding="utf-8")
+    original = _plan_fingerprint(paths)
 
     csv_path = tmp_path / "plan.csv"
     rc = cmd_plan_export(_export_args(out=csv_path), paths=paths)
@@ -184,7 +214,7 @@ def test_import_with_decline_leaves_plan_unchanged(tmp_path, monkeypatch):
     _script(monkeypatch, ["n"])
     rc = cmd_plan_import(_import_args(csv_path, yes=False), paths=paths)
     assert rc == 0
-    assert paths.plan.read_text(encoding="utf-8") == original_yaml
+    assert _plan_fingerprint(paths) == original
 
 
 def test_import_with_confirm_writes_changes(tmp_path, monkeypatch):
@@ -207,7 +237,7 @@ def test_import_with_confirm_writes_changes(tmp_path, monkeypatch):
     rc = cmd_plan_import(_import_args(csv_path, yes=False), paths=paths)
     assert rc == 0
 
-    reloaded = load_category_nodes_from_yaml(paths.plan)
+    reloaded = _load_plan(paths)
     nam = next(child for child in reloaded[0].children if child.name == "NAM")
     assert nam.adjustment == pytest.approx(0.85)
 
@@ -274,7 +304,7 @@ def test_import_into_fresh_user_creates_plan(tmp_path, capsys):
 
     rc = cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
     assert rc == 0
-    assert paths.plan.exists()
+    assert _plan_exists_in_db(paths)
     out = capsys.readouterr().out
     assert "create a new plan" in out
 
@@ -282,7 +312,7 @@ def test_import_into_fresh_user_creates_plan(tmp_path, capsys):
 def test_import_invalid_csv_returns_two_and_keeps_plan(tmp_path, capsys):
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    original_yaml = paths.plan.read_text(encoding="utf-8")
+    original = _plan_fingerprint(paths)
 
     csv_path = tmp_path / "broken.csv"
     csv_path.write_text("garbage,not,a,header\n", encoding="utf-8")
@@ -291,7 +321,7 @@ def test_import_invalid_csv_returns_two_and_keeps_plan(tmp_path, capsys):
     assert rc == 2
     err = capsys.readouterr().err
     assert "plan import failed" in err
-    assert paths.plan.read_text(encoding="utf-8") == original_yaml
+    assert _plan_fingerprint(paths) == original
 
 
 def test_import_invalid_weights_returns_two(tmp_path, capsys):
@@ -314,7 +344,7 @@ def test_import_conflicting_branch_weight_returns_two(tmp_path, capsys):
     """Two sibling leaves disagreeing on a parent's weight is rejected."""
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    original_yaml = paths.plan.read_text(encoding="utf-8")
+    original = _plan_fingerprint(paths)
 
     csv_path = tmp_path / "conflict.csv"
     csv_path.write_text(
@@ -330,7 +360,7 @@ def test_import_conflicting_branch_weight_returns_two(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "conflicting weight" in err
     assert "Equities" in err
-    assert paths.plan.read_text(encoding="utf-8") == original_yaml
+    assert _plan_fingerprint(paths) == original
 
 
 def test_import_missing_file_errors(tmp_path, capsys):
@@ -358,17 +388,19 @@ def test_import_missing_user_errors(tmp_path, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_write_plan_yaml_then_export_then_import_yields_same_yaml(tmp_path):
-    """Belt-and-braces round trip starting from a CategoryNode tree."""
+def test_write_plan_yaml_then_export_then_import_yields_same_plan(tmp_path):
+    """Belt-and-braces round trip starting from a CategoryNode tree.
+
+    After the database migration, "same plan" is checked at the
+    fingerprint level — the on-disk YAML form no longer exists, so a
+    byte-level comparison is meaningless.
+    """
     paths = _paths_for(tmp_path)
     _seed_plan(paths)
-    original_nodes = load_category_nodes_from_yaml(paths.plan)
-    canonical_path = tmp_path / "canonical.yaml"
-    write_plan_yaml(canonical_path, original_nodes)
-    canonical_yaml = canonical_path.read_text(encoding="utf-8")
+    before = _plan_fingerprint(paths)
 
     csv_path = tmp_path / "plan.csv"
     cmd_plan_export(_export_args(out=csv_path), paths=paths)
     cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
 
-    assert paths.plan.read_text(encoding="utf-8") == canonical_yaml
+    assert _plan_fingerprint(paths) == before

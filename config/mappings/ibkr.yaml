@@ -4,12 +4,16 @@ CNKY:
     weight: 1.0
 EMCA:
   allocations:
-  - category: Bonds / EM / Foreign / Corporate
+  - category: Bonds / EM / Foreign / Corp
     weight: 1.0
 EMIM:
   allocations:
-  - category: Equities / EM
-    weight: 1.0
+  - category: Equities / EM / Asia
+    weight: 0.78
+  - category: Equities / EM / EMEA
+    weight: 0.13
+  - category: Equities / EM / Americas
+    weight: 0.09
 GOOGL:
   allocations:
   - category: Equities / Developed / NAM
@@ -68,7 +72,7 @@ SEGA:
     weight: 1.0
 SEML:
   allocations:
-  - category: Bonds / EM / Normal / Govt
+  - category: Bonds / EM / Local / Govt
     weight: 1.0
 SLXX:
   allocations:
@@ -76,7 +80,7 @@ SLXX:
     weight: 1.0
 SMEA:
   allocations:
-  - category: Equities / Developed / EMEA / Non -UK
+  - category: Equities / Developed / EMEA / Non-UK
     weight: 1.0
 TSLA:
   allocations:

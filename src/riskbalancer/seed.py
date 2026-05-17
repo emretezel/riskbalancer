@@ -1,0 +1,292 @@
+"""
+Seed loader: ingest the committed YAML catalog into the database.
+
+`config/seed_plan.yaml` and every `config/mappings/<adapter>.yaml` file are
+authored by hand and committed to the repo. They serve as one-shot seed
+inputs that prime the database. `seed_from_yaml()` is idempotent: re-running
+it after the YAML changes brings the DB back in sync with the files (YAML
+is authoritative for the mapping table; per-user state is never touched).
+
+What this module does NOT do:
+- Touch per-user state (plans, statement imports, positions). Those live
+  in the database only and are out of scope for the seed loader.
+- Validate sibling weights sum to 1.0. The seed plan is presumed to come
+  from `plan validate`-clean YAML; the seed loader trusts what it reads
+  and is purely structural.
+
+Author: Emre Tezel
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
+
+import yaml
+
+# Public constant: convert a [0, 1] fraction (or unbounded multiplier like
+# `adjustment`) to integer parts-per-million for storage. Rounded so a
+# user's `0.62 + 0.05 + 0.13 + 0.2` sums back to exactly 1_000_000 instead
+# of 999_999.
+MICROS_SCALE = 1_000_000
+
+
+def fraction_to_micros(value: float) -> int:
+    """Round a real-valued fraction to integer parts-per-million.
+
+    Used wherever the schema expects a `*_micros` column (weights,
+    volatility, adjustment, FX rates). Range validation is the database's
+    job via `CHECK` constraints — this helper is pure arithmetic.
+    """
+    return round(value * MICROS_SCALE)
+
+
+def seed_from_yaml(
+    connection: sqlite3.Connection,
+    *,
+    seed_plan_path: Path,
+    mappings_dir: Path,
+) -> None:
+    """Load the committed YAML catalog into the DB. Idempotent.
+
+    Runs inside a single transaction so a partial failure leaves the
+    database in its prior state. Behaviour:
+
+    - `seed_plan_path` is walked depth-first; every category node becomes
+      (or matches) a row in `category`, and every leaf records a
+      `category_default` row carrying the seed's suggested volatility and
+      adjustment. Categories that already exist are kept as-is; rows are
+      never deleted.
+    - For each `<adapter>.yaml` in `mappings_dir`, every mapping row for
+      that adapter is deleted up-front (so removed allocations actually
+      go away on re-seed) and replaced with the file's contents. The
+      mapping table is global — there is no per-user scope.
+    """
+    connection.execute("BEGIN")
+    try:
+        _seed_categories_from_plan(connection, seed_plan_path)
+        if mappings_dir.exists():
+            for mapping_file in sorted(mappings_dir.glob("*.yaml")):
+                _seed_mappings_for_adapter(connection, mapping_file.stem, mapping_file)
+        connection.execute("COMMIT")
+    except Exception:
+        connection.execute("ROLLBACK")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Categories
+# ---------------------------------------------------------------------------
+
+
+def _seed_categories_from_plan(connection: sqlite3.Connection, path: Path) -> None:
+    """Walk the seed plan YAML and ensure category + category_default rows."""
+    if not path.exists():
+        return
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    assets = data.get("assets", data) if isinstance(data, dict) else data
+    if not isinstance(assets, list):
+        return
+    for entry in assets:
+        if isinstance(entry, dict):
+            _walk_seed_node(connection, parent_id=None, payload=entry)
+
+
+def _walk_seed_node(
+    connection: sqlite3.Connection,
+    *,
+    parent_id: Optional[int],
+    payload: Mapping[str, Any],
+) -> None:
+    """Recursive walker: insert category for `payload`, recurse into children.
+
+    Leaves (no `children`) additionally upsert a row into `category_default`
+    with the seed's suggested volatility and adjustment, so the interactive
+    plan walker can present them as defaults later.
+    """
+    raw_name = payload.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return
+    name = raw_name.strip()
+    category_id = _find_or_create_category(connection, parent_id=parent_id, name=name)
+    children = payload.get("children") or []
+    if isinstance(children, list) and children:
+        for child in children:
+            if isinstance(child, dict):
+                _walk_seed_node(connection, parent_id=category_id, payload=child)
+        return
+    # Leaf — record the suggestion. Volatility may be absent (e.g. for a
+    # placeholder leaf); leave it NULL in that case.
+    volatility_raw = payload.get("volatility")
+    adjustment_raw = payload.get("adjustment", 1.0)
+    vol_micros = fraction_to_micros(float(volatility_raw)) if volatility_raw is not None else None
+    adj_micros = fraction_to_micros(float(adjustment_raw))
+    connection.execute(
+        """
+        INSERT INTO category_default (category_id, volatility_micros, adjustment_micros)
+        VALUES (?, ?, ?)
+        ON CONFLICT(category_id) DO UPDATE SET
+            volatility_micros = excluded.volatility_micros,
+            adjustment_micros = excluded.adjustment_micros
+        """,
+        (category_id, vol_micros, adj_micros),
+    )
+
+
+def _find_or_create_category(
+    connection: sqlite3.Connection,
+    *,
+    parent_id: Optional[int],
+    name: str,
+) -> int:
+    """Find or insert `(parent_id, name)` in `category` and return its id.
+
+    Top-level categories (`parent_id IS NULL`) are matched via the partial
+    unique index `idx_category_top_level_name`; deeper categories rely on
+    the `UNIQUE (parent_id, name)` table constraint.
+    """
+    if parent_id is None:
+        row = connection.execute(
+            "SELECT id FROM category WHERE parent_id IS NULL AND name = ?",
+            (name,),
+        ).fetchone()
+    else:
+        row = connection.execute(
+            "SELECT id FROM category WHERE parent_id = ? AND name = ?",
+            (parent_id, name),
+        ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    cursor = connection.execute(
+        "INSERT INTO category (parent_id, name) VALUES (?, ?)",
+        (parent_id, name),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError(f"Failed to insert category {name!r}")
+    return int(cursor.lastrowid)
+
+
+def resolve_category_path(
+    connection: sqlite3.Connection,
+    parts: Sequence[str],
+) -> int:
+    """Resolve a full path (e.g. ('Bonds', 'Developed', 'NAM', 'Govt')) to a row id.
+
+    Missing intermediate or leaf categories are created. This is the only
+    sanctioned way to materialise a category path from text — both the
+    seed loader and the (later) interactive walker funnel through here so
+    the find-or-create semantics stay consistent.
+    """
+    current: Optional[int] = None
+    for raw in parts:
+        name = raw.strip()
+        if not name:
+            raise ValueError("category path contains an empty component")
+        current = _find_or_create_category(connection, parent_id=current, name=name)
+    if current is None:
+        raise ValueError("category path is empty")
+    return current
+
+
+# ---------------------------------------------------------------------------
+# Mappings
+# ---------------------------------------------------------------------------
+
+
+def _seed_mappings_for_adapter(
+    connection: sqlite3.Connection,
+    adapter: str,
+    path: Path,
+) -> None:
+    """Replace all mappings for `adapter` with the YAML contents.
+
+    The mapping table is global (no scope, no user_id) — every mapping
+    applies to every user. Per-adapter wiping at the start means that
+    removing an instrument from the YAML actually removes it on re-seed.
+    """
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        return
+    connection.execute(
+        """
+        DELETE FROM mapping
+        WHERE instrument_id IN (SELECT id FROM instrument WHERE adapter = ?)
+        """,
+        (adapter,),
+    )
+    for raw_instrument_id, payload in data.items():
+        if not isinstance(payload, dict):
+            continue
+        allocations = payload.get("allocations")
+        if not isinstance(allocations, list) or not allocations:
+            continue
+        instrument_id_text = str(raw_instrument_id).strip()
+        if not instrument_id_text:
+            continue
+        description_raw = payload.get("description")
+        description = str(description_raw).strip() if isinstance(description_raw, str) else None
+        instrument_id = _find_or_create_instrument(
+            connection,
+            adapter=adapter,
+            instrument_id_text=instrument_id_text,
+            description=description,
+        )
+        for allocation in allocations:
+            if not isinstance(allocation, dict):
+                continue
+            category_text = str(allocation.get("category", "")).strip()
+            if not category_text:
+                continue
+            parts = tuple(p.strip() for p in category_text.split("/") if p.strip())
+            if not parts:
+                continue
+            weight_raw = allocation.get("weight")
+            if weight_raw is None:
+                continue
+            try:
+                weight_micros = fraction_to_micros(float(weight_raw))
+            except (TypeError, ValueError):
+                continue
+            if weight_micros <= 0:
+                continue
+            category_id = resolve_category_path(connection, parts)
+            connection.execute(
+                "INSERT INTO mapping (instrument_id, category_id, weight_micros) VALUES (?, ?, ?)",
+                (instrument_id, category_id, weight_micros),
+            )
+
+
+def _find_or_create_instrument(
+    connection: sqlite3.Connection,
+    *,
+    adapter: str,
+    instrument_id_text: str,
+    description: Optional[str],
+) -> int:
+    """Find or insert `(adapter, instrument_id_text)` and return its row id.
+
+    The description is updated only when the existing row has no
+    description and the new one does — the YAML is the source of truth
+    for descriptions on shared instruments, but the loader doesn't
+    overwrite a description the user already curated.
+    """
+    row = connection.execute(
+        "SELECT id, description FROM instrument WHERE adapter = ? AND instrument_id_text = ?",
+        (adapter, instrument_id_text),
+    ).fetchone()
+    if row is not None:
+        existing_id = int(row["id"])
+        if description and not row["description"]:
+            connection.execute(
+                "UPDATE instrument SET description = ? WHERE id = ?",
+                (description, existing_id),
+            )
+        return existing_id
+    cursor = connection.execute(
+        "INSERT INTO instrument (adapter, instrument_id_text, description) VALUES (?, ?, ?)",
+        (adapter, instrument_id_text, description),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError(f"Failed to insert instrument ({adapter!r}, {instrument_id_text!r})")
+    return int(cursor.lastrowid)

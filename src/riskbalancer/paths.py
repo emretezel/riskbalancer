@@ -68,6 +68,7 @@ class UserPaths:
     seed_plan: Path
     users_root: Path
     riskbalancer_config: Path
+    db_path: Path
 
     @classmethod
     def for_user(cls, user: str, *, root: Optional[Path] = None) -> "UserPaths":
@@ -97,6 +98,7 @@ class UserPaths:
             seed_plan=base / "config" / "seed_plan.yaml",
             users_root=users_root,
             riskbalancer_config=base / "config" / "riskbalancer.yaml",
+            db_path=base / "private" / "riskbalancer.db",
         )
 
     def adapter_mappings_path(self, adapter: str) -> Path:

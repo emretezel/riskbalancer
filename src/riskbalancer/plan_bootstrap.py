@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from typing import Iterable, List, Optional, Protocol, Sequence
 
 import yaml
 
+from . import repositories
 from .configuration import (
     CategoryNode,
     collect_category_weight_validation_failures,
@@ -30,6 +32,7 @@ from .configuration import (
     load_category_nodes_from_yaml,
 )
 from .paths import UserPaths
+from .seed import MICROS_SCALE
 
 DEFAULT_ADJUSTMENT = 1.0
 
@@ -87,6 +90,10 @@ def build_catalog(paths: UserPaths) -> list[CatalogNode]:
     highest-priority source wins for `suggested_volatility` and
     `suggested_adjustment`; child sets are unioned in first-seen order so the
     user is offered every option that has ever been described.
+
+    Deprecated YAML-backed variant kept around during the database
+    migration so legacy tests still pass. New code should call
+    `build_catalog_from_db` directly.
     """
     catalog: list[CatalogNode] = []
     for source_nodes in _peer_plan_sources(paths):
@@ -96,6 +103,87 @@ def build_catalog(paths: UserPaths) -> list[CatalogNode]:
     for leaf_path in _collect_mapping_leaves(paths):
         _ensure_leaf_in_catalog(catalog, leaf_path)
     return catalog
+
+
+def build_catalog_from_db(
+    connection: sqlite3.Connection,
+    *,
+    current_user_id: Optional[int],
+) -> list[CatalogNode]:
+    """Build the merged catalog by querying the database.
+
+    Priority order, identical in spirit to the YAML version:
+
+    1. Peer-user plans (deterministic by `user.name`). First peer that has
+       a given category wins on `suggested_weight`, `suggested_volatility`,
+       and `suggested_adjustment`.
+    2. Seed defaults from `category_default`. Fills in volatility /
+       adjustment suggestions for leaves the seed defined but no peer
+       plan has adopted yet.
+    3. Shared mapping leaves. Categories referenced by mappings but absent
+       from every peer plan are inserted with `from_mappings=True` so the
+       walker can flag them.
+
+    Categories that exist in the DB only because a previous seed loaded
+    them and no plan or mapping references them are intentionally
+    invisible — the user does not need to see structure with no signal
+    behind it.
+    """
+    catalog: list[CatalogNode] = []
+    for _peer_name, peer_tree in repositories.iter_peer_plans(
+        connection, exclude_user_id=current_user_id
+    ):
+        _merge_nodes_into_catalog(peer_tree, catalog)
+    _merge_seed_leaves_into_catalog(connection, catalog)
+    for leaf_path in repositories.iter_mapping_paths(connection):
+        _ensure_leaf_in_catalog(catalog, leaf_path)
+    return catalog
+
+
+def _merge_seed_leaves_into_catalog(
+    connection: sqlite3.Connection,
+    catalog: list[CatalogNode],
+) -> None:
+    """Fill in volatility / adjustment suggestions from `category_default`.
+
+    Each `category_default` row corresponds to a category the seed plan
+    treated as a leaf. Walking the row's full path ensures the catalog
+    has the ancestor chain and the leaf node's suggestions are filled in
+    (without overwriting an earlier peer-derived value, since gap-fill
+    is the convention everywhere else in this module).
+    """
+    rows = connection.execute(
+        """
+        SELECT cd.volatility_micros, cd.adjustment_micros, cp.path
+        FROM category_default cd
+        JOIN category_path cp ON cp.id = cd.category_id
+        ORDER BY cp.path
+        """
+    ).fetchall()
+    for row in rows:
+        path = tuple(part.strip() for part in str(row["path"]).split("/") if part.strip())
+        if not path:
+            continue
+        vol_raw = row["volatility_micros"]
+        vol = vol_raw / MICROS_SCALE if vol_raw is not None else None
+        adj = row["adjustment_micros"] / MICROS_SCALE
+        cursor = catalog
+        for index, segment in enumerate(path):
+            is_leaf = index == len(path) - 1
+            existing = _find_by_name(cursor, segment)
+            if existing is None:
+                existing = CatalogNode(
+                    name=segment,
+                    suggested_volatility=vol if is_leaf else None,
+                    suggested_adjustment=adj if is_leaf else None,
+                )
+                cursor.append(existing)
+            elif is_leaf:
+                if existing.suggested_volatility is None and vol is not None:
+                    existing.suggested_volatility = vol
+                if existing.suggested_adjustment is None:
+                    existing.suggested_adjustment = adj
+            cursor = existing.children
 
 
 def _peer_plan_sources(paths: UserPaths) -> Iterable[list[CategoryNode]]:
@@ -780,3 +868,39 @@ def count_unique_categories(catalog: Sequence[CatalogNode]) -> int:
         total += 1
         total += count_unique_categories(node.children)
     return total
+
+
+def describe_catalog_sources_from_db(
+    connection: sqlite3.Connection,
+    *,
+    current_user_name: str,
+) -> str:
+    """Render a one-line summary of where the DB-backed catalog drew from.
+
+    Mirrors `describe_catalog_sources` but reads from the database instead
+    of the filesystem. Used by `plan create` to show the user which peers
+    contributed before the interactive walk begins.
+    """
+    parts: List[str] = []
+    peer_rows = connection.execute(
+        """
+        SELECT u.name
+        FROM user u
+        WHERE u.name != ?
+          AND EXISTS (SELECT 1 FROM plan_node pn WHERE pn.user_id = u.id)
+        ORDER BY u.name
+        """,
+        (current_user_name,),
+    ).fetchall()
+    if peer_rows:
+        names = [row["name"] for row in peer_rows]
+        parts.append(f"{len(names)} peer plan(s): {', '.join(names)}")
+    seed_count = connection.execute("SELECT COUNT(*) AS n FROM category_default").fetchone()["n"]
+    if seed_count:
+        parts.append(f"{seed_count} seed leaf default(s)")
+    mapping_count = connection.execute("SELECT COUNT(*) AS n FROM mapping").fetchone()["n"]
+    if mapping_count:
+        parts.append(f"{mapping_count} mapping row(s)")
+    if not parts:
+        return "Catalog: empty"
+    return "Catalog: " + ", ".join(parts)

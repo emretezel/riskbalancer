@@ -1,0 +1,394 @@
+"""
+Versioned DDL migrations for the RiskBalancer database.
+
+Each migration is a callable that takes a `sqlite3.Connection` and applies
+schema changes. Migrations run in order and are tracked by SQLite's
+`PRAGMA user_version`. The `schema_version` table records each application
+with a timestamp for human inspection — it is created by migration 1.
+
+Migrations are append-only: once a migration has been released and applied
+on any developer's machine, it must never be edited. New changes are new
+migrations.
+
+Author: Emre Tezel
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from datetime import datetime, timezone
+from typing import Callable, List
+
+# Each migration applies one numbered change. The list order is the schema
+# version order: index `i` is version `i + 1`. The runner reads
+# `PRAGMA user_version` to find where to resume and refuses to start if the
+# DB is newer than this binary knows about (downgrade protection).
+Migration = Callable[[sqlite3.Connection], None]
+
+
+# ---------------------------------------------------------------------------
+# Migration 1: initial schema (Option B of the persistence redesign).
+#
+# Notes on the choices encoded here:
+#
+# - Every table is declared `STRICT` so SQLite actually enforces the column
+#   type instead of accepting anything via type affinity. STRICT requires
+#   SQLite >= 3.37; `db._require_modern_sqlite` rejects older versions before
+#   we get here.
+#
+# - Money is stored as `INTEGER` ten-thousandths of a unit currency
+#   (suffix `_decithou`) so we can keep four decimal places without floating
+#   point error. £1.2345 is stored as 12345.
+#
+# - Fractions (weights, volatility, adjustments, FX rates) are stored as
+#   `INTEGER` parts-per-million (suffix `_micros`). 0.55 is 550000; 1.0 is
+#   1_000_000. We never store fractions as REAL.
+#
+# - Quantities (number of units of a holding) are stored as `INTEGER` micro-
+#   units, allowing fractional shares to six decimal places.
+#
+# - Dates use ISO-8601 `TEXT` (`YYYY-MM-DD`) with a GLOB CHECK so the
+#   database rejects malformed inputs at write time.
+#
+# - Timestamps use ISO-8601 UTC `TEXT` with the trailing `Z` suffix
+#   (e.g. `2026-05-17T12:34:56Z`). The CHECK is loose on the time part
+#   so fractional seconds and short forms both pass.
+# ---------------------------------------------------------------------------
+
+# Allowed `adapter` values across `source`, `instrument`, and `mapping`.
+# Centralised here so the CHECK clause stays consistent everywhere it
+# appears. `manual` covers user-entered holdings that did not originate
+# from a broker statement.
+_ADAPTERS_LIST = "('ibkr','ajbell','citi','ms401k','schwab','aegon','manual')"
+
+# SQLite `GLOB` uses shell-style wildcards: `?` matches a single character
+# and `*` matches zero or more. (`_` is literal in GLOB — it is the
+# single-character wildcard in `LIKE`, not here.) We use GLOB rather than
+# LIKE so the patterns are case-sensitive without depending on PRAGMA
+# case_sensitive_like.
+_TIMESTAMP_GLOB = "????-??-??T*Z"
+_DATE_GLOB = "????-??-??"
+
+_MIGRATION_1_TABLES: tuple[str, ...] = (
+    # Records every applied migration with a timestamp. Used for human
+    # inspection; the runner relies on `PRAGMA user_version` for sequencing.
+    f"""
+    CREATE TABLE schema_version (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL CHECK (applied_at GLOB '{_TIMESTAMP_GLOB}')
+    ) STRICT
+    """,
+    # Users are the top-level namespace. `name` is the on-disk identifier
+    # the CLI accepts in `--user`.
+    f"""
+    CREATE TABLE user (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE CHECK (length(name) > 0),
+        created_at TEXT NOT NULL CHECK (created_at GLOB '{_TIMESTAMP_GLOB}')
+    ) STRICT
+    """,
+    # Single hierarchical registry of categories. Pure structure — no
+    # volatility, no adjustment, no weight. Leaf vs branch is a per-plan
+    # concept (see `plan_node`).
+    """
+    CREATE TABLE category (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES category(id) ON DELETE RESTRICT,
+        name TEXT NOT NULL CHECK (length(name) > 0),
+        UNIQUE (parent_id, name)
+    ) STRICT
+    """,
+    # Seed-derived suggestions for a category's volatility/adjustment.
+    # Used only by the interactive plan walker as defaults; the user can
+    # override them per plan node. Categories that the seed never uses as
+    # a leaf have no row here.
+    """
+    CREATE TABLE category_default (
+        category_id INTEGER PRIMARY KEY REFERENCES category(id) ON DELETE CASCADE,
+        volatility_micros INTEGER CHECK (volatility_micros IS NULL OR volatility_micros >= 0),
+        adjustment_micros INTEGER NOT NULL DEFAULT 1000000 CHECK (adjustment_micros >= 0)
+    ) STRICT
+    """,
+    # A brokerage relationship for a user. One row per (user, adapter):
+    # different accounts at the same broker share the same source.
+    f"""
+    CREATE TABLE source (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+        adapter TEXT NOT NULL CHECK (adapter IN {_ADAPTERS_LIST}),
+        UNIQUE (user_id, adapter)
+    ) STRICT
+    """,
+    # A named account within a source (e.g. an AJ Bell ISA, an AJ Bell
+    # SIPP). One source can hold many accounts.
+    """
+    CREATE TABLE account (
+        id INTEGER PRIMARY KEY,
+        source_id INTEGER NOT NULL REFERENCES source(id) ON DELETE CASCADE,
+        name TEXT NOT NULL CHECK (length(name) > 0),
+        UNIQUE (source_id, name)
+    ) STRICT
+    """,
+    # Global registry of broker instruments. The same ticker at different
+    # brokers is two rows — the leading column is `(adapter, instrument_id_text)`.
+    f"""
+    CREATE TABLE instrument (
+        id INTEGER PRIMARY KEY,
+        adapter TEXT NOT NULL CHECK (adapter IN {_ADAPTERS_LIST}),
+        instrument_id_text TEXT NOT NULL CHECK (length(instrument_id_text) > 0),
+        description TEXT,
+        UNIQUE (adapter, instrument_id_text)
+    ) STRICT
+    """,
+    # Instrument-to-category mappings, split-aware (multiple rows per
+    # instrument when the holding maps across several categories). One row
+    # per (instrument, category) pair. Mappings are global — the same
+    # mapping applies to every user. The leaf-only invariant (a mapping
+    # must target a category with no children) is enforced by triggers,
+    # not by a CHECK, because CHECK cannot reference other rows.
+    """
+    CREATE TABLE mapping (
+        id INTEGER PRIMARY KEY,
+        instrument_id INTEGER NOT NULL REFERENCES instrument(id) ON DELETE RESTRICT,
+        category_id INTEGER NOT NULL REFERENCES category(id) ON DELETE RESTRICT,
+        weight_micros INTEGER NOT NULL
+            CHECK (weight_micros > 0 AND weight_micros <= 1000000),
+        UNIQUE (instrument_id, category_id)
+    ) STRICT
+    """,
+    # Historical FX rates, one row per (date, currency). The stored rate
+    # is GBP per native unit (e.g. 0.76 for USD/GBP on a given day).
+    f"""
+    CREATE TABLE fx_rate (
+        id INTEGER PRIMARY KEY,
+        rate_date TEXT NOT NULL CHECK (rate_date GLOB '{_DATE_GLOB}'),
+        currency TEXT NOT NULL CHECK (length(currency) = 3),
+        gbp_rate_micros INTEGER NOT NULL CHECK (gbp_rate_micros > 0),
+        UNIQUE (rate_date, currency)
+    ) STRICT
+    """,
+    # A user's plan: a tree of category targets. Whether a row is a leaf
+    # or a branch is decided by whether any other plan_node row has it as
+    # parent_id, so the same category can be a leaf for one user and a
+    # branch for another. The application enforces (i) sibling weights at
+    # every level sum to 1.0, and (ii) volatility_micros IS NULL iff the
+    # row is a branch (leaves carry an explicit volatility).
+    """
+    CREATE TABLE plan_node (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+        parent_id INTEGER REFERENCES plan_node(id) ON DELETE CASCADE,
+        category_id INTEGER NOT NULL REFERENCES category(id) ON DELETE RESTRICT,
+        weight_micros INTEGER NOT NULL
+            CHECK (weight_micros >= 0 AND weight_micros <= 1000000),
+        volatility_micros INTEGER
+            CHECK (volatility_micros IS NULL OR volatility_micros >= 0),
+        adjustment_micros INTEGER NOT NULL DEFAULT 1000000
+            CHECK (adjustment_micros >= 0),
+        UNIQUE (user_id, parent_id, category_id)
+    ) STRICT
+    """,
+    # An import event: one row per (account, as_of). Re-importing the
+    # same (account, as_of) is implemented as a transactional DELETE then
+    # INSERT in the import command, cascading through positions and
+    # import_fx via ON DELETE CASCADE.
+    f"""
+    CREATE TABLE statement_import (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES user(id) ON DELETE CASCADE,
+        account_id INTEGER NOT NULL REFERENCES account(id) ON DELETE CASCADE,
+        as_of TEXT NOT NULL CHECK (as_of GLOB '{_DATE_GLOB}'),
+        statement_path TEXT,
+        imported_at TEXT NOT NULL CHECK (imported_at GLOB '{_TIMESTAMP_GLOB}'),
+        UNIQUE (account_id, as_of)
+    ) STRICT
+    """,
+    # FX rates as observed at the moment a statement was imported. Frozen
+    # per-import so the GBP-equivalent value of historical positions is
+    # reproducible even if `fx_rate` is later corrected.
+    """
+    CREATE TABLE import_fx (
+        statement_import_id INTEGER NOT NULL
+            REFERENCES statement_import(id) ON DELETE CASCADE,
+        currency TEXT NOT NULL CHECK (length(currency) = 3),
+        gbp_rate_micros INTEGER NOT NULL CHECK (gbp_rate_micros > 0),
+        PRIMARY KEY (statement_import_id, currency)
+    ) STRICT
+    """,
+    # A holding inside an import. Native amounts only; GBP is computed
+    # by joining import_fx on `currency` so we never store a derived
+    # value (single source of truth).
+    """
+    CREATE TABLE position (
+        id INTEGER PRIMARY KEY,
+        statement_import_id INTEGER NOT NULL
+            REFERENCES statement_import(id) ON DELETE CASCADE,
+        instrument_id INTEGER NOT NULL REFERENCES instrument(id) ON DELETE RESTRICT,
+        description TEXT,
+        quantity_micro_units INTEGER,
+        market_value_native_decithou INTEGER NOT NULL
+            CHECK (market_value_native_decithou >= 0),
+        currency TEXT NOT NULL CHECK (length(currency) = 3),
+        UNIQUE (statement_import_id, instrument_id)
+    ) STRICT
+    """,
+)
+
+_MIGRATION_1_INDEXES: tuple[str, ...] = (
+    # Drives the per-import mapping lookup: given an instrument parsed
+    # from a statement, fetch all (category, weight) rows for it. One
+    # key, no scope discrimination — mappings are global.
+    "CREATE INDEX idx_mapping_instrument ON mapping(instrument_id)",
+    # Drives both "current portfolio" and "portfolio as of date X" — every
+    # query needs the latest `as_of` per `(user, account)`.
+    "CREATE INDEX idx_statement_import_user_account_asof "
+    "ON statement_import(user_id, account_id, as_of DESC)",
+    # Supports cross-import "every holding of EMIM ever" queries used by
+    # the interactive walker when suggesting categories.
+    "CREATE INDEX idx_position_instrument ON position(instrument_id)",
+    # SQLite treats NULL as distinct in composite UNIQUE constraints, so
+    # `UNIQUE (parent_id, name)` does NOT prevent two top-level categories
+    # from sharing a name (both have `parent_id IS NULL`). This partial
+    # unique index closes that gap for the root-level case.
+    "CREATE UNIQUE INDEX idx_category_top_level_name ON category(name) WHERE parent_id IS NULL",
+)
+
+
+_MIGRATION_1_TRIGGERS: tuple[str, ...] = (
+    # Enforce the leaf-only invariant for mapping targets: a mapping must
+    # not point at a category that currently has children. Triggers fire
+    # on the data being written; a category that later gains children
+    # does NOT retroactively invalidate existing mappings — the resolver
+    # tolerates such "stale" rows by rolling up to the user's plan leaf
+    # at report time. Strict enforcement happens at the time someone
+    # introduces the inconsistency (insert / update of category_id),
+    # which is where the user is in a position to fix it.
+    """
+    CREATE TRIGGER mapping_target_must_be_leaf_insert
+    BEFORE INSERT ON mapping
+    FOR EACH ROW
+    WHEN EXISTS (SELECT 1 FROM category WHERE parent_id = NEW.category_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'mapping target must be a leaf category');
+    END
+    """,
+    """
+    CREATE TRIGGER mapping_target_must_be_leaf_update
+    BEFORE UPDATE OF category_id ON mapping
+    FOR EACH ROW
+    WHEN EXISTS (SELECT 1 FROM category WHERE parent_id = NEW.category_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'mapping target must be a leaf category');
+    END
+    """,
+)
+
+_MIGRATION_1_VIEWS: tuple[str, ...] = (
+    # The most-recent import per account. Used by `current_position` and
+    # by the report writer.
+    """
+    CREATE VIEW current_import AS
+    SELECT si.*
+    FROM statement_import si
+    WHERE si.as_of = (
+        SELECT MAX(si2.as_of)
+        FROM statement_import si2
+        WHERE si2.account_id = si.account_id
+    )
+    """,
+    # Positions tied to the current import per account. Reports join this
+    # against import_fx by currency to compute the GBP value.
+    """
+    CREATE VIEW current_position AS
+    SELECT
+        p.id AS id,
+        p.statement_import_id AS statement_import_id,
+        p.instrument_id AS instrument_id,
+        p.description AS description,
+        p.quantity_micro_units AS quantity_micro_units,
+        p.market_value_native_decithou AS market_value_native_decithou,
+        p.currency AS currency,
+        ci.user_id AS user_id,
+        ci.account_id AS account_id,
+        ci.as_of AS as_of
+    FROM position p
+    JOIN current_import ci ON ci.id = p.statement_import_id
+    """,
+    # Recursive view materialising the full ' / '-joined path for every
+    # category. Used wherever we have to render or match a path string.
+    """
+    CREATE VIEW category_path AS
+    WITH RECURSIVE walk(id, parent_id, path) AS (
+        SELECT id, parent_id, name
+        FROM category
+        WHERE parent_id IS NULL
+        UNION ALL
+        SELECT c.id, c.parent_id, walk.path || ' / ' || c.name
+        FROM category c
+        JOIN walk ON c.parent_id = walk.id
+    )
+    SELECT id, path FROM walk
+    """,
+)
+
+
+def _migration_1(connection: sqlite3.Connection) -> None:
+    """Create the initial schema: tables, indexes, views, and triggers."""
+    for statement in _MIGRATION_1_TABLES:
+        connection.execute(statement)
+    for statement in _MIGRATION_1_INDEXES:
+        connection.execute(statement)
+    for statement in _MIGRATION_1_VIEWS:
+        connection.execute(statement)
+    for statement in _MIGRATION_1_TRIGGERS:
+        connection.execute(statement)
+
+
+MIGRATIONS: List[Migration] = [
+    _migration_1,
+]
+
+
+def apply_migrations(connection: sqlite3.Connection) -> None:
+    """Apply pending migrations in order. Idempotent and atomic per step.
+
+    Reads `PRAGMA user_version` to find the latest applied version. Each
+    migration runs inside its own explicit transaction so a failed
+    migration rolls back cleanly. Refuses to start if the DB is newer
+    than this binary supports (downgrade protection).
+    """
+    current_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    target_version = len(MIGRATIONS)
+    if current_version > target_version:
+        raise RuntimeError(
+            f"Database schema version {current_version} is newer than this binary "
+            f"supports (max {target_version}). Refusing to downgrade."
+        )
+    for index in range(current_version, target_version):
+        version = index + 1
+        connection.execute("BEGIN")
+        try:
+            MIGRATIONS[index](connection)
+            connection.execute(
+                "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
+                (version, _utc_now_iso()),
+            )
+            # `PRAGMA user_version = N` does not accept a bound parameter,
+            # so the literal is interpolated. `version` is a controlled
+            # integer from a known list, so there is no injection surface.
+            connection.execute(f"PRAGMA user_version = {version}")
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+
+
+def _utc_now_iso() -> str:
+    """Return the current UTC time as `YYYY-MM-DDTHH:MM:SSZ`.
+
+    Stored in `schema_version.applied_at`. The CHECK constraint on that
+    column requires the `Z` suffix, so we explicitly canonicalise the
+    output (Python's default appends `+00:00`).
+    """
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    return now.strftime("%Y-%m-%dT%H:%M:%SZ")

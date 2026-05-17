@@ -1,10 +1,14 @@
 BlackRock_Emerging_Markets_Index_Fund:
   allocations:
-  - category: Equities / EM
-    weight: 1.0
+  - category: Equities / EM / Asia
+    weight: 0.78
+  - category: Equities / EM / EMEA
+    weight: 0.13
+  - category: Equities / EM / Americas
+    weight: 0.09
 Wellington_Opportunistic_Emerging_Markets_Debt_Fund:
   allocations:
-  - category: Bonds / EM / Normal / Govt
+  - category: Bonds / EM / Local / Govt
     weight: 0.75
-  - category: Bonds / EM / Foreign / Corporate
+  - category: Bonds / EM / Foreign / Corp
     weight: 0.25

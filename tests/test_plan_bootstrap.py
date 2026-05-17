@@ -130,17 +130,17 @@ def test_build_catalog_marks_mapping_only_leaves(tmp_path):
         """\
 TICKER:
   allocations:
-    - category: Alternative / Crypto
+    - category: Alternatives / Crypto
       weight: 1.0
 """,
         encoding="utf-8",
     )
 
     catalog = build_catalog(paths)
-    alternative = next((n for n in catalog if n.name == "Alternative"), None)
-    assert alternative is not None, "Alternative should be added from the mapping file"
-    assert alternative.from_mappings is True
-    crypto = alternative.children[0]
+    alternatives = next((n for n in catalog if n.name == "Alternatives"), None)
+    assert alternatives is not None, "Alternatives should be added from the mapping file"
+    assert alternatives.from_mappings is True
+    crypto = alternatives.children[0]
     assert crypto.name == "Crypto"
     assert crypto.from_mappings is True
 

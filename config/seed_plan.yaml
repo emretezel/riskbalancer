@@ -16,7 +16,7 @@ assets:
         weight: 0.2
         volatility: 0.175
         adjustment: 0.9
-      - name: Non -UK
+      - name: Non-UK
         weight: 0.8
         volatility: 0.175
         adjustment: 0.9
@@ -33,8 +33,19 @@ assets:
         adjustment: 0.9
   - name: EM
     weight: 0.25
-    volatility: 0.232
-    adjustment: 0.9
+    children:
+    - name: Americas
+      weight: 0.34
+      volatility: 0.232
+      adjustment: 0.9
+    - name: EMEA
+      weight: 0.33
+      volatility: 0.232
+      adjustment: 0.9
+    - name: Asia
+      weight: 0.33
+      volatility: 0.232
+      adjustment: 0.9
 - name: Bonds
   weight: 0.2
   children:
@@ -97,7 +108,7 @@ assets:
   - name: EM
     weight: 0.25
     children:
-    - name: Normal
+    - name: Local
       weight: 0.6
       children:
       - name: Govt
@@ -111,11 +122,28 @@ assets:
         weight: 0.4
         volatility: 0.073
         adjustment: 0.85
-      - name: Corporate
+      - name: Corp
         weight: 0.6
         volatility: 0.08
         adjustment: 0.8
-- name: Alternative
+- name: Bond Alternatives
+  weight: 0.0
+  children:
+  - name: Infrastructure
+    weight: 0.5
+    children:
+    - name: Developed
+      weight: 1.0
+      volatility: 0.1
+      adjustment: 1.0
+  - name: Real Assets
+    weight: 0.5
+    children:
+    - name: Agribusiness
+      weight: 1.0
+      volatility: 0.15
+      adjustment: 1.0
+- name: Alternatives
   weight: 0.25
   children:
   - name: Gold
