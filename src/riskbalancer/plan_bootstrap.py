@@ -117,9 +117,9 @@ def build_catalog_from_db(
     1. Peer-user plans (deterministic by `user.name`). First peer that has
        a given category wins on `suggested_weight`, `suggested_volatility`,
        and `suggested_adjustment`.
-    2. Seed defaults from `category_attribute`. Fills in volatility /
-       adjustment suggestions for leaves the seed defined but no peer
-       plan has adopted yet.
+    2. Seed defaults from `category` (the merged vol/adj columns from
+       migration 6). Fills in volatility / adjustment suggestions for
+       leaves the seed defined but no peer plan has adopted yet.
     3. Shared mapping leaves. Categories referenced by mappings but absent
        from every peer plan are inserted with `from_mappings=True` so the
        walker can flag them.
@@ -144,22 +144,24 @@ def _merge_seed_leaves_into_catalog(
     connection: sqlite3.Connection,
     catalog: list[CatalogNode],
 ) -> None:
-    """Fill in volatility / adjustment suggestions from `category_attribute`.
+    """Fill in volatility / adjustment suggestions from `category`.
 
-    Every `category_attribute` row corresponds to a category whose
-    intrinsic vol/adj is known — typically a seed leaf, but also any
-    category a user has already adopted as a plan-leaf. Walking the
-    row's full path ensures the catalog has the ancestor chain and the
-    leaf node's suggestions are filled in (without overwriting an earlier
-    peer-derived value, since gap-fill is the convention everywhere else
-    in this module). Branches in the seed plan have no row here; their
-    branch-level suggestions come from peer plans if at all.
+    Every `category` row with non-NULL vol/adj corresponds to a category
+    whose intrinsic fundamentals are known — typically a seed leaf, but
+    also any category a user has already adopted as a plan-leaf. Walking
+    the row's full path ensures the catalog has the ancestor chain and
+    the leaf node's suggestions are filled in (without overwriting an
+    earlier peer-derived value, since gap-fill is the convention
+    everywhere else in this module). Branches whose vol/adj is unset
+    have NULL in these columns; their branch-level suggestions come
+    from peer plans if at all.
     """
     rows = connection.execute(
         """
-        SELECT ca.volatility_micros, ca.adjustment_micros, cp.path
-        FROM category_attribute ca
-        JOIN category_path cp ON cp.id = ca.category_id
+        SELECT c.volatility_micros, c.adjustment_micros, cp.path
+        FROM category c
+        JOIN category_path cp ON cp.id = c.id
+        WHERE c.volatility_micros IS NOT NULL
         ORDER BY cp.path
         """
     ).fetchall()
@@ -690,6 +692,130 @@ def _prompt_positive_float(io: IO, message: str, *, default: Optional[float]) ->
             io.warn("Enter a positive number.")
 
 
+def fill_missing_leaf_vol_adj(
+    connection: sqlite3.Connection,
+    nodes: Sequence[CategoryNode],
+    io: IO,
+) -> None:
+    """Ensure every plan-leaf has a concrete volatility/adjustment in memory.
+
+    Walks `nodes` depth-first. For each leaf whose `volatility is None`:
+
+    1. Looks up the category by path in the DB (without creating any
+       rows). If the row already has `volatility_micros` /
+       `adjustment_micros` set, copies them onto the in-memory node —
+       previously-defined fundamentals are reused silently.
+    2. Otherwise, prompts the user via the same `_prompt_leaf_metadata`
+       used by the interactive walker, defaulting to the closest
+       ancestor's vol/adj if any. Raises `PlanCreationAborted` if the
+       prompt cancels.
+
+    Mutates `nodes` in place. The interactive walker already collects
+    vol/adj at leaf time, so this helper is only meaningful for the CSV
+    import path where blank cells produce leaves with `volatility=None`.
+    """
+    _fill_missing_leaf_vol_adj(
+        connection,
+        nodes,
+        io,
+        path_prefix=(),
+        inherited_volatility=None,
+        inherited_adjustment=None,
+    )
+
+
+def _fill_missing_leaf_vol_adj(
+    connection: sqlite3.Connection,
+    nodes: Sequence[CategoryNode],
+    io: IO,
+    *,
+    path_prefix: tuple[str, ...],
+    inherited_volatility: Optional[float],
+    inherited_adjustment: Optional[float],
+) -> None:
+    """Recursive implementation of `fill_missing_leaf_vol_adj`."""
+    for node in nodes:
+        path = path_prefix + (node.name,)
+        # Carry the node's own vol/adj down to descendants if set; this
+        # matches the walker's "inherited from nearest ancestor" rule.
+        next_inherited_vol = (
+            node.volatility if node.volatility is not None else inherited_volatility
+        )
+        next_inherited_adj = (
+            node.adjustment if node.adjustment not in (None, 1.0) else inherited_adjustment
+        )
+        if node.children:
+            _fill_missing_leaf_vol_adj(
+                connection,
+                node.children,
+                io,
+                path_prefix=path,
+                inherited_volatility=next_inherited_vol,
+                inherited_adjustment=next_inherited_adj,
+            )
+            continue
+        # Leaf branch.
+        if node.volatility is not None:
+            continue
+        # In-memory vol is missing. Try the DB first — a previous plan
+        # or seed load may have recorded fundamentals for this category.
+        category_id = _find_category_id_by_path(connection, path)
+        if category_id is not None:
+            attrs = repositories.get_category_attribute(connection, category_id)
+            if attrs is not None:
+                node.volatility, node.adjustment = attrs
+                continue
+        # Nothing in the DB either. Prompt the user. Treat the node's
+        # CSV-provided adjustment as the suggestion if it differs from
+        # the silent 1.0 default; otherwise fall back to inherited.
+        suggested_adj = node.adjustment if node.adjustment not in (None, 1.0) else None
+        synthetic = CatalogNode(
+            name=node.name,
+            suggested_volatility=None,
+            suggested_adjustment=suggested_adj,
+        )
+        label = " / ".join(path)
+        volatility, adjustment = _prompt_leaf_metadata(
+            io,
+            label,
+            synthetic,
+            inherited_volatility=inherited_volatility,
+            inherited_adjustment=inherited_adjustment,
+        )
+        node.volatility = volatility
+        node.adjustment = adjustment
+
+
+def _find_category_id_by_path(
+    connection: sqlite3.Connection,
+    path: tuple[str, ...],
+) -> Optional[int]:
+    """Resolve a category path to its id without creating any rows.
+
+    Mirrors `seed._find_or_create_category`'s lookup logic but returns
+    `None` for any missing path component instead of inserting. Used by
+    `fill_missing_leaf_vol_adj` so the read-side pre-check has no DB
+    side effects — the actual category rows are created later by
+    `repositories.write_plan_tree` inside its transaction.
+    """
+    parent_id: Optional[int] = None
+    for name in path:
+        if parent_id is None:
+            row = connection.execute(
+                "SELECT id FROM category WHERE parent_id IS NULL AND name = ?",
+                (name,),
+            ).fetchone()
+        else:
+            row = connection.execute(
+                "SELECT id FROM category WHERE parent_id = ? AND name = ?",
+                (parent_id, name),
+            ).fetchone()
+        if row is None:
+            return None
+        parent_id = int(row["id"])
+    return parent_id
+
+
 _WEIGHT_RE = re.compile(r"^\s*([0-9.]+)\s*%?\s*$")
 
 
@@ -897,7 +1023,9 @@ def describe_catalog_sources_from_db(
     if peer_rows:
         names = [row["name"] for row in peer_rows]
         parts.append(f"{len(names)} peer plan(s): {', '.join(names)}")
-    seed_count = connection.execute("SELECT COUNT(*) AS n FROM category_attribute").fetchone()["n"]
+    seed_count = connection.execute(
+        "SELECT COUNT(*) AS n FROM category WHERE volatility_micros IS NOT NULL"
+    ).fetchone()["n"]
     if seed_count:
         parts.append(f"{seed_count} category default(s)")
     mapping_count = connection.execute("SELECT COUNT(*) AS n FROM mapping").fetchone()["n"]

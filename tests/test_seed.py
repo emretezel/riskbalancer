@@ -99,17 +99,18 @@ def test_seed_distinguishes_same_leaf_name_under_distinct_parents(
 
 
 def test_seed_records_category_attribute_for_leaves(seeded_db: Database) -> None:
-    """`category_attribute` carries the seed leaf's volatility and adjustment.
+    """`category` carries the seed leaf's volatility and adjustment.
 
-    Both columns are NOT NULL in the new schema, and the row holds the
-    leaf's intrinsic fundamentals — no parent-relative weight, no
-    derivation. Plan weights live on `plan_node`.
+    Migration 6 merged the former `category_attribute` columns onto
+    `category`. The row holds the leaf's intrinsic fundamentals — no
+    parent-relative weight, no derivation. Plan weights live on
+    `plan_node`.
     """
     nam_row = seeded_db.connection.execute(
         """
-        SELECT ca.volatility_micros, ca.adjustment_micros
-        FROM category_attribute ca
-        JOIN category_path cp ON cp.id = ca.category_id
+        SELECT c.volatility_micros, c.adjustment_micros
+        FROM category c
+        JOIN category_path cp ON cp.id = c.id
         WHERE cp.path = ?
         """,
         ("Equities / Developed / NAM",),
@@ -121,32 +122,34 @@ def test_seed_records_category_attribute_for_leaves(seeded_db: Database) -> None
 
 
 def test_seed_does_not_record_branches_in_category_attribute(seeded_db: Database) -> None:
-    """Seed branches contribute their `category` row only — no `category_attribute` row.
+    """Seed branches have NULL vol/adj on `category`.
 
-    Branch-level volatility/adjustment is not a fact the schema holds;
+    Branch-level volatility/adjustment is not a fact the schema records;
     a user who wants to hold a branch (e.g. `Equities / Developed`) as
-    a plan-leaf must supply explicit vol/adj at plan-creation time
-    rather than rely on a stored derivation.
+    a plan-leaf must supply explicit vol/adj at plan-creation time. The
+    paired-NULL CHECK guarantees the two columns are unset together.
     """
     row = seeded_db.connection.execute(
         """
-        SELECT 1
-        FROM category_attribute ca
-        JOIN category_path cp ON cp.id = ca.category_id
+        SELECT c.volatility_micros, c.adjustment_micros
+        FROM category c
+        JOIN category_path cp ON cp.id = c.id
         WHERE cp.path = ?
         """,
         ("Equities / Developed",),
     ).fetchone()
-    assert row is None
+    assert row is not None
+    assert row["volatility_micros"] is None
+    assert row["adjustment_micros"] is None
 
 
 def test_seed_default_supports_adjustment_above_one(seeded_db: Database) -> None:
     """Adjustments like 1.35 are stored as 1_350_000 (no [0,1] clamp)."""
     row = seeded_db.connection.execute(
         """
-        SELECT ca.adjustment_micros
-        FROM category_attribute ca
-        JOIN category_path cp ON cp.id = ca.category_id
+        SELECT c.adjustment_micros
+        FROM category c
+        JOIN category_path cp ON cp.id = c.id
         WHERE cp.path = ?
         """,
         ("Bonds / Developed / NAM / Inflation",),
@@ -223,7 +226,7 @@ def test_seed_is_idempotent(seeded_db: Database) -> None:
         "n"
     ]
     before_attributes = seeded_db.connection.execute(
-        "SELECT COUNT(*) AS n FROM category_attribute"
+        "SELECT COUNT(*) AS n FROM category WHERE volatility_micros IS NOT NULL"
     ).fetchone()["n"]
     seed_from_yaml(
         seeded_db.connection,
@@ -239,7 +242,9 @@ def test_seed_is_idempotent(seeded_db: Database) -> None:
         == before_mappings
     )
     assert (
-        seeded_db.connection.execute("SELECT COUNT(*) AS n FROM category_attribute").fetchone()["n"]
+        seeded_db.connection.execute(
+            "SELECT COUNT(*) AS n FROM category WHERE volatility_micros IS NOT NULL"
+        ).fetchone()["n"]
         == before_attributes
     )
 
@@ -318,18 +323,17 @@ def test_seed_refuses_to_map_to_branch_category(tmp_path: Path) -> None:
 
 
 def test_load_plan_tree_raises_when_leaf_has_no_category_attribute(tmp_path: Path) -> None:
-    """A plan-leaf on a category with no `category_attribute` row cannot load.
+    """A plan-leaf whose category has NULL vol/adj cannot load.
 
-    This is the H2 invariant in action: vol/adj live on
-    `category_attribute` and must be explicit. If a developer (or a buggy
-    write path) leaves a plan-leaf pointing at a category with no
-    attribute row, `load_plan_tree` refuses to invent fallback values
-    and instead raises a typed error pinpointing the offending leaf.
+    Migration 6 merged vol/adj onto `category` (nullable, paired). A
+    plan-leaf referencing a category with NULL vol/adj is a
+    data-integrity error — the loader refuses to invent fallback values
+    and raises a typed error pinpointing the offending leaf.
     """
     db = Database.connect(":memory:")
     user_id = find_or_create_user(db.connection, "emre")
-    # Build the category row but deliberately skip the category_attribute
-    # row so the schema's "no derived vol/adj" rule is exercised end-to-end.
+    # Build the category row but deliberately leave vol/adj NULL so the
+    # schema's "no derived vol/adj" rule is exercised end-to-end.
     cash_id = db.connection.execute(
         "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
         ("Cash",),
@@ -339,7 +343,7 @@ def test_load_plan_tree_raises_when_leaf_has_no_category_attribute(tmp_path: Pat
         "VALUES (?, NULL, ?, ?)",
         (user_id, cash_id, MICROS_SCALE),
     )
-    with pytest.raises(ValueError, match="has no category_attribute row"):
+    with pytest.raises(ValueError, match="no volatility/adjustment recorded"):
         load_plan_tree(db.connection, user_id)
 
 
@@ -347,8 +351,8 @@ def test_plan_tree_round_trip_preserves_explicit_leaf_attributes(tmp_path: Path)
     """Writing a plan-leaf and reading it back returns the same vol/adj.
 
     Exercises the canonical path: the walker collects explicit vol/adj
-    for a plan-leaf, `write_plan_tree` upserts them into
-    `category_attribute`, and `load_plan_tree` reads them back without
+    for a plan-leaf, `write_plan_tree` updates the merged columns on
+    `category`, and `load_plan_tree` reads them back without
     transformation. No derivation, no fallback — what goes in comes out.
     """
     db = Database.connect(":memory:")
@@ -382,23 +386,24 @@ def test_branch_as_leaf_requires_explicit_vol_adj(seeded_db: Database) -> None:
     """A user holding a seed-branch as a plan-leaf must set vol/adj explicitly.
 
     The seed plan declares `Equities / EM` as a branch (Asia / EMEA /
-    Americas children), so no `category_attribute` row exists for it.
+    Americas children), so the merged `category` row has NULL vol/adj.
     A user whose plan stops at EM-as-a-leaf without supplying explicit
-    vol/adj on the in-memory node and without an existing attribute row
-    cannot be persisted: the writer raises rather than fabricating values.
+    vol/adj on the in-memory node and without recorded fundamentals on
+    the category cannot be persisted: the writer raises rather than
+    fabricating values.
     """
     user_id = find_or_create_user(seeded_db.connection, "emre")
     em_id = seeded_db.connection.execute(
         "SELECT id FROM category_path WHERE path = ?",
         ("Equities / EM",),
     ).fetchone()["id"]
-    # Sanity check: the seed-loaded branch indeed has no attribute row.
+    # Sanity check: the seed-loaded branch has NULL vol/adj.
     assert (
         seeded_db.connection.execute(
-            "SELECT COUNT(*) AS n FROM category_attribute WHERE category_id = ?",
+            "SELECT volatility_micros FROM category WHERE id = ?",
             (em_id,),
-        ).fetchone()["n"]
-        == 0
+        ).fetchone()["volatility_micros"]
+        is None
     )
     plan = [
         CategoryNode(
@@ -411,8 +416,8 @@ def test_branch_as_leaf_requires_explicit_vol_adj(seeded_db: Database) -> None:
     ]
     with pytest.raises(ValueError, match="has no in-memory volatility"):
         write_plan_tree(seeded_db.connection, user_id, plan)
-    # And once the walker has collected explicit fundamentals, the same
-    # plan persists successfully because the attribute row now exists.
+    # Once the walker has collected explicit fundamentals, the same
+    # plan persists successfully because the category now has vol/adj.
     upsert_category_attribute(
         seeded_db.connection,
         category_id=em_id,

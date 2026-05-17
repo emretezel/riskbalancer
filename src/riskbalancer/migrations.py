@@ -932,12 +932,209 @@ def _migration_5(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+# ---------------------------------------------------------------------------
+# Migration 6: merge `category_attribute` into `category`.
+#
+# Motivation: `category_attribute` was a 1:1 child table carrying
+# `volatility_micros` and `adjustment_micros` for any category considered
+# leafable (seed leaves and user-adopted plan-leaves). Row presence acted
+# as a "has canonical vol/adj defined" flag. That semantic is real but
+# subtle, requires a join on every vol/adj read, and is not the natural
+# home for these attributes — `CategoryNode` in the Python layer already
+# treats them as direct properties of a category. This migration folds
+# the columns onto `category` (nullable) and adds a paired-NULL CHECK so
+# they remain "both set or both unset", preserving the migration-2
+# invariant at column level rather than row level.
+#
+# Mechanics: SQLite cannot ADD COLUMN with a multi-column CHECK on a
+# STRICT table, so the standard table-recreate pattern is used with the
+# FK-off envelope. `PRAGMA foreign_key_check` at the end of the envelope
+# verifies that `mapping.category_id` and `plan_node.category_id` still
+# resolve after the rename.
+#
+# Triggers and dependent objects:
+# - `mapping_target_must_be_leaf_{insert,update}` (on mapping, body
+#   queries category): SQLite refuses to drop `category` while these
+#   triggers exist, so they are dropped first and recreated after the
+#   rename with their migration-1 bodies.
+# - `plan_node_parent_category_lineage_{insert,update}` (on plan_node,
+#   body queries category): same constraint; dropped first, recreated
+#   with their migration-4 bodies.
+# - `category_no_cycle_update` (on category itself): dropped with the
+#   table; recreated with its migration-4 body.
+# - `category_path` view (recursive CTE over `category`): dropped, then
+#   recreated with the depth-capped migration-4 body.
+# - `idx_category_top_level_name`: dropped with the table; recreated.
+#
+# Plan-leaves whose vol/adj are missing are still rejected at write time
+# by `repositories._insert_plan_subtree` — now reading the merged
+# columns instead of the `category_attribute` row. The CLI import path
+# prompts for missing values before that check fires, so the safety net
+# is rarely user-visible.
+# ---------------------------------------------------------------------------
+
+_MIGRATION_6_DROP_DEPENDENTS: tuple[str, ...] = (
+    "DROP VIEW category_path",
+    # Triggers whose body references `category` from another table.
+    # SQLite refuses to drop `category` while these exist.
+    "DROP TRIGGER mapping_target_must_be_leaf_update",
+    "DROP TRIGGER mapping_target_must_be_leaf_insert",
+    "DROP TRIGGER plan_node_parent_category_lineage_update",
+    "DROP TRIGGER plan_node_parent_category_lineage_insert",
+    # The on-category cycle trigger is dropped with the table, but the
+    # explicit DROP keeps the recreate path symmetric.
+    "DROP TRIGGER category_no_cycle_update",
+)
+
+_MIGRATION_6_RECREATE_TABLE: tuple[str, ...] = (
+    """
+    CREATE TABLE category_new (
+        id INTEGER PRIMARY KEY,
+        parent_id INTEGER REFERENCES category(id) ON DELETE RESTRICT
+            CHECK (parent_id IS NULL OR parent_id != id),
+        name TEXT NOT NULL CHECK (length(name) > 0 AND name = trim(name)),
+        volatility_micros INTEGER
+            CHECK (volatility_micros IS NULL OR volatility_micros >= 0),
+        adjustment_micros INTEGER
+            CHECK (adjustment_micros IS NULL OR adjustment_micros >= 0),
+        CHECK ((volatility_micros IS NULL) = (adjustment_micros IS NULL)),
+        UNIQUE (parent_id, name)
+    ) STRICT
+    """,
+    # Copy structure plus vol/adj from `category_attribute`. The LEFT
+    # JOIN leaves vol/adj NULL for categories without an attribute row,
+    # which is now the canonical "not yet defined" state.
+    """
+    INSERT INTO category_new
+        (id, parent_id, name, volatility_micros, adjustment_micros)
+    SELECT
+        c.id, c.parent_id, c.name,
+        ca.volatility_micros, ca.adjustment_micros
+    FROM category c
+    LEFT JOIN category_attribute ca ON ca.category_id = c.id
+    """,
+    # Drop the side table first — it has an FK to category. With FK
+    # enforcement off the order is academic, but draining the dependent
+    # before the parent reads more clearly.
+    "DROP TABLE category_attribute",
+    "DROP TABLE category",
+    "ALTER TABLE category_new RENAME TO category",
+)
+
+_MIGRATION_6_RECREATE_INDEX: str = (
+    "CREATE UNIQUE INDEX idx_category_top_level_name ON category(name) WHERE parent_id IS NULL"
+)
+
+_MIGRATION_6_RECREATE_VIEW: str = """
+CREATE VIEW category_path AS
+WITH RECURSIVE walk(id, parent_id, path, depth) AS (
+    SELECT id, parent_id, name, 1
+    FROM category
+    WHERE parent_id IS NULL
+    UNION ALL
+    SELECT c.id, c.parent_id, walk.path || ' / ' || c.name, walk.depth + 1
+    FROM category c
+    JOIN walk ON c.parent_id = walk.id
+    WHERE walk.depth < 32
+)
+SELECT id, path FROM walk
+"""
+
+_MIGRATION_6_RECREATE_TRIGGERS: tuple[str, ...] = (
+    # mapping_target_must_be_leaf — original bodies from migration 1.
+    """
+    CREATE TRIGGER mapping_target_must_be_leaf_insert
+    BEFORE INSERT ON mapping
+    FOR EACH ROW
+    WHEN EXISTS (SELECT 1 FROM category WHERE parent_id = NEW.category_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'mapping target must be a leaf category');
+    END
+    """,
+    """
+    CREATE TRIGGER mapping_target_must_be_leaf_update
+    BEFORE UPDATE OF category_id ON mapping
+    FOR EACH ROW
+    WHEN EXISTS (SELECT 1 FROM category WHERE parent_id = NEW.category_id)
+    BEGIN
+        SELECT RAISE(ABORT, 'mapping target must be a leaf category');
+    END
+    """,
+    # category_no_cycle_update — original body from migration 4.
+    """
+    CREATE TRIGGER category_no_cycle_update
+    BEFORE UPDATE OF parent_id ON category
+    FOR EACH ROW
+    WHEN NEW.parent_id IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, 'category parent_id would create a cycle')
+        WHERE EXISTS (
+            WITH RECURSIVE ancestors(id, depth) AS (
+                SELECT NEW.parent_id, 1
+                UNION ALL
+                SELECT c.parent_id, a.depth + 1
+                FROM category c
+                JOIN ancestors a ON c.id = a.id
+                WHERE c.parent_id IS NOT NULL AND a.depth < 32
+            )
+            SELECT 1 FROM ancestors WHERE id = NEW.id
+        );
+    END
+    """,
+    # plan_node_parent_category_lineage_* — original bodies from
+    # migration 4. `IS NOT` is used instead of `!=` because
+    # category.parent_id is nullable and `!=` against NULL is NULL,
+    # which would silently let mismatches through.
+    """
+    CREATE TRIGGER plan_node_parent_category_lineage_insert
+    BEFORE INSERT ON plan_node
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_node category lineage must mirror the category tree')
+        WHERE
+            (NEW.parent_id IS NULL
+                AND (SELECT parent_id FROM category WHERE id = NEW.category_id) IS NOT NULL)
+            OR (NEW.parent_id IS NOT NULL
+                AND (SELECT category_id FROM plan_node WHERE id = NEW.parent_id)
+                    IS NOT (SELECT parent_id FROM category WHERE id = NEW.category_id));
+    END
+    """,
+    """
+    CREATE TRIGGER plan_node_parent_category_lineage_update
+    BEFORE UPDATE OF parent_id, category_id ON plan_node
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'plan_node category lineage must mirror the category tree')
+        WHERE
+            (NEW.parent_id IS NULL
+                AND (SELECT parent_id FROM category WHERE id = NEW.category_id) IS NOT NULL)
+            OR (NEW.parent_id IS NOT NULL
+                AND (SELECT category_id FROM plan_node WHERE id = NEW.parent_id)
+                    IS NOT (SELECT parent_id FROM category WHERE id = NEW.category_id));
+    END
+    """,
+)
+
+
+def _migration_6(connection: sqlite3.Connection) -> None:
+    """Merge `category_attribute` into `category` with paired-NULL vol/adj."""
+    for statement in _MIGRATION_6_DROP_DEPENDENTS:
+        connection.execute(statement)
+    for statement in _MIGRATION_6_RECREATE_TABLE:
+        connection.execute(statement)
+    connection.execute(_MIGRATION_6_RECREATE_INDEX)
+    connection.execute(_MIGRATION_6_RECREATE_VIEW)
+    for statement in _MIGRATION_6_RECREATE_TRIGGERS:
+        connection.execute(statement)
+
+
 MIGRATIONS: List[Migration] = [
     Migration(_migration_1),
     Migration(_migration_2),
     Migration(_migration_3, requires_fk_off=True),
     Migration(_migration_4),
     Migration(_migration_5),
+    Migration(_migration_6, requires_fk_off=True),
 ]
 
 

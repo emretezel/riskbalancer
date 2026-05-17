@@ -54,13 +54,13 @@ def seed_from_yaml(
     database in its prior state. Behaviour:
 
     - `seed_plan_path` is walked depth-first; every category node becomes
-      (or matches) a row in `category`. Seed leaves additionally upsert
-      a `category_attribute` row carrying their intrinsic `volatility`
-      and `adjustment`. Seed branches do NOT get a `category_attribute`
-      row at all — branch-level vol/adj is not a fact the schema holds;
-      a user who wants to hold a branch as a plan-leaf must supply
-      explicit vol/adj at plan-creation time. Categories that already
-      exist are kept as-is; rows are never deleted.
+      (or matches) a row in `category`. Seed leaves additionally fill in
+      the merged `volatility_micros` / `adjustment_micros` columns on
+      that `category` row (migration 6). Seed branches leave those
+      columns NULL — branch-level vol/adj is not a fact the schema
+      holds; a user who wants to hold a branch as a plan-leaf must
+      supply explicit vol/adj at plan-creation time. Categories that
+      already exist are kept as-is; rows are never deleted.
     - For each `<adapter>.yaml` in `mappings_dir`, every mapping row for
       that adapter is deleted up-front (so removed allocations actually
       go away on re-seed) and replaced with the file's contents. The
@@ -84,7 +84,7 @@ def seed_from_yaml(
 
 
 def _seed_categories_from_plan(connection: sqlite3.Connection, path: Path) -> None:
-    """Walk the seed plan YAML and ensure category + category_attribute rows."""
+    """Walk the seed plan YAML; ensure `category` rows and fill leaf vol/adj."""
     if not path.exists():
         return
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -104,13 +104,14 @@ def _walk_seed_node(
 ) -> None:
     """Recursive walker: insert category for `payload`, recurse into children.
 
-    Seed leaves upsert a `category_attribute` row holding their intrinsic
-    `volatility` and `adjustment`. Seed branches contribute their
-    `category` row only — no `category_attribute` row is written, because
-    branch-level vol/adj is not a fact the schema holds. A leaf with no
-    explicit `volatility` is silently skipped at the attribute write step:
-    its `category` row still exists for the hierarchy, but it cannot serve
-    as a plan-leaf until the walker collects vol/adj from the user.
+    Seed leaves fill in the merged `volatility_micros` /
+    `adjustment_micros` columns on `category` with their intrinsic
+    fundamentals. Seed branches keep those columns NULL — branch-level
+    vol/adj is not a fact the schema holds. A leaf with no explicit
+    `volatility` in the YAML is silently skipped at the attribute write
+    step: its `category` row still exists for the hierarchy, but it
+    cannot serve as a plan-leaf until the walker collects vol/adj from
+    the user.
     """
     raw_name = payload.get("name")
     if not isinstance(raw_name, str) or not raw_name.strip():
@@ -127,23 +128,21 @@ def _walk_seed_node(
     volatility_raw = payload.get("volatility")
     adjustment_raw = payload.get("adjustment", 1.0)
     if volatility_raw is None or adjustment_raw is None:
-        # The schema requires both columns; a seed leaf without an explicit
-        # volatility is incomplete data, not a row we silently materialise
-        # with placeholders. The walker is responsible for filling it in
+        # The paired-NULL CHECK on `category` requires both columns
+        # together; a seed leaf without an explicit volatility is
+        # incomplete data, not a row we silently materialise with
+        # placeholders. The walker is responsible for filling it in
         # when (and only when) a user actually adopts the category.
         return
     vol_micros = fraction_to_micros(float(volatility_raw))
     adj_micros = fraction_to_micros(float(adjustment_raw))
     connection.execute(
         """
-        INSERT INTO category_attribute
-            (category_id, volatility_micros, adjustment_micros)
-        VALUES (?, ?, ?)
-        ON CONFLICT(category_id) DO UPDATE SET
-            volatility_micros = excluded.volatility_micros,
-            adjustment_micros = excluded.adjustment_micros
+        UPDATE category
+        SET volatility_micros = ?, adjustment_micros = ?
+        WHERE id = ?
         """,
-        (category_id, vol_micros, adj_micros),
+        (vol_micros, adj_micros, category_id),
     )
 
 

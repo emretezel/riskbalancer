@@ -180,13 +180,14 @@ def load_plan_tree(
 
     Returns an empty list when the user has no plan rows. Each row's
     weight is read from `plan_node`; volatility and adjustment for
-    plan-leaves are read directly from `category_attribute` and raise
-    if a leaf has no row (a plan should never have been saved without
-    explicit fundamentals on every leaf — the walker enforces this on
-    creation). Branch nodes (those with plan children) carry `None` for
-    volatility and `_DEFAULT_ADJUSTMENT` for adjustment; they are summary
-    nodes, not allocation targets, and downstream code recognises them
-    by `children` being non-empty rather than by sentinel values.
+    plan-leaves are read directly from the merged `category` columns
+    (migration 6) and raise if a leaf's category has NULL vol/adj — a
+    plan should never have been saved without explicit fundamentals on
+    every leaf, the walker and CLI import enforce this on creation.
+    Branch nodes (those with plan children) carry `None` for volatility
+    and `_DEFAULT_ADJUSTMENT` for adjustment; they are summary nodes,
+    not allocation targets, and downstream code recognises them by
+    `children` being non-empty rather than by sentinel values.
     """
     rows = connection.execute(
         """
@@ -225,9 +226,10 @@ def load_plan_tree(
         else:
             by_id[parent].children.append(node)
     # Populate vol/adj on plan-leaves only. A node is a leaf iff it has
-    # no plan children. The schema guarantees `category_attribute` carries
-    # both columns NOT NULL, so a hit yields a complete pair; a miss is a
-    # data-integrity error and surfaces as a typed exception.
+    # no plan children. The paired-NULL CHECK on `category` guarantees
+    # both columns are set together, so a hit yields a complete pair; a
+    # miss (NULL) is a data-integrity error and surfaces as a typed
+    # exception.
     for node_id, node in by_id.items():
         if node.children:
             continue
@@ -236,8 +238,8 @@ def load_plan_tree(
         if attr is None:
             raise ValueError(
                 f"Plan-leaf {node.name!r} (category_id={category_id}) has no "
-                "category_attribute row; vol/adj must be set explicitly before "
-                "the plan can be loaded."
+                "volatility/adjustment recorded; vol/adj must be set "
+                "explicitly before the plan can be loaded."
             )
         node.volatility, node.adjustment = attr
     return roots
@@ -284,10 +286,11 @@ def _insert_plan_subtree(
 
     `plan_node` stores tree structure and the user's parent-relative
     weight only. For plan-leaves (no children), the in-memory node's
-    vol/adj are upserted into `category_attribute`, which is the single
-    source of truth for intrinsic per-category fundamentals. Plan-leaves
-    must carry a concrete volatility — the walker enforces this — so a
-    missing value here is a programmer error and raises.
+    vol/adj are written to the merged `category` columns (migration 6),
+    which are the single source of truth for intrinsic per-category
+    fundamentals. Plan-leaves must carry a concrete volatility — the
+    walker and CLI import enforce this — so a missing value here is a
+    programmer error and raises.
     """
     category_id = find_or_create_category(connection, parent_id=parent_category_id, name=node.name)
     cursor = connection.execute(
@@ -310,18 +313,19 @@ def _insert_plan_subtree(
         if node.volatility is None:
             # The YAML loader returns None for `volatility: 0.0` (a legacy
             # parser quirk in `configuration._parse_optional_volatility`),
-            # so a missing in-memory volatility is tolerated iff an existing
-            # `category_attribute` row already covers this category —
-            # typically because the seed loader populated it. Without such
-            # a row there is no information to fall back on and the plan
-            # is invalid; the walker is responsible for collecting vol/adj
-            # before reaching this point.
+            # so a missing in-memory volatility is tolerated iff the
+            # merged `category` row already has vol/adj recorded —
+            # typically because the seed loader populated it. Without
+            # that fallback there is no information to use and the plan
+            # is invalid; the walker (or the CLI's import-time prompt)
+            # is responsible for collecting vol/adj before reaching
+            # this point.
             if get_category_attribute(connection, category_id) is None:
                 raise ValueError(
                     f"Plan-leaf {node.name!r} (category_id={category_id}) "
-                    "has no in-memory volatility and no category_attribute "
-                    "row to fall back on; the walker must collect explicit "
-                    "vol/adj before persisting a leaf."
+                    "has no in-memory volatility and no recorded vol/adj on "
+                    "the category to fall back on; the walker must collect "
+                    "explicit vol/adj before persisting a leaf."
                 )
         else:
             upsert_category_attribute(
@@ -347,23 +351,21 @@ def upsert_category_attribute(
     volatility: float,
     adjustment: float,
 ) -> None:
-    """Upsert intrinsic `(volatility, adjustment)` for a category.
+    """Set the intrinsic `(volatility, adjustment)` on a category.
 
-    The schema declares both columns NOT NULL with `>= 0` CHECKs, so the
-    caller passes concrete values. Used by the seed loader for seed
-    leaves and by the plan walker whenever a user adopts a category as a
-    plan-leaf — that is the only path through which a row can land here.
+    Both columns live directly on `category` (migration 6 merged the
+    former `category_attribute` table). The paired-NULL CHECK enforces
+    that they are set together. Caller passes concrete values; the seed
+    loader uses this for seed-known leaves and the plan walker uses it
+    whenever the user adopts a category as a plan-leaf.
     """
     connection.execute(
         """
-        INSERT INTO category_attribute
-            (category_id, volatility_micros, adjustment_micros)
-        VALUES (?, ?, ?)
-        ON CONFLICT(category_id) DO UPDATE SET
-            volatility_micros = excluded.volatility_micros,
-            adjustment_micros = excluded.adjustment_micros
+        UPDATE category
+        SET volatility_micros = ?, adjustment_micros = ?
+        WHERE id = ?
         """,
-        (category_id, fraction_to_micros(volatility), fraction_to_micros(adjustment)),
+        (fraction_to_micros(volatility), fraction_to_micros(adjustment), category_id),
     )
 
 
@@ -413,23 +415,23 @@ def get_category_attribute(
 ) -> Optional[tuple[float, float]]:
     """Return `(volatility, adjustment)` for a category, or `None`.
 
-    Both columns are NOT NULL in the schema, so a hit always yields a
-    concrete pair. `None` means the category has no row — typically a
-    branch the seed declared or a leaf no user has adopted yet — and
-    the caller should surface it (the walker prompts for vol/adj; the
-    plan loader treats it as a data-integrity error). There is no
-    fallback lookup or derivation; every plan-leaf names its own
-    fundamentals.
+    The columns live on `category` itself (migration 6) and are paired
+    by a CHECK constraint — both set or both NULL. `None` means the
+    category has no canonical fundamentals yet (a branch the seed
+    declared, or a leaf no user has adopted). The caller surfaces it:
+    the walker prompts for values, the plan loader treats it as a
+    data-integrity error. There is no fallback lookup or derivation;
+    every plan-leaf names its own fundamentals.
     """
     row = connection.execute(
         """
         SELECT volatility_micros, adjustment_micros
-        FROM category_attribute
-        WHERE category_id = ?
+        FROM category
+        WHERE id = ?
         """,
         (category_id,),
     ).fetchone()
-    if row is None:
+    if row is None or row["volatility_micros"] is None:
         return None
     return row["volatility_micros"] / MICROS_SCALE, row["adjustment_micros"] / MICROS_SCALE
 

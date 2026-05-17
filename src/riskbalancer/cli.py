@@ -59,6 +59,7 @@ from .plan_bootstrap import (
     build_catalog_from_db,
     count_unique_categories,
     describe_catalog_sources_from_db,
+    fill_missing_leaf_vol_adj,
     walk_catalog_interactive,
 )
 from .plan_csv import PlanCSVError, read_plan_csv, write_plan_csv
@@ -1675,10 +1676,24 @@ def cmd_plan_import(args: argparse.Namespace, paths: Optional[UserPaths] = None)
         return 2
 
     skip_confirm = bool(getattr(args, "yes", False))
+    io: IO = StdIO()
 
     db = _open_database(paths)
     try:
         user_id = _ensure_user_in_db(db.connection, paths.user)
+
+        # Fill in vol/adj for any leaf whose CSV cell was blank — the
+        # walker collects these interactively for new plans; the CSV
+        # path historically failed at write time with a ValueError if a
+        # leaf had no vol on the node and no existing row in the DB.
+        # `--yes` skips only the "Replace plan?" confirmation, not data
+        # entry that the plan genuinely needs.
+        try:
+            fill_missing_leaf_vol_adj(db.connection, new_nodes, io)
+        except PlanCreationAborted as exc:
+            print(f"plan import aborted: {exc}", file=sys.stderr)
+            return 1
+
         had_plan = repositories.plan_exists(db.connection, user_id)
         if had_plan:
             old_nodes = repositories.load_plan_tree(db.connection, user_id)
@@ -1691,7 +1706,6 @@ def cmd_plan_import(args: argparse.Namespace, paths: Optional[UserPaths] = None)
             )
 
         if not skip_confirm:
-            io: IO = StdIO()
             try:
                 ok = _prompt_yes_no(
                     io,

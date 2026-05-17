@@ -404,3 +404,91 @@ def test_write_plan_yaml_then_export_then_import_yields_same_plan(tmp_path):
     cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
 
     assert _plan_fingerprint(paths) == before
+
+
+def test_import_prompts_for_missing_leaf_vol_adj(tmp_path, monkeypatch, capsys):
+    """A CSV leaf with an empty volatility cell prompts the user at import.
+
+    The CSV parser tolerates blank vol/adj cells; the historical write
+    path raised at write time with a ValueError if the category had no
+    recorded vol/adj. Migration 6 keeps the schema-level invariant
+    (NULL `category.volatility_micros` blocks plan loading) and the CLI
+    now plugs the gap by prompting for the missing values before the
+    write happens — the walker has always done this for interactive
+    plan creation, and the CSV path now matches.
+    """
+    paths = _paths_for(tmp_path)
+    paths.user_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "plan.csv"
+    csv_path.write_text(
+        "level1,weight1,level2,weight2,volatility,adjustment\nEquities,1.0,NAM,1.0,,1.0\n",
+        encoding="utf-8",
+    )
+
+    # The fill helper asks first for volatility, then for adjustment;
+    # the synthetic node's 1.0 adjustment matches the silent default so
+    # no suggestion is offered and the user must type both.
+    _script(monkeypatch, ["0.20", "1.05"])
+    rc = cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
+    assert rc == 0
+    assert _plan_exists_in_db(paths)
+
+    nam = _load_plan(paths)[0].children[0]
+    assert nam.name == "NAM"
+    assert nam.volatility == pytest.approx(0.20)
+    assert nam.adjustment == pytest.approx(1.05)
+
+
+def test_import_missing_vol_adj_quit_aborts_without_writing(tmp_path, monkeypatch):
+    """Typing `quit` at the vol/adj prompt cancels the import cleanly.
+
+    Mirrors the walker's abort semantics: `_ask` translates `quit` (and
+    EOF / Ctrl+C) into `PlanCreationAborted`, which the CLI catches and
+    reports without touching the DB. No `plan_node` rows must appear.
+    """
+    paths = _paths_for(tmp_path)
+    paths.user_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "plan.csv"
+    csv_path.write_text(
+        "level1,weight1,level2,weight2,volatility,adjustment\nEquities,1.0,NAM,1.0,,1.0\n",
+        encoding="utf-8",
+    )
+
+    _script(monkeypatch, ["quit"])
+    rc = cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
+    assert rc == 1
+    assert not _plan_exists_in_db(paths)
+
+
+def test_import_reuses_existing_category_attrs_silently(tmp_path, monkeypatch, capsys):
+    """If the category already has vol/adj recorded, the import does not prompt.
+
+    Re-importing the same CSV after fundamentals are recorded must be
+    silent — the helper looks up the merged columns on `category` and
+    fills them onto the in-memory node before any prompt would fire.
+    """
+    paths = _paths_for(tmp_path)
+    paths.user_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = tmp_path / "plan.csv"
+    csv_path.write_text(
+        "level1,weight1,level2,weight2,volatility,adjustment\nEquities,1.0,NAM,1.0,,1.0\n",
+        encoding="utf-8",
+    )
+
+    # First import fills the missing vol/adj via the prompt and writes
+    # them to category.
+    _script(monkeypatch, ["0.22", "1.10"])
+    rc = cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
+    assert rc == 0
+
+    # Second import with the same CSV must not prompt — an empty
+    # answers list would raise from ScriptedIO if a prompt fired. We
+    # script no answers and rely on _script's KeyError from the empty
+    # iter() if that contract were violated.
+    _script(monkeypatch, [])
+    rc = cmd_plan_import(_import_args(csv_path, yes=True), paths=paths)
+    assert rc == 0
+
+    nam = _load_plan(paths)[0].children[0]
+    assert nam.volatility == pytest.approx(0.22)
+    assert nam.adjustment == pytest.approx(1.10)

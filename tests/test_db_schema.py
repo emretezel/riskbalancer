@@ -26,7 +26,7 @@ EXPECTED_TABLES: frozenset[str] = frozenset(
         "schema_version",
         "user",
         "category",
-        "category_attribute",
+        # `category_attribute` was merged into `category` in migration 6.
         "source",
         "account",
         "instrument",
@@ -213,47 +213,41 @@ def test_category_same_name_under_different_parents_ok(db: Database) -> None:
     )
 
 
-def test_category_attribute_requires_volatility(db: Database) -> None:
-    """`category_attribute.volatility_micros` is NOT NULL — vol must be explicit."""
+def test_category_vol_adj_must_be_paired_null_or_paired_set(db: Database) -> None:
+    """The paired-NULL CHECK on `category` rejects half-set vol/adj rows.
+
+    Migration 6 merged the former `category_attribute` columns onto
+    `category` and added `CHECK ((volatility_micros IS NULL) =
+    (adjustment_micros IS NULL))`. Setting one without the other is
+    rejected at write time so the on-disk shape preserves the migration
+    2 "both set or neither set" invariant at column level.
+    """
     cash_id = db.connection.execute(
         "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
         ("Cash",),
     ).fetchone()["id"]
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
-            "INSERT INTO category_attribute "
-            "(category_id, volatility_micros, adjustment_micros) "
-            "VALUES (?, NULL, ?)",
-            (cash_id, 1_000_000),
+            "UPDATE category SET volatility_micros = ?, adjustment_micros = NULL WHERE id = ?",
+            (1_000_000, cash_id),
         )
-
-
-def test_category_attribute_requires_adjustment(db: Database) -> None:
-    """`category_attribute.adjustment_micros` is NOT NULL — adj must be explicit."""
-    cash_id = db.connection.execute(
-        "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
-        ("Cash",),
-    ).fetchone()["id"]
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
-            "INSERT INTO category_attribute "
-            "(category_id, volatility_micros, adjustment_micros) "
-            "VALUES (?, ?, NULL)",
-            (cash_id, 0),
+            "UPDATE category SET volatility_micros = NULL, adjustment_micros = ? WHERE id = ?",
+            (1_000_000, cash_id),
         )
 
 
-def test_category_attribute_vol_and_adj_must_be_non_negative(db: Database) -> None:
-    """Both `volatility_micros` and `adjustment_micros` reject negative values."""
+def test_category_vol_adj_must_be_non_negative(db: Database) -> None:
+    """`category.volatility_micros` and `adjustment_micros` reject negative values."""
     nam_id = db.connection.execute(
         "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
         ("NAM",),
     ).fetchone()["id"]
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
-            "INSERT INTO category_attribute "
-            "(category_id, volatility_micros, adjustment_micros) VALUES (?, ?, ?)",
-            (nam_id, -1, 1_000_000),
+            "UPDATE category SET volatility_micros = ?, adjustment_micros = ? WHERE id = ?",
+            (-1, 1_000_000, nam_id),
         )
     em_id = db.connection.execute(
         "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
@@ -261,35 +255,27 @@ def test_category_attribute_vol_and_adj_must_be_non_negative(db: Database) -> No
     ).fetchone()["id"]
     with pytest.raises(sqlite3.IntegrityError):
         db.connection.execute(
-            "INSERT INTO category_attribute "
-            "(category_id, volatility_micros, adjustment_micros) VALUES (?, ?, ?)",
-            (em_id, 1_000_000, -1),
+            "UPDATE category SET volatility_micros = ?, adjustment_micros = ? WHERE id = ?",
+            (1_000_000, -1, em_id),
         )
 
 
-def test_category_attribute_cascades_on_category_delete(db: Database) -> None:
-    """Dropping a `category` cascades to its `category_attribute` row.
-
-    Categories referenced by other rows (mapping, plan_node) cannot be
-    deleted thanks to ON DELETE RESTRICT on those FKs; but a standalone
-    category with only its own attribute row goes away cleanly, and
-    SQLite removes the dependent attribute row as part of the cascade.
+def test_category_vol_adj_default_to_null(db: Database) -> None:
+    """A freshly inserted `category` row has NULL vol/adj — the canonical
+    "not yet defined" state for branches and unadopted leaves. Migration
+    6 keeps this nullable so vol/adj is set lazily, only when the
+    category is actually used as a plan-leaf.
     """
-    cash_id = db.connection.execute(
+    fresh_id = db.connection.execute(
         "INSERT INTO category (parent_id, name) VALUES (NULL, ?) RETURNING id",
-        ("Cash",),
+        ("Fresh",),
     ).fetchone()["id"]
-    db.connection.execute(
-        "INSERT INTO category_attribute "
-        "(category_id, volatility_micros, adjustment_micros) VALUES (?, ?, ?)",
-        (cash_id, 0, 0),
-    )
-    db.connection.execute("DELETE FROM category WHERE id = ?", (cash_id,))
-    remaining = db.connection.execute(
-        "SELECT COUNT(*) AS n FROM category_attribute WHERE category_id = ?",
-        (cash_id,),
-    ).fetchone()["n"]
-    assert remaining == 0
+    row = db.connection.execute(
+        "SELECT volatility_micros, adjustment_micros FROM category WHERE id = ?",
+        (fresh_id,),
+    ).fetchone()
+    assert row["volatility_micros"] is None
+    assert row["adjustment_micros"] is None
 
 
 def test_mapping_unique_per_instrument_category(db: Database) -> None:

@@ -119,16 +119,19 @@ mappings survive — those are global registries.
 
 ### 3.3 `category`
 
-The single hierarchical registry of categories. **Pure structure only —
-no weight, no volatility, no adjustment.** A category is a leaf in one
-user's plan and a branch in another's by virtue of which `plan_node`
-rows reference it — not by anything on the category itself.
+The single hierarchical registry of categories. Carries both the tree
+structure (`parent_id`, `name`) and the category's **intrinsic
+fundamentals** (`volatility_micros`, `adjustment_micros`). A category is
+a leaf in one user's plan and a branch in another's by virtue of which
+`plan_node` rows reference it — not by anything on the category itself.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | `INTEGER PRIMARY KEY` | |
 | `parent_id` | `INTEGER REFERENCES category(id) ON DELETE RESTRICT` | `NULL` for top-level. `CHECK (parent_id IS NULL OR parent_id != id)` blocks the trivial single-row cycle. |
 | `name` | `TEXT NOT NULL` | `length(name) > 0 AND name = trim(name)`. The trim guard rejects space-padded names (the realistic copy-paste case); the application's `.strip()` catches tabs and other whitespace before they reach the DB. |
+| `volatility_micros` | `INTEGER NULL` | `volatility_micros IS NULL OR volatility_micros >= 0`. Annualised volatility as a fraction of unit value, parts-per-million. `NULL` for categories whose fundamentals have not been canonically defined yet (typically branches and unadopted leaves). |
+| `adjustment_micros` | `INTEGER NULL` | `adjustment_micros IS NULL OR adjustment_micros >= 0`. Multiplicative risk adjustment, parts-per-million. Not clamped to ≤1.0 — the seed's `Bonds / Developed / NAM / Inflation` carries `1.35`. Zero is allowed (e.g. seed `Cash`); a category with `adjustment = 0` contributes zero risk weight regardless of its `plan_node.weight_micros`. |
 
 Constraints:
 
@@ -136,48 +139,46 @@ Constraints:
 - `UNIQUE INDEX idx_category_top_level_name ON category(name) WHERE parent_id IS NULL` —
   SQLite treats `NULL` as distinct in composite `UNIQUE`, so this partial
   index is needed to also enforce uniqueness for the top-level case.
+- `CHECK ((volatility_micros IS NULL) = (adjustment_micros IS NULL))` —
+  the two fundamentals are paired. Either both are set with concrete
+  non-negative values, or both are unset; setting one alone is rejected
+  at write time. This preserves the migration-2 "both or neither"
+  invariant at column level (it lived at row level when the fundamentals
+  were in their own table, before migration 6 merged them in here).
 
-`ON DELETE RESTRICT` (rather than `CASCADE`) is deliberate: a category
-referenced by any `plan_node` or `mapping` cannot be deleted, because
-those rows would otherwise lose their referent. The error surfaces at
-write time and forces the caller to clean up references first.
+`ON DELETE RESTRICT` on `parent_id` (rather than `CASCADE`) is
+deliberate: a category referenced by any `plan_node` or `mapping`
+cannot be deleted, because those rows would otherwise lose their
+referent. The error surfaces at write time and forces the caller to
+clean up references first.
 
 A category named `Govt` can exist under `Bonds / Developed / NAM` *and*
 under `Bonds / Developed / Europe` simultaneously — different parents,
 different IDs. The schema deliberately supports this.
 
-### 3.4 `category_attribute`
+**On fundamentals.** Row presence of non-NULL vol/adj means "this
+category has explicit canonical fundamentals and can serve as a
+plan-leaf for any user who adopts it." Categories with NULL vol/adj
+exist purely as structural nodes — a user who wants to hold such a
+category as a plan-leaf must supply explicit vol/adj at plan-creation
+time, which the walker (for interactive `rb plan create`) or the
+import-time prompt (for `rb plan import` from CSV) collects and then
+writes back via an `UPDATE` on this table. There is no derived-value
+path: no weighted average over children, no fallback to the seed's
+reference figures. Every plan-leaf names its own fundamentals.
 
-The single source of truth for a category's **intrinsic** volatility
-and adjustment. Both columns are NOT NULL; row existence means
-"this category has explicit canonical fundamentals and can serve as a
-plan-leaf for any user who adopts it". Categories without a row exist
-in `category` purely as structural nodes — a user who wants to hold
-such a category as a plan-leaf must supply explicit vol/adj at
-plan-creation time, which the walker upserts here. Plan weights live
-exclusively on `plan_node` and are not represented here.
+**Why fundamentals live here.** Plans differ in how they weight a
+branch's children, so deriving a branch's effective vol/adj from any
+single "seed" weighting would silently impose one plan's choices on
+another. Splitting *plan weights* (per-plan, in `plan_node`) from
+*fundamentals* (per-category, here) keeps both facts in exactly one
+place. Migration 2 first introduced this split by lifting `vol/adj`
+out of an earlier `category_attribute` table that conflated weights and
+fundamentals; migration 6 then folded `vol/adj` back onto `category`
+itself, on the basis that fundamentals are properties of a category
+and not a separate entity in their own right.
 
-| Column | Type | Notes |
-|---|---|---|
-| `category_id` | `INTEGER PRIMARY KEY REFERENCES category(id) ON DELETE CASCADE` | One row per category, at most. Cascade fires only when the bare `category` row is deleted, which is blocked by `RESTRICT` on `mapping` and `plan_node` first. |
-| `volatility_micros` | `INTEGER NOT NULL` | `volatility_micros >= 0`. Annualised volatility as a fraction of unit value, stored as parts-per-million. |
-| `adjustment_micros` | `INTEGER NOT NULL` | `adjustment_micros >= 0`. Multiplicative risk adjustment, parts-per-million. Not clamped to ≤1.0 — the seed's `Bonds / Developed / NAM / Inflation` has `1.35`. Zero is allowed (e.g. seed `Cash`); a category with `adjustment = 0` contributes zero risk weight regardless of its `plan_node.weight_micros`. |
-
-**Branches do not appear here.** The seed loader writes a row only for
-seed leaves. A user's plan that terminates above a seed leaf — e.g.
-holding `Equities / EM` as a single plan-leaf rather than splitting it
-into Asia / Americas / EMEA — requires the walker to collect explicit
-vol/adj for `Equities / EM` and upsert a row for it. There is no
-derived-value path: no weighted average over children, no fallback to
-the seed's reference figures. Every plan-leaf names its own fundamentals.
-
-**Why this shape.** Plans differ in how they weight a branch's
-children, so deriving a branch's effective vol/adj from any single
-"seed" weighting would silently impose one plan's choices on another.
-Splitting weights (per-plan, in `plan_node`) from fundamentals
-(per-category, here) keeps both facts in exactly one place.
-
-### 3.5 `source`
+### 3.4 `source`
 
 A broker. **One row per adapter globally** — `ibkr` is `ibkr` regardless
 of which user holds an account there, because the adapter alone
@@ -197,7 +198,7 @@ have a target. Adding a new broker means: new entry in
 module. The `_ADAPTERS_LIST` SQL literal is derived from
 `KNOWN_ADAPTERS` to keep the CHECK clause in lockstep.
 
-### 3.6 `account`
+### 3.5 `account`
 
 A named account at a broker, owned by a user. AJ Bell users typically
 have `isa` and `sipp`; IBKR users typically have one `taxable`. Two
@@ -215,7 +216,7 @@ each have their own `account` rows.
 by different users — Emre and Tani can each have a `taxable` account at
 IBKR without collision.
 
-### 3.7 `instrument`
+### 3.6 `instrument`
 
 Global registry of broker tickers / fund identifiers. The same ticker
 at two different brokers is two separate rows — the leading natural
@@ -232,7 +233,7 @@ adapter string lives on `source.adapter`, single source of truth).
 
 `UNIQUE (source_id, instrument_id_text)`.
 
-### 3.8 `mapping`
+### 3.7 `mapping`
 
 Instrument-to-category mappings, split-aware (multiple rows per
 instrument when the holding maps across several categories with
@@ -276,7 +277,7 @@ each `instrument_id` group sum to `1_000_000`. The
 `fraction_to_micros` helper rounds so common multi-allocation splits
 (e.g. AJ Bell `SPAG` = 0.62 + 0.05 + 0.13 + 0.2) sum exactly.
 
-### 3.9 `fx_rate`
+### 3.8 `fx_rate`
 
 Historical FX rates, keyed by date and currency. Rate is GBP per
 native unit (e.g. `760000` for USD on a day when 1 USD = 0.76 GBP).
@@ -293,7 +294,7 @@ native unit (e.g. `760000` for USD on a day when 1 USD = 0.76 GBP).
 ECB publishes historical reference rates back to 1999; `rb fx update`
 will fetch and upsert for any date as needed.
 
-### 3.10 `plan_node`
+### 3.9 `plan_node`
 
 A user's target tree. One row per node in the plan. **The leaf/branch
 distinction is implicit and per-user**: a `plan_node` is a leaf iff no
@@ -310,21 +311,22 @@ be a leaf in one user's plan and a branch in another's.
 
 `UNIQUE (user_id, parent_id, category_id)`.
 
-`weight_micros` is **the sole source of plan weight** — at compute time
-no other table is consulted for the parent-relative weight of a user's
-plan node. Volatility and adjustment are not stored here; they live on
-`category_attribute` and are looked up per plan-leaf at read time. For
-a plan-leaf that sits above any seed leaf (e.g. a user holding
-`Equities / EM` as a leaf without splitting it further), the walker
-must have collected explicit vol/adj for that category and written a
-`category_attribute` row before the plan was persisted. There is no
+`weight_micros` is **the sole source of plan weight** — at compute
+time no other table is consulted for the parent-relative weight of a
+user's plan node. Volatility and adjustment are not stored here; they
+live on `category` (§3.3) and are looked up per plan-leaf at read
+time. For a plan-leaf that sits above any seed leaf (e.g. a user
+holding `Equities / EM` as a leaf without splitting it further), the
+walker (or the CSV import-time prompt) must have collected explicit
+vol/adj for that category and written them to the merged columns on
+`category` before the plan was persisted. There is no
 weighted-average derivation: every plan-leaf names its own fundamentals.
 
 Application-level invariant (enforced in `repositories.write_plan_tree`):
 sibling weights at every level sum to `1_000_000` (within the YAML
 loader's tolerance of `1e-6` when expressed as fractions).
 
-### 3.11 `statement_import`
+### 3.10 `statement_import`
 
 An import event. One row per `(account_id, as_of)` — re-importing the
 same statement for the same as-of replaces the previous import in a
@@ -342,7 +344,7 @@ same account coexist and form the historical timeline.
 
 `UNIQUE (account_id, as_of)`.
 
-### 3.12 `position`
+### 3.11 `position`
 
 One holding inside an import. Native amounts only — the GBP-equivalent
 is **never stored**, only computed at query time by joining `fx_rate`
@@ -456,7 +458,7 @@ user downgraded the binary) is rejected at connect time with
 ## 7. Mapping resolution
 
 Mappings target **leaf** categories in the global category tree (enforced
-by trigger — see §3.8). A user's plan, however, may stop the
+by trigger — see §3.7). A user's plan, however, may stop the
 sub-categorisation earlier than the mapping does. For example, the
 seed maps EMIM into `Equities / EM / Asia`, but Tani's plan holds
 `Equities / EM` as a single leaf — there is no `Asia` plan node to
@@ -478,7 +480,7 @@ The resolver bridges the two trees:
 This is implemented in `repositories.resolve_category_to_plan_leaf`.
 Note that the resolver only re-targets a position to the user's
 plan-leaf; it does not borrow vol/adj from the mapping's deeper leaf.
-The plan-leaf's own `category_attribute` row supplies the
+The plan-leaf's own vol/adj on `category` (§3.3) supplies the
 fundamentals, as for any other leaf.
 
 Why this design:
@@ -506,14 +508,16 @@ Why this design:
 - **No global UNIQUE on `category(name)`.** Two `Govt` leaves with
   different parents are legitimately distinct rows.
 - **No "is_seed" flag on user or plan_node.** The seed plan is loaded
-  into `category` + `category_attribute` only; it never appears as a
-  fake "_seed" user.
+  into `category` only (the merged vol/adj columns hold the seed's
+  fundamentals for leaves); it never appears as a fake "_seed" user.
 - **No derived vol/adj.** A category's volatility and adjustment are
-  either explicit in `category_attribute` or absent. There is no
-  weighted-average computation over children, no fallback to a parent's
-  fundamentals, no `default_leaf_volatility` baked into the schema.
-  Every plan-leaf names its own fundamentals; the walker collects them
-  at plan-creation time when no row exists yet.
+  either explicit on `category` itself (both columns set together) or
+  absent (both NULL). There is no weighted-average computation over
+  children, no fallback to a parent's fundamentals, no
+  `default_leaf_volatility` baked into the schema. Every plan-leaf
+  names its own fundamentals; the walker (interactive) or the import
+  prompt (CSV) collects them at plan-creation time when the columns
+  are still NULL.
 - **No plan-weight lookup outside `plan_node`.** Per-plan weights live
   exclusively on `plan_node.weight_micros`. The seed plan's reference
   weights are an input to plan creation (read directly from
@@ -537,7 +541,7 @@ rather than committing a broken graph.
 
 - **`mapping_target_must_be_leaf_insert`** — `BEFORE INSERT ON mapping`,
   aborts when `NEW.category_id` has children in the global category
-  tree. See §3.8.
+  tree. See §3.7.
 - **`mapping_target_must_be_leaf_update`** — `BEFORE UPDATE OF category_id ON mapping`,
   same check.
 
