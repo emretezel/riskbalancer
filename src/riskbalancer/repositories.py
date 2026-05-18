@@ -1407,6 +1407,45 @@ def get_mappings_for_instrument(
     return [(int(r["category_id"]), int(r["weight_micros"])) for r in rows]
 
 
+def list_unmapped_instruments_detailed(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+) -> list[dict]:
+    """Like `list_unmapped_instrument_ids` but also returns adapter / text.
+
+    Each result has `id`, `adapter`, `instrument_id_text`. Used by the
+    import-time interactive categorisation prompt, which needs to show
+    the user enough context to make a decision without an extra lookup
+    per instrument.
+    """
+    rows = connection.execute(
+        """
+        SELECT DISTINCT
+            i.id AS id,
+            s.adapter AS adapter,
+            i.instrument_id_text AS instrument_id_text
+        FROM current_position cp
+        JOIN instrument i ON i.id = cp.instrument_id
+        JOIN source s ON s.id = i.source_id
+        WHERE cp.user_id = ?
+          AND NOT EXISTS (
+              SELECT 1 FROM mapping m WHERE m.instrument_id = i.id
+          )
+        ORDER BY s.adapter, i.instrument_id_text
+        """,
+        (user_id,),
+    ).fetchall()
+    return [
+        {
+            "id": int(row["id"]),
+            "adapter": str(row["adapter"]),
+            "instrument_id_text": str(row["instrument_id_text"]),
+        }
+        for row in rows
+    ]
+
+
 def list_unmapped_instrument_ids(
     connection: sqlite3.Connection,
     *,

@@ -472,6 +472,152 @@ def cmd_fx_update(args: argparse.Namespace, paths: Optional[UserPaths] = None) -
 # ---------------------------------------------------------------------------
 
 
+def _parent_has_mapping_references(connection: sqlite3.Connection, parent_id: int) -> int:
+    """Return the count of mapping rows pointing at `parent_id`.
+
+    Used by the inline-create-leaf flow: adding a child to a category
+    that currently has mappings pointing at it would orphan those
+    mappings (they would suddenly be branch-targeted in violation of
+    the schema's leaf-only rule for *future* writes, even though the
+    trigger does not re-validate existing rows). We refuse the
+    operation up-front rather than leave the schema in an inconsistent
+    state.
+    """
+    row = connection.execute(
+        "SELECT COUNT(*) AS n FROM mapping WHERE category_id = ?",
+        (parent_id,),
+    ).fetchone()
+    return int(row["n"])
+
+
+def _import_create_new_leaf(
+    connection: sqlite3.Connection,
+    io: IO,
+    *,
+    adapter: str,
+    instrument_id: int,
+    instrument_id_text: str,
+) -> bool:
+    """Prompt for a new leaf under an existing parent + map this instrument to it.
+
+    Returns True on success, False when the user aborts or hits a guard
+    rail. All writes go through a single transaction so a half-finished
+    attempt does not leave a stray category behind.
+    """
+    parent_raw = io.prompt("Parent path for the new leaf (e.g. 'Equities / Developed'): ").strip()
+    if not parent_raw:
+        io.warn("Parent path required; aborting new-leaf creation.")
+        return False
+    parent_id = repositories.find_category_by_path(connection, parent_raw)
+    if parent_id is None:
+        io.warn(f"Parent path '{parent_raw}' not found.")
+        return False
+    references = _parent_has_mapping_references(connection, parent_id)
+    if references > 0:
+        io.warn(
+            f"Parent '{parent_raw}' has {references} mapping row(s) pointing at it. "
+            "Adding a child would orphan those mappings. Re-target them first via "
+            "`rb mapping update`."
+        )
+        return False
+    name = io.prompt("New leaf name: ").strip()
+    if not name:
+        io.warn("Leaf name required; aborting.")
+        return False
+    try:
+        vol = float(io.prompt("Volatility (e.g. 0.18): ").strip())
+        adj = float(io.prompt("Adjustment (e.g. 1.0): ").strip())
+    except ValueError:
+        io.warn("Invalid numeric input; aborting new-leaf creation.")
+        return False
+    try:
+        connection.execute("BEGIN")
+        new_cat_id = repositories.create_category(
+            connection,
+            parent_id=parent_id,
+            name=name,
+            volatility=vol,
+            adjustment=adj,
+        )
+        repositories.add_mapping(
+            connection,
+            instrument_id=instrument_id,
+            category_id=new_cat_id,
+            weight_micros=MICROS_SCALE,
+        )
+        connection.execute("COMMIT")
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        connection.execute("ROLLBACK")
+        io.warn(f"Could not create category / mapping: {exc}")
+        return False
+    new_path = repositories.get_category_path(connection, new_cat_id)
+    io.info(f"Created leaf '{new_path}' and mapped {adapter}/{instrument_id_text} → {new_path}")
+    return True
+
+
+def _import_categorise_one(
+    connection: sqlite3.Connection,
+    io: IO,
+    *,
+    adapter: str,
+    instrument_id: int,
+    instrument_id_text: str,
+) -> str:
+    """Prompt the user to categorise one unmapped instrument.
+
+    Returns one of: `"mapped"`, `"skipped"`, `"abort"`. `"abort"` tells
+    the caller to stop the categorisation loop entirely (no prompt for
+    subsequent instruments); the user can finish later via
+    `rb mapping add`.
+    """
+    while True:
+        try:
+            raw = io.prompt(
+                f"\n{adapter}/{instrument_id_text} is unmapped.\n"
+                "  Enter a leaf category path (e.g. 'Equities / EM / Asia'),\n"
+                "  'new' to create a new leaf,\n"
+                "  'skip' (or blank) to defer, or\n"
+                "  'quit' to stop categorising. > "
+            )
+        except (KeyboardInterrupt, EOFError):
+            return "abort"
+        cmd = raw.strip()
+        lowered = cmd.lower()
+        if lowered in {"quit", "exit"}:
+            return "abort"
+        if lowered in {"skip", ""}:
+            return "skipped"
+        if lowered == "new":
+            if _import_create_new_leaf(
+                connection,
+                io,
+                adapter=adapter,
+                instrument_id=instrument_id,
+                instrument_id_text=instrument_id_text,
+            ):
+                return "mapped"
+            continue
+        category_id = repositories.find_category_by_path(connection, cmd)
+        if category_id is None:
+            io.warn(f"Category path '{cmd}' not found. Try again, or type 'new' to create one.")
+            continue
+        try:
+            connection.execute("BEGIN")
+            repositories.add_mapping(
+                connection,
+                instrument_id=instrument_id,
+                category_id=category_id,
+                weight_micros=MICROS_SCALE,
+            )
+            connection.execute("COMMIT")
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            connection.execute("ROLLBACK")
+            io.warn(f"Could not add mapping: {exc}")
+            continue
+        io.info(f"Mapped {adapter}/{instrument_id_text} → {cmd}")
+        return "mapped"
+
+
 def cmd_portfolio_import(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     """`rb portfolio import` — parse a statement and upsert positions in the DB.
 
@@ -545,18 +691,54 @@ def cmd_portfolio_import(args: argparse.Namespace, paths: Optional[UserPaths] = 
             db.connection.execute("ROLLBACK")
             raise
 
-        unmapped_ids = repositories.list_unmapped_instrument_ids(db.connection, user_id=user_id)
-        if unmapped_ids:
-            print(
-                f"Imported {len(parsed)} position(s) from {canonical_statement} into "
-                f"({args.adapter}/{args.account}) as-of {as_of}; {len(unmapped_ids)} "
-                "instrument(s) are uncategorised — add mappings with `rb mapping add`."
+        non_interactive = bool(getattr(args, "non_interactive", False))
+        unmapped = repositories.list_unmapped_instruments_detailed(db.connection, user_id=user_id)
+        mapped_count = 0
+        skipped_count = 0
+        if unmapped and not non_interactive:
+            io: IO = StdIO()
+            io.info(
+                f"\n{len(unmapped)} instrument(s) have no mapping yet. "
+                "Categorise them now, or pass --non-interactive to defer."
             )
-        else:
-            print(
-                f"Imported {len(parsed)} position(s) from {canonical_statement} into "
-                f"({args.adapter}/{args.account}) as-of {as_of}."
+            aborted = False
+            for entry in unmapped:
+                if aborted:
+                    break
+                result = _import_categorise_one(
+                    db.connection,
+                    io,
+                    adapter=entry["adapter"],
+                    instrument_id=entry["id"],
+                    instrument_id_text=entry["instrument_id_text"],
+                )
+                if result == "mapped":
+                    mapped_count += 1
+                elif result == "skipped":
+                    skipped_count += 1
+                else:  # "abort"
+                    aborted = True
+                    io.info(
+                        "Stopping categorisation; remaining instruments stay "
+                        "unmapped (`rb mapping add` to finish later)."
+                    )
+
+        # Recount after the prompts in case the loop added mappings.
+        remaining_unmapped = repositories.list_unmapped_instrument_ids(
+            db.connection, user_id=user_id
+        )
+        summary = (
+            f"Imported {len(parsed)} position(s) from {canonical_statement} into "
+            f"({args.adapter}/{args.account}) as-of {as_of}."
+        )
+        if mapped_count or skipped_count:
+            summary += f" Categorised {mapped_count}; deferred {skipped_count}."
+        if remaining_unmapped:
+            summary += (
+                f" {len(remaining_unmapped)} instrument(s) still uncategorised — "
+                "add mappings with `rb mapping add`."
             )
+        print(summary)
         return 0
     finally:
         db.close()
@@ -1960,6 +2142,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--move",
         action="store_true",
         help="Remove the source statement after copying it into the user's statements tree.",
+    )
+    portfolio_import.add_argument(
+        "--non-interactive",
+        dest="non_interactive",
+        action="store_true",
+        help=(
+            "Skip the post-import prompt for uncategorised instruments and report "
+            "the count at the end instead."
+        ),
     )
     portfolio_import.set_defaults(func=cmd_portfolio_import)
 

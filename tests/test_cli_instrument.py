@@ -383,6 +383,7 @@ def test_instrument_delete_blocked_when_position_references_it(paths, capsys) ->
             statement=str(statement),
             as_of="2026-05-17",
             move=False,
+            non_interactive=True,
         ),
         paths=paths,
     )
