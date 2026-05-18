@@ -1374,6 +1374,230 @@ def cmd_mapping_update(args: argparse.Namespace, paths: Optional[UserPaths] = No
 
 
 # ---------------------------------------------------------------------------
+# Commands: category
+# ---------------------------------------------------------------------------
+
+
+def _format_category_tree(
+    rows: Sequence[dict],
+    plan_leaf_ids: Optional[set[int]] = None,
+) -> str:
+    """Render category rows as an indented tree for `category list`.
+
+    Each row indents two spaces per depth level so the hierarchy reads at
+    a glance. Vol / adj show four decimal places (matching `micros`
+    precision); NULL renders as an em-dash. When `plan_leaf_ids` is
+    provided, rows in that set get a trailing `(plan-leaf)` annotation.
+    """
+    if not rows:
+        return "(no categories)"
+    id_width = max(len("ID"), max(len(str(r["id"])) for r in rows))
+    header = f"{'ID':<{id_width}}  {'PATH':<60}  {'VOL':>8}  {'ADJ':>8}"
+    if plan_leaf_ids is not None:
+        header += "  PLAN"
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        indent = "  " * row["depth"]
+        # The full path is unambiguous on its own; the indent is purely
+        # visual sugar so a deeper row pops out without forcing the
+        # reader to count " / " separators.
+        leaf_name = row["path"].rsplit(" / ", 1)[-1]
+        labelled = f"{indent}{leaf_name}"
+        vol = f"{row['volatility']:.4f}" if row["volatility"] is not None else "—"
+        adj = f"{row['adjustment']:.4f}" if row["adjustment"] is not None else "—"
+        suffix = ""
+        if plan_leaf_ids is not None and row["id"] in plan_leaf_ids:
+            suffix = "  (plan-leaf)"
+        lines.append(f"{row['id']:<{id_width}}  {labelled:<60}  {vol:>8}  {adj:>8}{suffix}")
+    return "\n".join(lines)
+
+
+def cmd_category_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb category list` — show every category as an indented tree.
+
+    Optional `--user U` annotates rows that are leaves in that user's
+    plan, so the reader can see at a glance which catalog leaves are
+    actually adopted.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    db = _open_database(paths)
+    try:
+        rows = repositories.list_categories_tree(db.connection)
+        plan_leaf_ids: Optional[set[int]] = None
+        user = getattr(args, "user", None)
+        if user:
+            user_id = repositories.find_user_id(db.connection, user)
+            if user_id is None:
+                print(
+                    f"category list: user '{user}' has no rows in the database "
+                    "(running without the --user marker).",
+                    file=sys.stderr,
+                )
+            else:
+                plan_leaf_ids = repositories.plan_leaf_category_ids_for_user(db.connection, user_id)
+    finally:
+        db.close()
+    print(_format_category_tree(rows, plan_leaf_ids))
+    return 0
+
+
+def cmd_category_add(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb category add` — insert a new category row.
+
+    `--parent` resolves a full path (or is omitted for a top-level
+    category). `--volatility` and `--adjustment` are paired (both or
+    neither, per the schema CHECK).
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    volatility = getattr(args, "volatility", None)
+    adjustment = getattr(args, "adjustment", None)
+    if (volatility is None) != (adjustment is None):
+        print(
+            "category add: pass --volatility and --adjustment together (both or neither).",
+            file=sys.stderr,
+        )
+        return 1
+
+    db = _open_database(paths)
+    try:
+        parent_id: Optional[int] = None
+        if args.parent:
+            parent_id = repositories.find_category_by_path(db.connection, args.parent)
+            if parent_id is None:
+                print(
+                    f"category add failed: parent path '{args.parent}' not found.",
+                    file=sys.stderr,
+                )
+                return 1
+        try:
+            db.connection.execute("BEGIN")
+            new_id = repositories.create_category(
+                db.connection,
+                parent_id=parent_id,
+                name=args.name,
+                volatility=volatility,
+                adjustment=adjustment,
+            )
+            db.connection.execute("COMMIT")
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            db.connection.execute("ROLLBACK")
+            print(f"category add failed: {exc}", file=sys.stderr)
+            return 1
+
+        full_path = repositories.get_category_path(db.connection, new_id)
+        print(f"Added category {new_id}: {full_path}")
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_category_update(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb category update` — change name and/or vol+adj on an existing category.
+
+    Volatility and adjustment remain paired. Pass `--clear-fundamentals`
+    to clear both (useful when a former leaf becomes a branch).
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    name = getattr(args, "name", None)
+    volatility = getattr(args, "volatility", None)
+    adjustment = getattr(args, "adjustment", None)
+    clear_fundamentals = bool(getattr(args, "clear_fundamentals", False))
+    if name is None and volatility is None and adjustment is None and not clear_fundamentals:
+        print(
+            "category update: pass at least one of --name, --volatility/--adjustment, "
+            "or --clear-fundamentals.",
+            file=sys.stderr,
+        )
+        return 1
+    if clear_fundamentals and (volatility is not None or adjustment is not None):
+        print(
+            "category update: --clear-fundamentals cannot be combined with "
+            "--volatility / --adjustment.",
+            file=sys.stderr,
+        )
+        return 1
+    if not clear_fundamentals and (volatility is None) != (adjustment is None):
+        print(
+            "category update: --volatility and --adjustment must be passed together.",
+            file=sys.stderr,
+        )
+        return 1
+
+    db = _open_database(paths)
+    try:
+        existing = repositories.get_category_by_id(db.connection, args.category_id)
+        if existing is None:
+            print(
+                f"category update failed: no category with id {args.category_id}.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            db.connection.execute("BEGIN")
+            repositories.update_category(
+                db.connection,
+                category_id=args.category_id,
+                name=name,
+                volatility=volatility,
+                adjustment=adjustment,
+                set_fundamentals_null=clear_fundamentals,
+            )
+            db.connection.execute("COMMIT")
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            db.connection.execute("ROLLBACK")
+            print(f"category update failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"Updated category {args.category_id}.")
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_category_delete(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb category delete` — remove a category by id.
+
+    Refuses (via the schema's `ON DELETE RESTRICT` on `parent_id`,
+    `plan_node.category_id`, and `mapping.category_id`) whenever any of
+    them references the row. Surfaces a friendly hint to clean up the
+    references first.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    db = _open_database(paths)
+    try:
+        existing = repositories.get_category_by_id(db.connection, args.category_id)
+        if existing is None:
+            print(
+                f"category delete failed: no category with id {args.category_id}.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            db.connection.execute("BEGIN")
+            deleted = repositories.delete_category(db.connection, args.category_id)
+            db.connection.execute("COMMIT")
+        except sqlite3.IntegrityError:
+            db.connection.execute("ROLLBACK")
+            print(
+                f"category delete failed: category {args.category_id} is still "
+                "referenced by one or more child categories, mappings, or plan "
+                "nodes. Delete those first (`rb mapping delete <id>` or remove "
+                "child categories).",
+                file=sys.stderr,
+            )
+            return 1
+        if not deleted:
+            print(
+                f"category delete failed: no category with id {args.category_id}.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Deleted category {args.category_id}.")
+        return 0
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # Commands: instrument
 # ---------------------------------------------------------------------------
 
@@ -1856,6 +2080,93 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mapping row id (see `rb mapping list`).",
     )
     mapping_delete.set_defaults(func=cmd_mapping_delete)
+
+    # category — global category-tree CRUD.
+    category_parser = subparsers.add_parser(
+        "category", help="Manage the global category tree (vol/adj live on the row)"
+    )
+    category_sub = category_parser.add_subparsers(dest="category_command", required=True)
+
+    category_list = category_sub.add_parser(
+        "list",
+        help="Show every category as an indented tree",
+    )
+    category_list.add_argument(
+        "--user",
+        help="Annotate rows that are plan-leaves in this user's plan.",
+    )
+    category_list.set_defaults(func=cmd_category_list)
+
+    category_add = category_sub.add_parser(
+        "add",
+        help="Insert a new category row",
+    )
+    category_add.add_argument(
+        "--parent",
+        default=None,
+        help='Parent path (e.g. "Bonds / Developed"); omit for a top-level category.',
+    )
+    category_add.add_argument("--name", required=True, help="New category name (trimmed).")
+    category_add.add_argument(
+        "--volatility",
+        type=float,
+        default=None,
+        help=(
+            "Annualised volatility as a fraction (e.g. 0.175). Paired with "
+            "--adjustment; pass both to mark this category as a plan-leaf "
+            "candidate, or neither for a structural branch."
+        ),
+    )
+    category_add.add_argument(
+        "--adjustment",
+        type=float,
+        default=None,
+        help="Multiplicative risk adjustment (paired with --volatility).",
+    )
+    category_add.set_defaults(func=cmd_category_add)
+
+    category_update = category_sub.add_parser(
+        "update",
+        help="Change name and/or vol+adj on an existing category",
+    )
+    category_update.add_argument(
+        "category_id",
+        type=int,
+        help="Category row id (see `rb category list`).",
+    )
+    category_update.add_argument("--name", help="New name for this category.")
+    category_update.add_argument(
+        "--volatility",
+        type=float,
+        default=None,
+        help="New volatility (paired with --adjustment).",
+    )
+    category_update.add_argument(
+        "--adjustment",
+        type=float,
+        default=None,
+        help="New adjustment (paired with --volatility).",
+    )
+    category_update.add_argument(
+        "--clear-fundamentals",
+        action="store_true",
+        help="Clear both volatility and adjustment (use when a leaf becomes a branch).",
+    )
+    category_update.set_defaults(func=cmd_category_update)
+
+    category_delete = category_sub.add_parser(
+        "delete",
+        help=(
+            "Delete a category by id (rejected if child categories, mappings, "
+            "or plan nodes reference it)"
+        ),
+    )
+    category_delete.add_argument(
+        "category_id",
+        type=int,
+        help="Category row id (see `rb category list`).",
+    )
+    category_delete.set_defaults(func=cmd_category_delete)
 
     # instrument — global broker-instrument CRUD.
     instrument_parser = subparsers.add_parser(

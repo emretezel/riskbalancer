@@ -185,6 +185,201 @@ def resolve_category_path(
     return current
 
 
+def list_categories_tree(
+    connection: sqlite3.Connection,
+) -> list[dict]:
+    """Return every category as a flat list, depth-first by path.
+
+    Each result has `id`, `path`, `depth`, `volatility`, `adjustment`,
+    where `depth` is `0` for top-level rows. Vol / adj are `None` for
+    branches (paired-NULL guaranteed by the schema CHECK). Ordering by
+    the `category_path` view's string path yields depth-first pre-order
+    because the ` / ` separator sorts shorter paths first ("Equities"
+    before "Equities / Developed") and siblings alphabetically.
+    """
+    rows = connection.execute(
+        """
+        SELECT
+            c.id AS id,
+            cp.path AS path,
+            c.volatility_micros AS vol_micros,
+            c.adjustment_micros AS adj_micros
+        FROM category c
+        JOIN category_path cp ON cp.id = c.id
+        ORDER BY cp.path
+        """
+    ).fetchall()
+    return [
+        {
+            "id": int(row["id"]),
+            "path": str(row["path"]),
+            "depth": str(row["path"]).count(" / "),
+            "volatility": (
+                float(row["vol_micros"]) / MICROS_SCALE if row["vol_micros"] is not None else None
+            ),
+            "adjustment": (
+                float(row["adj_micros"]) / MICROS_SCALE if row["adj_micros"] is not None else None
+            ),
+        }
+        for row in rows
+    ]
+
+
+def get_category_by_id(
+    connection: sqlite3.Connection,
+    category_id: int,
+) -> Optional[dict]:
+    """Return `{id, parent_id, name, volatility, adjustment}` for a row, or None."""
+    row = connection.execute(
+        """
+        SELECT id, parent_id, name, volatility_micros, adjustment_micros
+        FROM category
+        WHERE id = ?
+        """,
+        (category_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "parent_id": int(row["parent_id"]) if row["parent_id"] is not None else None,
+        "name": str(row["name"]),
+        "volatility": (
+            float(row["volatility_micros"]) / MICROS_SCALE
+            if row["volatility_micros"] is not None
+            else None
+        ),
+        "adjustment": (
+            float(row["adjustment_micros"]) / MICROS_SCALE
+            if row["adjustment_micros"] is not None
+            else None
+        ),
+    }
+
+
+def create_category(
+    connection: sqlite3.Connection,
+    *,
+    parent_id: Optional[int],
+    name: str,
+    volatility: Optional[float] = None,
+    adjustment: Optional[float] = None,
+) -> int:
+    """Insert a new category row.
+
+    `parent_id=None` creates a top-level category. `volatility` and
+    `adjustment` are paired: pass both or neither, matching the schema's
+    `(volatility_micros IS NULL) = (adjustment_micros IS NULL)` CHECK.
+    """
+    clean = name.strip()
+    if not clean:
+        raise ValueError("category name must be non-empty")
+    if (volatility is None) != (adjustment is None):
+        raise ValueError("volatility and adjustment must be passed together (both or neither)")
+    if volatility is not None and volatility < 0:
+        raise ValueError("volatility must be non-negative")
+    if adjustment is not None and adjustment < 0:
+        raise ValueError("adjustment must be non-negative")
+    vol_micros = fraction_to_micros(volatility) if volatility is not None else None
+    adj_micros = fraction_to_micros(adjustment) if adjustment is not None else None
+    cursor = connection.execute(
+        """
+        INSERT INTO category (parent_id, name, volatility_micros, adjustment_micros)
+        VALUES (?, ?, ?, ?)
+        """,
+        (parent_id, clean, vol_micros, adj_micros),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError(f"Failed to insert category {clean!r}")
+    return int(cursor.lastrowid)
+
+
+def update_category(
+    connection: sqlite3.Connection,
+    *,
+    category_id: int,
+    name: Optional[str] = None,
+    volatility: Optional[float] = None,
+    adjustment: Optional[float] = None,
+    set_fundamentals_null: bool = False,
+) -> None:
+    """Update one or more editable columns on a category row.
+
+    `name`, `volatility`, and `adjustment` are independently optional.
+    Vol / adj remain paired: pass both to set, or `set_fundamentals_null=True`
+    to clear both. Passing only one of vol / adj is rejected up-front;
+    the schema's paired-NULL CHECK would otherwise reject the write.
+    """
+    if name is None and volatility is None and adjustment is None and not set_fundamentals_null:
+        raise ValueError("update_category requires at least one field to change")
+    if set_fundamentals_null and (volatility is not None or adjustment is not None):
+        raise ValueError("set_fundamentals_null cannot be combined with volatility / adjustment")
+    if not set_fundamentals_null and (volatility is None) != (adjustment is None):
+        raise ValueError("volatility and adjustment must be set together (both or neither)")
+    if volatility is not None and volatility < 0:
+        raise ValueError("volatility must be non-negative")
+    if adjustment is not None and adjustment < 0:
+        raise ValueError("adjustment must be non-negative")
+    sets: list[str] = []
+    params: list[object] = []
+    if name is not None:
+        clean = name.strip()
+        if not clean:
+            raise ValueError("category name must be non-empty")
+        sets.append("name = ?")
+        params.append(clean)
+    if set_fundamentals_null:
+        sets.append("volatility_micros = NULL")
+        sets.append("adjustment_micros = NULL")
+    elif volatility is not None:
+        # The pairing rule above guarantees `adjustment` is also non-None here;
+        # mypy can't see across the prior check, so narrow it explicitly.
+        assert adjustment is not None
+        sets.append("volatility_micros = ?")
+        params.append(fraction_to_micros(volatility))
+        sets.append("adjustment_micros = ?")
+        params.append(fraction_to_micros(adjustment))
+    params.append(category_id)
+    connection.execute(f"UPDATE category SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def delete_category(
+    connection: sqlite3.Connection,
+    category_id: int,
+) -> bool:
+    """Remove a category row; return True iff something was deleted.
+
+    The schema's `ON DELETE RESTRICT` on `category.parent_id`,
+    `plan_node.category_id`, and `mapping.category_id` blocks deletes
+    while any of them references the row. SQLite surfaces that as an
+    `IntegrityError`; callers catch it for a friendly error.
+    """
+    cursor = connection.execute("DELETE FROM category WHERE id = ?", (category_id,))
+    return cursor.rowcount > 0
+
+
+def plan_leaf_category_ids_for_user(
+    connection: sqlite3.Connection,
+    user_id: int,
+) -> set[int]:
+    """Return the set of `category.id` values that are leaves in the user's plan.
+
+    A plan-leaf is a `plan_node` row with no children. Used by
+    `cmd_category_list --user U` to mark which catalog leaves are
+    actually adopted in that user's plan.
+    """
+    rows = connection.execute(
+        """
+        SELECT pn.category_id AS cid
+        FROM plan_node pn
+        LEFT JOIN plan_node child ON child.parent_id = pn.id
+        WHERE pn.user_id = ? AND child.id IS NULL
+        """,
+        (user_id,),
+    ).fetchall()
+    return {int(row["cid"]) for row in rows}
+
+
 def get_category_path(connection: sqlite3.Connection, category_id: int) -> str:
     """Return the full ` / `-joined path for the given category id."""
     row = connection.execute(
