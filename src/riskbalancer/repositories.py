@@ -798,6 +798,117 @@ def get_source_id(connection: sqlite3.Connection, adapter: str) -> int:
     return int(row["id"])
 
 
+def list_instruments(
+    connection: sqlite3.Connection,
+    *,
+    adapter: Optional[str] = None,
+) -> list[dict]:
+    """Return every instrument row, optionally filtered by broker `adapter`.
+
+    Each result has `id`, `adapter`, `instrument_id_text`, `description`.
+    Ordered by adapter, instrument so the output is stable across runs.
+    """
+    where = ""
+    params: list[object] = []
+    if adapter is not None:
+        where = "WHERE s.adapter = ?"
+        params.append(adapter)
+    rows = connection.execute(
+        f"""
+        SELECT
+            i.id AS id,
+            s.adapter AS adapter,
+            i.instrument_id_text AS instrument_id_text,
+            i.description AS description
+        FROM instrument i
+        JOIN source s ON s.id = i.source_id
+        {where}
+        ORDER BY s.adapter, i.instrument_id_text
+        """,
+        params,
+    ).fetchall()
+    return [
+        {
+            "id": int(row["id"]),
+            "adapter": str(row["adapter"]),
+            "instrument_id_text": str(row["instrument_id_text"]),
+            "description": (str(row["description"]) if row["description"] is not None else None),
+        }
+        for row in rows
+    ]
+
+
+def create_instrument(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int,
+    instrument_id_text: str,
+    description: Optional[str],
+) -> int:
+    """Insert a new instrument row, raising on duplicate natural key.
+
+    Strict counterpart to `find_or_create_instrument`: the explicit
+    `rb instrument add` command needs to fail loudly if the instrument
+    already exists, rather than silently returning the existing row.
+    """
+    cleaned_text = instrument_id_text.strip()
+    if not cleaned_text:
+        raise ValueError("instrument_id_text must be non-empty")
+    cleaned_description: Optional[str] = None
+    if description is not None:
+        stripped = description.strip()
+        if not stripped:
+            raise ValueError("description must be non-empty when provided")
+        cleaned_description = stripped
+    cursor = connection.execute(
+        "INSERT INTO instrument (source_id, instrument_id_text, description) VALUES (?, ?, ?)",
+        (source_id, cleaned_text, cleaned_description),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError(f"Failed to insert instrument (source_id={source_id}, {cleaned_text!r})")
+    return int(cursor.lastrowid)
+
+
+def update_instrument_description(
+    connection: sqlite3.Connection,
+    *,
+    instrument_id: int,
+    description: Optional[str],
+) -> None:
+    """Update the description column on an existing instrument row.
+
+    `description` is the only mutable field on `instrument`; the
+    `(source_id, instrument_id_text)` natural key is immutable per the
+    schema. `None` clears the column; any non-None value must be a
+    trimmed non-empty string to satisfy the CHECK constraint.
+    """
+    cleaned: Optional[str] = None
+    if description is not None:
+        stripped = description.strip()
+        if not stripped:
+            raise ValueError("description must be non-empty when provided")
+        cleaned = stripped
+    connection.execute(
+        "UPDATE instrument SET description = ? WHERE id = ?",
+        (cleaned, instrument_id),
+    )
+
+
+def delete_instrument(
+    connection: sqlite3.Connection,
+    instrument_id: int,
+) -> bool:
+    """Remove an instrument row; return True iff something was deleted.
+
+    The schema's `ON DELETE RESTRICT` on `mapping.instrument_id` and
+    `position.instrument_id` blocks deletes whenever either references
+    the row. SQLite surfaces that as an `IntegrityError`; callers catch
+    it to produce a friendly error.
+    """
+    cursor = connection.execute("DELETE FROM instrument WHERE id = ?", (instrument_id,))
+    return cursor.rowcount > 0
+
+
 def find_or_create_instrument(
     connection: sqlite3.Connection,
     *,

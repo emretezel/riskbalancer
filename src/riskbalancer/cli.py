@@ -1373,6 +1373,179 @@ def cmd_mapping_update(args: argparse.Namespace, paths: Optional[UserPaths] = No
         db.close()
 
 
+# ---------------------------------------------------------------------------
+# Commands: instrument
+# ---------------------------------------------------------------------------
+
+
+def _format_instrument_rows(rows: Sequence[dict]) -> str:
+    """Render instrument rows as a fixed-width table for `instrument list`."""
+    if not rows:
+        return "(no instruments)"
+    id_width = max(len("ID"), max(len(str(r["id"])) for r in rows))
+    adapter_width = max(len("SOURCE"), max(len(r["adapter"]) for r in rows))
+    instrument_width = max(len("INSTRUMENT"), max(len(r["instrument_id_text"]) for r in rows))
+    header = (
+        f"{'ID':<{id_width}}  "
+        f"{'SOURCE':<{adapter_width}}  "
+        f"{'INSTRUMENT':<{instrument_width}}  "
+        "DESCRIPTION"
+    )
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        description = row["description"] if row["description"] is not None else "—"
+        lines.append(
+            f"{row['id']:<{id_width}}  "
+            f"{row['adapter']:<{adapter_width}}  "
+            f"{row['instrument_id_text']:<{instrument_width}}  "
+            f"{description}"
+        )
+    return "\n".join(lines)
+
+
+def cmd_instrument_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb instrument list` — show every instrument, optionally filtered by source."""
+    paths = paths if paths is not None else _paths_from_args(args)
+    db = _open_database(paths)
+    try:
+        rows = repositories.list_instruments(db.connection, adapter=getattr(args, "source", None))
+    finally:
+        db.close()
+    print(_format_instrument_rows(rows))
+    return 0
+
+
+def cmd_instrument_add(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb instrument add` — insert a new instrument row.
+
+    Errors loudly if `(source, id)` already exists. To edit the description
+    of an existing instrument, use `rb instrument update`.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    db = _open_database(paths)
+    try:
+        try:
+            source_id = repositories.get_source_id(db.connection, args.source)
+        except ValueError as exc:
+            print(f"instrument add failed: {exc}", file=sys.stderr)
+            return 1
+        existing = repositories.find_instrument_by_natural_key(
+            db.connection,
+            source_id=source_id,
+            instrument_id_text=args.id,
+        )
+        if existing is not None:
+            print(
+                f"instrument add failed: ({args.source}/{args.id}) already exists "
+                f"as id {existing}. Use `rb instrument update {existing}` to edit it.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            db.connection.execute("BEGIN")
+            new_id = repositories.create_instrument(
+                db.connection,
+                source_id=source_id,
+                instrument_id_text=args.id,
+                description=args.description,
+            )
+            db.connection.execute("COMMIT")
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            db.connection.execute("ROLLBACK")
+            print(f"instrument add failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"Added instrument {new_id}: {args.source}/{args.id}")
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_instrument_update(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb instrument update` — change the description on an existing row.
+
+    The natural key `(source_id, instrument_id_text)` is immutable per the
+    schema; only `description` is editable here. To rename or re-attribute
+    an instrument, delete and re-add it (after first cleaning up any
+    mapping / position references).
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    description = getattr(args, "description", None)
+    if description is None:
+        print(
+            "instrument update: pass --description to set the description.",
+            file=sys.stderr,
+        )
+        return 1
+    db = _open_database(paths)
+    try:
+        existing = repositories.get_instrument_by_id(db.connection, args.instrument_id)
+        if existing is None:
+            print(
+                f"instrument update failed: no instrument with id {args.instrument_id}.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            db.connection.execute("BEGIN")
+            repositories.update_instrument_description(
+                db.connection,
+                instrument_id=args.instrument_id,
+                description=description,
+            )
+            db.connection.execute("COMMIT")
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            db.connection.execute("ROLLBACK")
+            print(f"instrument update failed: {exc}", file=sys.stderr)
+            return 1
+        print(f"Updated instrument {args.instrument_id}.")
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_instrument_delete(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb instrument delete` — remove an instrument by id.
+
+    Refuses (via the schema's `ON DELETE RESTRICT`) when any mapping or
+    position still references the row; surfaces a friendly hint to clean
+    up the references first.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    db = _open_database(paths)
+    try:
+        existing = repositories.get_instrument_by_id(db.connection, args.instrument_id)
+        if existing is None:
+            print(
+                f"instrument delete failed: no instrument with id {args.instrument_id}.",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            db.connection.execute("BEGIN")
+            deleted = repositories.delete_instrument(db.connection, args.instrument_id)
+            db.connection.execute("COMMIT")
+        except sqlite3.IntegrityError:
+            db.connection.execute("ROLLBACK")
+            print(
+                f"instrument delete failed: instrument {args.instrument_id} is "
+                "still referenced by one or more mapping or position rows. "
+                "Delete those references first "
+                "(`rb mapping delete <id>` and/or re-import without the holding).",
+                file=sys.stderr,
+            )
+            return 1
+        if not deleted:
+            print(
+                f"instrument delete failed: no instrument with id {args.instrument_id}.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Deleted instrument {args.instrument_id}.")
+        return 0
+    finally:
+        db.close()
+
+
 def cmd_mapping_delete(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
     """`rb mapping delete` — remove a single mapping row by id."""
     paths = paths if paths is not None else _paths_from_args(args)
@@ -1683,6 +1856,67 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mapping row id (see `rb mapping list`).",
     )
     mapping_delete.set_defaults(func=cmd_mapping_delete)
+
+    # instrument — global broker-instrument CRUD.
+    instrument_parser = subparsers.add_parser(
+        "instrument", help="Manage instruments (global, per (source, id_text))"
+    )
+    instrument_sub = instrument_parser.add_subparsers(dest="instrument_command", required=True)
+
+    instrument_list = instrument_sub.add_parser(
+        "list",
+        help="List instruments, optionally filtered by broker",
+    )
+    instrument_list.add_argument(
+        "--source",
+        choices=ADAPTERS.keys(),
+        help="Only show instruments for this broker.",
+    )
+    instrument_list.set_defaults(func=cmd_instrument_list)
+
+    instrument_add = instrument_sub.add_parser(
+        "add",
+        help="Insert a new instrument row",
+    )
+    instrument_add.add_argument("--source", required=True, choices=ADAPTERS.keys())
+    instrument_add.add_argument(
+        "--id",
+        required=True,
+        help="Instrument id text as it appears in broker statements (e.g. EMIM).",
+    )
+    instrument_add.add_argument(
+        "--description",
+        default=None,
+        help="Optional human-readable description.",
+    )
+    instrument_add.set_defaults(func=cmd_instrument_add)
+
+    instrument_update = instrument_sub.add_parser(
+        "update",
+        help="Update the description on an existing instrument row",
+    )
+    instrument_update.add_argument(
+        "instrument_id",
+        type=int,
+        help="Instrument row id (see `rb instrument list`).",
+    )
+    instrument_update.add_argument(
+        "--description",
+        required=True,
+        help="New description (trimmed; must be non-empty).",
+    )
+    instrument_update.set_defaults(func=cmd_instrument_update)
+
+    instrument_delete = instrument_sub.add_parser(
+        "delete",
+        help="Delete an instrument row by id (rejected if mappings or positions reference it)",
+    )
+    instrument_delete.add_argument(
+        "instrument_id",
+        type=int,
+        help="Instrument row id (see `rb instrument list`).",
+    )
+    instrument_delete.set_defaults(func=cmd_instrument_delete)
 
     # user — manage which users exist.
     user_parser = subparsers.add_parser("user", help="Manage users")
