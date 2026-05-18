@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import shutil
+import sqlite3
 import sys
 import urllib.error
 import urllib.request
@@ -1137,6 +1138,280 @@ def cmd_user_delete(args: argparse.Namespace, paths: Optional[UserPaths] = None)
 
 
 # ---------------------------------------------------------------------------
+# Commands: mapping
+# ---------------------------------------------------------------------------
+
+
+def _parse_weight_argument(raw: str) -> float:
+    """Parse a `--weight` value as either a fraction (`0.55`) or percent (`55%`).
+
+    Mirrors the walker's parser in `plan_bootstrap._parse_weight_input` so
+    the user can type whichever shape feels natural. Values must land in
+    `(0, 1]`; zero or negative weights are rejected because the schema's
+    `CHECK (weight_micros > 0)` would reject them anyway.
+    """
+    cleaned = raw.strip().rstrip("%")
+    if not cleaned:
+        raise ValueError("Weight value is required")
+    try:
+        value = float(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"Invalid weight '{raw}'") from exc
+    if "%" in raw or value > 1:
+        value = value / 100.0
+    if value <= 0:
+        raise ValueError("Weight must be positive")
+    if value > 1.0 + 1e-9:
+        raise ValueError("Weight must not exceed 100%")
+    return value
+
+
+def _warn_on_weight_sum_mismatch(
+    connection,
+    instrument_id: int,
+    instrument_label: str,
+) -> None:
+    """Emit a stderr warning when per-instrument mapping weights don't sum to 1.0.
+
+    The schema enforces `weight_micros > 0` and `<= 1_000_000` per row but
+    cannot express the cross-row sum invariant (§3.7) — that's the
+    application's job. After every mutation the CLI checks the total and
+    surfaces a one-line warning when the user has left it inconsistent.
+    """
+    total = repositories.weight_sum_micros_for_instrument(connection, instrument_id)
+    if total == MICROS_SCALE:
+        return
+    if total == 0:
+        print(
+            f"Warning: instrument {instrument_label!r} no longer has any mappings.",
+            file=sys.stderr,
+        )
+        return
+    pct = total / MICROS_SCALE * 100
+    print(
+        f"Warning: weights for instrument {instrument_label!r} sum to {pct:.2f}% "
+        f"(expected 100%). Add or update sibling mappings to fix.",
+        file=sys.stderr,
+    )
+
+
+def _format_mapping_rows(rows: Sequence[dict]) -> str:
+    """Render mapping rows as a fixed-width table for `mapping list`."""
+    if not rows:
+        return "(no mappings)"
+    id_width = max(len("ID"), max(len(str(r["id"])) for r in rows))
+    adapter_width = max(len("SOURCE"), max(len(r["adapter"]) for r in rows))
+    instrument_width = max(len("INSTRUMENT"), max(len(r["instrument_id_text"]) for r in rows))
+    category_width = max(len("CATEGORY"), max(len(r["category_path"]) for r in rows))
+    header = (
+        f"{'ID':<{id_width}}  "
+        f"{'SOURCE':<{adapter_width}}  "
+        f"{'INSTRUMENT':<{instrument_width}}  "
+        f"{'CATEGORY':<{category_width}}  "
+        f"{'WEIGHT':>7}"
+    )
+    lines = [header, "-" * len(header)]
+    for row in rows:
+        weight = row["weight_micros"] / MICROS_SCALE
+        lines.append(
+            f"{row['id']:<{id_width}}  "
+            f"{row['adapter']:<{adapter_width}}  "
+            f"{row['instrument_id_text']:<{instrument_width}}  "
+            f"{row['category_path']:<{category_width}}  "
+            f"{weight:7.4f}"
+        )
+    return "\n".join(lines)
+
+
+def cmd_mapping_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb mapping list` — list mappings, optionally filtered by source / instrument / category."""
+    paths = paths if paths is not None else _paths_from_args(args)
+    db = _open_database(paths)
+    try:
+        rows = repositories.list_mappings(
+            db.connection,
+            adapter=getattr(args, "source", None),
+            instrument_id_text=getattr(args, "instrument", None),
+            category_path=getattr(args, "category", None),
+        )
+    finally:
+        db.close()
+    print(_format_mapping_rows(rows))
+    return 0
+
+
+def cmd_mapping_add(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb mapping add` — create a single mapping row."""
+    paths = paths if paths is not None else _paths_from_args(args)
+    try:
+        weight_fraction = _parse_weight_argument(args.weight) if args.weight else 1.0
+    except ValueError as exc:
+        print(f"mapping add failed: {exc}", file=sys.stderr)
+        return 1
+    weight_micros = repositories.fraction_to_micros(weight_fraction)
+
+    db = _open_database(paths)
+    try:
+        try:
+            source_id = repositories.get_source_id(db.connection, args.source)
+        except ValueError as exc:
+            print(f"mapping add failed: {exc}", file=sys.stderr)
+            return 1
+
+        instrument_id = repositories.find_instrument_by_natural_key(
+            db.connection,
+            source_id=source_id,
+            instrument_id_text=args.instrument,
+        )
+        if instrument_id is None:
+            print(
+                f"mapping add failed: instrument '{args.instrument}' not found for "
+                f"source '{args.source}'. Run `rb instrument add` or import a "
+                "statement first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        category_id = repositories.find_category_by_path(db.connection, args.category)
+        if category_id is None:
+            print(
+                f"mapping add failed: category path '{args.category}' not found. "
+                "Run `rb category add` or `rb plan create` first.",
+                file=sys.stderr,
+            )
+            return 1
+
+        try:
+            db.connection.execute("BEGIN")
+            repositories.add_mapping(
+                db.connection,
+                instrument_id=instrument_id,
+                category_id=category_id,
+                weight_micros=weight_micros,
+            )
+            db.connection.execute("COMMIT")
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            db.connection.execute("ROLLBACK")
+            print(f"mapping add failed: {exc}", file=sys.stderr)
+            return 1
+
+        instrument_label = f"{args.source}/{args.instrument}"
+        print(f"Added mapping: {instrument_label} → {args.category} @ {weight_fraction:.4f}")
+        _warn_on_weight_sum_mismatch(db.connection, instrument_id, instrument_label)
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_mapping_update(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb mapping update` — change the category and/or weight of an existing mapping row."""
+    paths = paths if paths is not None else _paths_from_args(args)
+    category = getattr(args, "category", None)
+    weight = getattr(args, "weight", None)
+    if category is None and weight is None:
+        print(
+            "mapping update: pass at least one of --category or --weight",
+            file=sys.stderr,
+        )
+        return 1
+    weight_fraction: Optional[float] = None
+    if weight is not None:
+        try:
+            weight_fraction = _parse_weight_argument(weight)
+        except ValueError as exc:
+            print(f"mapping update failed: {exc}", file=sys.stderr)
+            return 1
+
+    db = _open_database(paths)
+    try:
+        existing = repositories.find_mapping_by_id(db.connection, args.mapping_id)
+        if existing is None:
+            print(
+                f"mapping update failed: no mapping with id {args.mapping_id}.",
+                file=sys.stderr,
+            )
+            return 1
+
+        new_category_id: Optional[int] = None
+        if category is not None:
+            new_category_id = repositories.find_category_by_path(db.connection, category)
+            if new_category_id is None:
+                print(
+                    f"mapping update failed: category path '{category}' not found.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        new_weight_micros: Optional[int] = None
+        if weight_fraction is not None:
+            new_weight_micros = repositories.fraction_to_micros(weight_fraction)
+
+        try:
+            db.connection.execute("BEGIN")
+            repositories.update_mapping(
+                db.connection,
+                mapping_id=args.mapping_id,
+                category_id=new_category_id,
+                weight_micros=new_weight_micros,
+            )
+            db.connection.execute("COMMIT")
+        except (ValueError, sqlite3.IntegrityError) as exc:
+            db.connection.execute("ROLLBACK")
+            print(f"mapping update failed: {exc}", file=sys.stderr)
+            return 1
+
+        instrument = repositories.get_instrument_by_id(db.connection, existing["instrument_id"])
+        instrument_label = (
+            f"{repositories.get_category_path(db.connection, existing['category_id'])}"
+            if instrument is None
+            else f"instrument#{existing['instrument_id']} ({instrument[1]})"
+        )
+        print(f"Updated mapping {args.mapping_id}.")
+        _warn_on_weight_sum_mismatch(db.connection, existing["instrument_id"], instrument_label)
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_mapping_delete(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb mapping delete` — remove a single mapping row by id."""
+    paths = paths if paths is not None else _paths_from_args(args)
+    db = _open_database(paths)
+    try:
+        existing = repositories.find_mapping_by_id(db.connection, args.mapping_id)
+        if existing is None:
+            print(
+                f"mapping delete failed: no mapping with id {args.mapping_id}.",
+                file=sys.stderr,
+            )
+            return 1
+        instrument_id = existing["instrument_id"]
+        instrument = repositories.get_instrument_by_id(db.connection, instrument_id)
+        instrument_label = f"instrument#{instrument_id}" if instrument is None else instrument[1]
+
+        try:
+            db.connection.execute("BEGIN")
+            deleted = repositories.delete_mapping_by_id(db.connection, args.mapping_id)
+            db.connection.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            db.connection.execute("ROLLBACK")
+            print(f"mapping delete failed: {exc}", file=sys.stderr)
+            return 1
+
+        if not deleted:
+            print(
+                f"mapping delete failed: no mapping with id {args.mapping_id}.",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Deleted mapping {args.mapping_id}.")
+        _warn_on_weight_sum_mismatch(db.connection, instrument_id, instrument_label)
+        return 0
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
@@ -1326,6 +1601,88 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the y/N confirm before replacing the existing plan.",
     )
     plan_import.set_defaults(func=cmd_plan_import)
+
+    # mapping — global instrument→category CRUD.
+    mapping_parser = subparsers.add_parser(
+        "mapping", help="Manage instrument-to-category mappings (global, leaf-only)"
+    )
+    mapping_sub = mapping_parser.add_subparsers(dest="mapping_command", required=True)
+
+    mapping_list = mapping_sub.add_parser(
+        "list",
+        help="List mappings, optionally filtered by source / instrument / category",
+    )
+    mapping_list.add_argument(
+        "--source",
+        choices=ADAPTERS.keys(),
+        help="Only show mappings for this broker.",
+    )
+    mapping_list.add_argument(
+        "--instrument",
+        help=(
+            "Only show mappings for this instrument id (combine with --source for full uniqueness)."
+        ),
+    )
+    mapping_list.add_argument(
+        "--category",
+        help='Only show mappings to this category path (e.g. "Equities / EM / Asia").',
+    )
+    mapping_list.set_defaults(func=cmd_mapping_list)
+
+    mapping_add = mapping_sub.add_parser(
+        "add",
+        help="Insert a mapping row for (source, instrument) → category",
+    )
+    mapping_add.add_argument("--source", required=True, choices=ADAPTERS.keys())
+    mapping_add.add_argument(
+        "--instrument",
+        required=True,
+        help="Instrument id text as it appears in broker statements (e.g. EMIM).",
+    )
+    mapping_add.add_argument(
+        "--category",
+        required=True,
+        help=(
+            "Full category path the mapping targets (must be a leaf in the global "
+            'category tree, e.g. "Equities / EM / Asia").'
+        ),
+    )
+    mapping_add.add_argument(
+        "--weight",
+        default=None,
+        help="Allocation weight as a fraction or percent (e.g. 0.62 or 62%%). Defaults to 1.0.",
+    )
+    mapping_add.set_defaults(func=cmd_mapping_add)
+
+    mapping_update = mapping_sub.add_parser(
+        "update",
+        help="Update an existing mapping row's category and/or weight",
+    )
+    mapping_update.add_argument(
+        "mapping_id",
+        type=int,
+        help="Mapping row id (see `rb mapping list`).",
+    )
+    mapping_update.add_argument(
+        "--category",
+        help="New category path (must be a leaf).",
+    )
+    mapping_update.add_argument(
+        "--weight",
+        help="New weight as a fraction or percent.",
+    )
+    mapping_update.set_defaults(func=cmd_mapping_update)
+
+    mapping_delete = mapping_sub.add_parser(
+        "delete",
+        help="Delete a single mapping row by id",
+    )
+    mapping_delete.add_argument(
+        "mapping_id",
+        type=int,
+        help="Mapping row id (see `rb mapping list`).",
+    )
+    mapping_delete.set_defaults(func=cmd_mapping_delete)
 
     # user — manage which users exist.
     user_parser = subparsers.add_parser("user", help="Manage users")

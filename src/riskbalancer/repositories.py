@@ -542,6 +542,191 @@ def add_mapping(
     )
 
 
+def find_category_by_path(
+    connection: sqlite3.Connection,
+    path: str,
+) -> Optional[int]:
+    """Look up a category id by its full ` / `-joined path.
+
+    Read-only: missing path components return None instead of being
+    auto-created (that's `resolve_category_path`'s job). Used by the
+    CRUD commands that must error cleanly when the user names a path
+    that doesn't exist yet.
+    """
+    cleaned = " / ".join(part.strip() for part in path.split("/") if part.strip())
+    if not cleaned:
+        return None
+    row = connection.execute(
+        "SELECT id FROM category_path WHERE path = ?",
+        (cleaned,),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["id"])
+
+
+def find_instrument_by_natural_key(
+    connection: sqlite3.Connection,
+    *,
+    source_id: int,
+    instrument_id_text: str,
+) -> Optional[int]:
+    """Look up an instrument id by `(source_id, instrument_id_text)`.
+
+    Read-only counterpart to `find_or_create_instrument`. Returns None
+    when the instrument has never been seen (no statement_import has
+    introduced it and no `rb instrument add` has been run).
+    """
+    row = connection.execute(
+        "SELECT id FROM instrument WHERE source_id = ? AND instrument_id_text = ?",
+        (source_id, instrument_id_text.strip()),
+    ).fetchone()
+    if row is None:
+        return None
+    return int(row["id"])
+
+
+def find_mapping_by_id(
+    connection: sqlite3.Connection,
+    mapping_id: int,
+) -> Optional[dict]:
+    """Return `{id, instrument_id, category_id, weight_micros}` for a mapping row, or None."""
+    row = connection.execute(
+        """
+        SELECT id, instrument_id, category_id, weight_micros
+        FROM mapping
+        WHERE id = ?
+        """,
+        (mapping_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": int(row["id"]),
+        "instrument_id": int(row["instrument_id"]),
+        "category_id": int(row["category_id"]),
+        "weight_micros": int(row["weight_micros"]),
+    }
+
+
+def update_mapping(
+    connection: sqlite3.Connection,
+    *,
+    mapping_id: int,
+    category_id: Optional[int] = None,
+    weight_micros: Optional[int] = None,
+) -> None:
+    """Update one or both editable columns on a `mapping` row.
+
+    The schema's `mapping_target_must_be_leaf_update` trigger still
+    enforces the leaf-only invariant on the new `category_id`; this
+    helper does the application-side pre-check so callers get a typed
+    `ValueError` with a clear message before the trigger fires.
+    """
+    if category_id is None and weight_micros is None:
+        raise ValueError("update_mapping requires at least one of category_id or weight_micros")
+    if category_id is not None and not _category_is_leaf(connection, category_id):
+        raise ValueError(
+            f"Mapping target category {category_id} is not a leaf; "
+            "mappings can only point at leaf categories."
+        )
+    if weight_micros is not None and (weight_micros <= 0 or weight_micros > MICROS_SCALE):
+        raise ValueError(
+            f"Mapping weight {weight_micros} micros is outside the valid range (0, {MICROS_SCALE}]."
+        )
+    sets: list[str] = []
+    params: list[object] = []
+    if category_id is not None:
+        sets.append("category_id = ?")
+        params.append(category_id)
+    if weight_micros is not None:
+        sets.append("weight_micros = ?")
+        params.append(weight_micros)
+    params.append(mapping_id)
+    connection.execute(f"UPDATE mapping SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def delete_mapping_by_id(
+    connection: sqlite3.Connection,
+    mapping_id: int,
+) -> bool:
+    """Remove a single mapping row by id; return True iff something was deleted."""
+    cursor = connection.execute("DELETE FROM mapping WHERE id = ?", (mapping_id,))
+    return cursor.rowcount > 0
+
+
+def weight_sum_micros_for_instrument(
+    connection: sqlite3.Connection,
+    instrument_id: int,
+) -> int:
+    """Return the sum of `weight_micros` across every mapping for the instrument.
+
+    The application-level invariant (§3.7) is that this sums to `1_000_000`.
+    Any deviation is a warning, not an error — the schema accepts it.
+    """
+    row = connection.execute(
+        "SELECT COALESCE(SUM(weight_micros), 0) AS total FROM mapping WHERE instrument_id = ?",
+        (instrument_id,),
+    ).fetchone()
+    return int(row["total"])
+
+
+def list_mappings(
+    connection: sqlite3.Connection,
+    *,
+    adapter: Optional[str] = None,
+    instrument_id_text: Optional[str] = None,
+    category_path: Optional[str] = None,
+) -> list[dict]:
+    """Return mapping rows joined to instrument + source + category path.
+
+    Filters are AND-combined. Each result row is a dict with: `id`,
+    `adapter`, `instrument_id_text`, `category_path`, `weight_micros`.
+    Ordered by adapter, instrument, category path so the output is
+    stable across runs.
+    """
+    where: list[str] = []
+    params: list[object] = []
+    if adapter is not None:
+        where.append("s.adapter = ?")
+        params.append(adapter)
+    if instrument_id_text is not None:
+        where.append("i.instrument_id_text = ?")
+        params.append(instrument_id_text.strip())
+    if category_path is not None:
+        cleaned = " / ".join(part.strip() for part in category_path.split("/") if part.strip())
+        where.append("cp.path = ?")
+        params.append(cleaned)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    rows = connection.execute(
+        f"""
+        SELECT
+            m.id AS id,
+            s.adapter AS adapter,
+            i.instrument_id_text AS instrument_id_text,
+            cp.path AS category_path,
+            m.weight_micros AS weight_micros
+        FROM mapping m
+        JOIN instrument i ON i.id = m.instrument_id
+        JOIN source s ON s.id = i.source_id
+        JOIN category_path cp ON cp.id = m.category_id
+        {where_sql}
+        ORDER BY s.adapter, i.instrument_id_text, cp.path
+        """,
+        params,
+    ).fetchall()
+    return [
+        {
+            "id": int(row["id"]),
+            "adapter": str(row["adapter"]),
+            "instrument_id_text": str(row["instrument_id_text"]),
+            "category_path": str(row["category_path"]),
+            "weight_micros": int(row["weight_micros"]),
+        }
+        for row in rows
+    ]
+
+
 def resolve_category_to_plan_leaf(
     connection: sqlite3.Connection,
     *,
