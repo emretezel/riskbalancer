@@ -4,13 +4,18 @@
 > writing any code that touches `private/riskbalancer.db` or
 > `src/riskbalancer/repositories.py`.
 
-The database is SQLite. It is the single source of truth for every mutable
-concept in the project: users, categories, plans, instruments, mappings,
-statement imports, positions, and FX rates. Curated YAML files under
-`config/` (`seed_plan.yaml`, `mappings/<adapter>.yaml`, `fx.example.yaml`)
-are *seed inputs only* — loaded into the database once via `rb db seed`.
+The database is SQLite. It is the **single source of truth** for every
+mutable concept in the project: users, categories, plans, instruments,
+mappings, statement imports, positions, and FX rates. There are no YAML
+or JSON side files for working data; the CLI's CRUD commands
+(`rb category add`, `rb instrument add`, `rb mapping add`, etc.) and
+`rb portfolio import` are the only sanctioned write paths. One-off
+local scripts may insert rows directly when an automated mass-load is
+needed.
 
-The redesign rationale lives at `/Users/emre/.claude/plans/we-need-to-have-snappy-crescent.md`.
+The redesign rationale lives at `/Users/emre/.claude/plans/we-need-to-have-snappy-crescent.md`;
+the post-migration plan that completed the SQLite-only world is at
+`/Users/emre/.claude/plans/we-have-just-completed-smooth-badger.md`.
 
 ---
 
@@ -45,7 +50,7 @@ form throughout the schema. There is no `REAL`/`FLOAT` money column anywhere.
 Weights, volatility, adjustments, and FX rates are stored as `INTEGER`
 parts-per-million (suffix `_micros`). `0.55` is `550000`; `1.0` is
 `1000000`; an adjustment of `1.35` is `1350000`. The helper
-`riskbalancer.seed.fraction_to_micros(value)` rounds — so
+`riskbalancer.repositories.fraction_to_micros(value)` rounds — so
 `0.62 + 0.05 + 0.13 + 0.2` round-trips to exactly `1_000_000`, not
 `999_999`.
 
@@ -229,7 +234,7 @@ adapter string lives on `source.adapter`, single source of truth).
 | `id` | `INTEGER PRIMARY KEY` | |
 | `source_id` | `INTEGER NOT NULL REFERENCES source(id) ON DELETE RESTRICT` | The broker. A `source` row cannot be deleted while instruments still reference it. |
 | `instrument_id_text` | `TEXT NOT NULL` | The broker's identifier, as it appears in the CSV. `length(instrument_id_text) > 0`. |
-| `description` | `TEXT NULL` | Human-readable description. `NULL` or a trimmed non-empty string; the empty string is rejected to keep "absent" unambiguous. The seed loader populates this from the YAML and refuses to overwrite a non-empty existing description. |
+| `description` | `TEXT NULL` | Human-readable description. `NULL` or a trimmed non-empty string; the empty string is rejected to keep "absent" unambiguous. `find_or_create_instrument` (used by the import path) fills it in from the statement and refuses to overwrite a non-empty existing description; `rb instrument update` is the explicit edit path. |
 
 `UNIQUE (source_id, instrument_id_text)`.
 
@@ -423,8 +428,9 @@ the underlying schema normalised.
 
 A recursive CTE that materialises the full ` / `-joined path for every
 category. Used wherever we need to render or match a path string
-(seed loading, mapping lookups, interactive prompts). The recursion
-walks down from `parent_id IS NULL`. Migration 4 added a `depth < 32`
+(mapping lookups, `rb category list` rendering, interactive prompts,
+`find_category_by_path`). The recursion walks down from
+`parent_id IS NULL`. Migration 4 added a `depth < 32`
 guard to the CTE so a malformed parent chain (which the cycle triggers
 in §10 should already prevent) produces a bounded result instead of
 exhausting memory.
@@ -485,8 +491,10 @@ fundamentals, as for any other leaf.
 
 Why this design:
 
-- The seed can ship maximally specific mappings without forcing every
-  user to adopt the deepest sub-tree.
+- Mappings can be maximally specific (e.g. `Equities / EM / Asia`)
+  without forcing every user to adopt the deepest sub-tree. A user
+  whose plan stops at `Equities / EM` still attributes those positions
+  cleanly via the resolver.
 - Users can extend their plan over time (split `EM` into `Asia / EMEA /
   Americas`) and existing imports automatically attribute at the new
   granularity — no re-import required.
@@ -507,9 +515,10 @@ Why this design:
   always preferred when a state needs to be modelled.
 - **No global UNIQUE on `category(name)`.** Two `Govt` leaves with
   different parents are legitimately distinct rows.
-- **No "is_seed" flag on user or plan_node.** The seed plan is loaded
-  into `category` only (the merged vol/adj columns hold the seed's
-  fundamentals for leaves); it never appears as a fake "_seed" user.
+- **No "is_seed" flag on user or plan_node.** Categories and their
+  fundamentals live in the `category` table directly. There is no fake
+  "_seed" user; if a category is canonical enough to deserve
+  fundamentals, the row on `category` carries them, full stop.
 - **No derived vol/adj.** A category's volatility and adjustment are
   either explicit on `category` itself (both columns set together) or
   absent (both NULL). There is no weighted-average computation over
@@ -519,10 +528,10 @@ Why this design:
   prompt (CSV) collects them at plan-creation time when the columns
   are still NULL.
 - **No plan-weight lookup outside `plan_node`.** Per-plan weights live
-  exclusively on `plan_node.weight_micros`. The seed plan's reference
-  weights are an input to plan creation (read directly from
-  `config/seed_plan.yaml` by the walker) and are not persisted in any
-  table.
+  exclusively on `plan_node.weight_micros`. The interactive walker
+  surfaces *suggested* weights drawn from peer-user plans (via
+  `repositories.iter_peer_plans`) and from any catalog leaves with
+  pre-populated vol/adj — never from any file or table outside the DB.
 - **No short positions.** `position.market_value_native_decithou` is
   constrained non-negative. A household portfolio tool has no business
   modelling shorts, and the asymmetry would propagate into the

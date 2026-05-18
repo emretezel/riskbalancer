@@ -4,32 +4,10 @@ RiskBalancer ingests broker statements for one or more household members,
 maps holdings into a per-user nested category plan, converts values to GBP
 when needed, and compares actual holdings against risk-parity targets.
 
-## Project Layout
-
-```text
-.
-├── pyproject.toml                       # packaging, tooling, pytest config
-├── config/                              # committed
-│   ├── seed_plan.yaml                   # catalog floor (the first user's starting point)
-│   ├── riskbalancer.example.yaml        # template for the local default-user config
-│   ├── riskbalancer.yaml                # local-only override, gitignored (holds default_user)
-│   ├── mappings/<adapter>.yaml          # shared adapter mappings
-│   └── fx.example.yaml                  # FX template
-├── private/                             # gitignored
-│   ├── fx.yaml                          # shared GBP FX rates (one file across all users)
-│   └── users/<user>/
-│       ├── plan.yaml                    # this user's category plan (target weights)
-│       ├── portfolio.json               # this user's portfolio snapshot
-│       ├── mappings/                    # per-user override directory
-│       │   ├── manual.yaml              # always per-user
-│       │   └── <adapter>.yaml           # optional override of shared mappings
-│       ├── statements/<broker>/<account>/<YYYY>/<MM>/...
-│       └── reports/<YYYY-MM-DD>.csv
-├── src/riskbalancer/                    # CLI, adapters, models, portfolio logic
-└── tests/                               # pytest suite
-```
-
-`private/` is gitignored — never commit it. `config/` is committed.
+All working data — users, categories, instruments, mappings, plans, FX
+rates, statement imports and positions — lives in a single SQLite database
+at `private/riskbalancer.db`. Raw broker statements and generated reports
+are the only other things kept on disk.
 
 ## Installation
 
@@ -41,129 +19,37 @@ python -m pip install -e '.[dev]'
 riskbalancer --help
 ```
 
-## Picking the user
+`private/` is gitignored — never commit it.
 
-Every per-user command takes `--user <name>`. The flag falls back to:
-
-1. the `RISKBALANCER_USER` environment variable, then
-2. the `default_user` field in `config/riskbalancer.yaml`.
-
-The repository ships only `config/riskbalancer.example.yaml` (no personal
-defaults committed). To set a default user on your machine:
+## Setting up from zero
 
 ```bash
-cp config/riskbalancer.example.yaml config/riskbalancer.yaml
-# then edit the file and uncomment `default_user: your_name`
-```
+# 1. Create the database (idempotent).
+riskbalancer db init
 
-Or skip the file and `export RISKBALANCER_USER=your_name` in your shell
-rc. With no default set, every per-user command exits 1 with a clear
-message asking for `--user`; `fx update` and `user list` still work.
+# 2. Register a user. Pre-creates private/users/<name>/{statements,reports}/.
+riskbalancer user create --user emre
 
-## Setting up a new user
-
-Onboarding a new household member from zero to first report:
-
-```bash
-# 1. Register the user on disk.
-riskbalancer user create --user wife
-
-# 2. Bootstrap their plan. Either clone an existing one as a starting point
-#    or walk the catalog interactively.
-riskbalancer plan create --user wife --from emre
-# OR
-riskbalancer plan create --user wife
-
-# 3. Drop a broker statement anywhere on disk and import it. The CLI
-#    auto-files the statement under
-#    private/users/wife/statements/<adapter>/<account>/<YYYY>/<MM>/ using
-#    today's date and creates private/users/wife/portfolio.json on first
-#    run. The source file stays put unless you pass --move.
-riskbalancer portfolio import \
-  --user wife \
-  --adapter ajbell \
-  --account isa \
-  --statement ~/Downloads/wife-isa-snapshot.csv
-
-# 4. Optional: add manual holdings (cash, gold, alternatives).
-riskbalancer portfolio add \
-  --user wife \
-  --instrument-id GOLD \
-  --description "Physical Gold" \
-  --market-value 5000 \
-  --category "Alternative / Gold"
-
-# 5. Run the report (use bare --export to land at
-#    private/users/wife/reports/<today>.csv).
-riskbalancer portfolio report --user wife --export
-```
-
-The "Main Workflow" section below covers the same commands in steady-state
-form once the user already exists.
-
-## Main Workflow
-
-### 1. Bootstrap a plan for the user
-
-If you are setting up a new user, build their `plan.yaml` interactively from
-the catalog the system already knows about:
-
-```bash
-riskbalancer plan create --user wife
-```
-
-The walk goes one level at a time. At every level it asks which categories
-to include and what risk weight to give each, then recurses into the chosen
-subtree. Leaves prompt for `volatility` and `adjustment` with the catalog's
-suggestion as the default.
-
-To clone an existing user's plan as a starting point:
-
-```bash
-riskbalancer plan create --user kid1 --from emre
-```
-
-To check that a plan is well-formed:
-
-```bash
-riskbalancer plan validate --user wife
-```
-
-To review the plan's leaves (read-only):
-
-```bash
-riskbalancer plan list --user wife
-```
-
-To change leaf `adjustment` values without hand-editing YAML:
-
-```bash
-# Walk every leaf with weight > 0 and prompt for a new adjustment.
-# Press Enter to keep, type a number to replace, or `q` to stop early.
-riskbalancer plan adjust --user wife
-
-# Restrict the walk to a subtree.
-riskbalancer plan adjust --user wife --under "Bonds / Developed"
-
-# Set a single leaf without the walker (use `--yes` to skip the y/N confirm).
-riskbalancer plan adjust --user wife "Bonds / Developed > UK > Govt" 0.95
-```
-
-### 2. Refresh FX rates (shared across users)
-
-```bash
+# 3. Pull today's ECB FX rates into the fx_rate table.
 riskbalancer fx update --currency USD --currency EUR --currency CHF
+
+# 4. Add the categories you care about (one-off; tree is global across users).
+#    Categories carry their volatility/adjustment fundamentals.
+riskbalancer category add --name "Equities"
+riskbalancer category add --parent "Equities" --name "Developed"
+riskbalancer category add --parent "Equities / Developed" --name "NAM" \
+    --volatility 0.16 --adjustment 1.00
+
+# 5. Bootstrap the user's plan from the category tree.
+#    Walks the tree interactively, prompting for inclusion + risk weight.
+riskbalancer plan create --user emre
+#    Or clone an existing user's plan as a starting point:
+riskbalancer plan create --user emre --from spouse
 ```
 
-FX is not per-user — exchange rates are the same for everyone. This writes
-`private/fx.yaml`.
+## Main workflow
 
-### 3. Import each statement (auto-files into the user's directory)
-
-Point `--statement` at any path on disk — typically wherever your broker
-left it (`~/Downloads/...`). The CLI copies the statement under
-`private/users/<user>/statements/<adapter>/<account>/<YYYY>/<MM>/` using
-today's date as the year/month folder, creating directories as needed:
+### Import a statement
 
 ```bash
 riskbalancer portfolio import \
@@ -173,58 +59,60 @@ riskbalancer portfolio import \
   --statement ~/Downloads/2026-03-23-positions.csv
 ```
 
-Pass `--move` to remove the source after copying. If a file with the same
-name already exists at the destination, the new copy is suffixed
-(`foo.csv` → `foo-2.csv`) so prior statements are never overwritten. If
-your `--statement` is already inside the user's `statements/` tree, the
-file is left exactly where it is.
+The CLI copies the statement under
+`private/users/<user>/statements/<adapter>/<account>/<YYYY>/<MM>/` so it
+can be re-parsed later, then upserts positions into the DB keyed by
+`(account, as-of)`. After the parse, any uncategorised instrument
+triggers an interactive prompt offering to: type an existing leaf
+category, create a brand-new leaf inline, skip, or quit the loop. Use
+`--non-interactive` to skip the prompt for scripted imports.
 
-Mapping resolution is layered: the shared file at
-`config/mappings/<adapter>.yaml` is read first, then the per-user override
-at `private/users/<user>/mappings/<adapter>.yaml` replaces individual
-entries by instrument id. New mappings learned interactively are written
-only to the override file so the shared catalog stays curated.
+Re-importing the same `(adapter, account, as-of)` replaces the previous
+positions atomically. Different accounts at the same broker (e.g. SIPP
+vs Dealing) coexist as separate `account` rows.
 
-`portfolio import` re-imports replace by `(--adapter, --account)` so
-re-running for the same brokerage account updates that account's positions
-and leaves other accounts alone. Multiple accounts at the same broker
-(e.g. an AJ Bell SIPP and Dealing account) coexist because the keys differ.
+Supported adapters: `aegon`, `ajbell`, `citi`, `ibkr`, `ms401k`, `schwab`.
 
-Supported adapters: `ajbell`, `citi`, `ibkr`, `ms401k`, `schwab`.
-
-### 4. Add manual investments
+### Run the report
 
 ```bash
-riskbalancer portfolio add \
-  --user emre \
-  --instrument-id GOLD \
-  --description "Physical Gold" \
-  --market-value 15000 \
-  --category "Alternative / Gold"
-```
-
-Manual mappings live in `private/users/<user>/mappings/manual.yaml`.
-
-### 5. Run the report
-
-```bash
+# Console summary.
 riskbalancer portfolio report --user emre
-```
 
-To export the category summary as CSV:
-
-```bash
+# CSV export (defaults to private/users/emre/reports/<today>.csv).
 riskbalancer portfolio report --user emre --export
 ```
 
-The bare `--export` writes to
-`private/users/emre/reports/<YYYY-MM-DD>.csv`. Pass an explicit path to
-override.
+The report resolves each position's instrument → mapping → plan-leaf,
+converts native amounts to GBP via the most recent FX rate at or before
+the import's as-of date, and reports actual vs target weights side by
+side.
 
-## Supporting Commands
+## CRUD reference
+
+Every per-user command requires `--user <name>` — there is no
+default-user resolution.
 
 ```bash
-riskbalancer user create --user wife             # register a new user on disk
-riskbalancer user list                           # list every user under private/users/
-riskbalancer user delete --user wife --confirm   # wipe a user's directory
+# Users
+riskbalancer user list / create / delete
+
+# Categories (global tree, vol/adj live on the row)
+riskbalancer category list / add / update / delete
+
+# Instruments (global, keyed by (source, id_text))
+riskbalancer instrument list / add / update / delete
+
+# Mappings (global, leaf-only target categories)
+riskbalancer mapping list / add / update / delete
+
+# Plans (per-user)
+riskbalancer plan create / list / validate / adjust / delete
+riskbalancer plan export / import       # CSV round-trip
+
+# FX (shared across users)
+riskbalancer fx update                  # ECB feed → fx_rate table
 ```
+
+See `docs/architecture.md` for the component map and data-flow diagrams,
+and `docs/database-schema.md` for the full schema reference.
