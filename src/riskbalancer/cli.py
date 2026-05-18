@@ -1111,33 +1111,56 @@ def _collect_leaf_summary(
 
 
 def cmd_user_list(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
-    """`rb user list` — show every user in the DB with a plan summary."""
+    """`rb user list` — show every user in the DB with a plan summary.
+
+    Also reports any directories under `private/users/` that don't have a
+    matching DB row — informational only, the orphans are not removed
+    (the DB is authoritative; an orphan likely means a stale rename or
+    an abandoned create).
+    """
     paths = paths if paths is not None else _paths_from_args(args)
     db = _open_database(paths)
     try:
         names = repositories.list_user_names(db.connection)
-        if not names:
+        if names:
+            for name in names:
+                user_id = repositories.find_user_id(db.connection, name)
+                assert user_id is not None
+                leaf_count = db.connection.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM plan_node pn
+                    LEFT JOIN plan_node child ON child.parent_id = pn.id
+                    WHERE pn.user_id = ? AND child.id IS NULL
+                    """,
+                    (user_id,),
+                ).fetchone()["n"]
+                if leaf_count:
+                    print(f"{name:<25} plan_leaves={leaf_count}")
+                else:
+                    print(f"{name:<25} (no plan yet)")
+        else:
             print("No stored users.")
-            return 0
-        for name in names:
-            user_id = repositories.find_user_id(db.connection, name)
-            assert user_id is not None
-            leaf_count = db.connection.execute(
-                """
-                SELECT COUNT(*) AS n
-                FROM plan_node pn
-                LEFT JOIN plan_node child ON child.parent_id = pn.id
-                WHERE pn.user_id = ? AND child.id IS NULL
-                """,
-                (user_id,),
-            ).fetchone()["n"]
-            if leaf_count:
-                print(f"{name:<25} plan_leaves={leaf_count}")
-            else:
-                print(f"{name:<25} (no plan yet)")
-        return 0
     finally:
         db.close()
+
+    # Surface any on-disk users_root subdirectories that don't have a
+    # matching DB row. These are informational — the DB is the
+    # authoritative roster; orphans are likely renames or aborted
+    # creates and the user is the only one who knows what to do with
+    # them.
+    db_names = set(names)
+    orphans: list[str] = []
+    if paths.users_root.exists():
+        for entry in sorted(paths.users_root.iterdir()):
+            if entry.is_dir() and entry.name not in db_names:
+                orphans.append(entry.name)
+    if orphans:
+        print()
+        print("Orphan directories (filesystem only, no DB row):")
+        for name in orphans:
+            print(f"  {name}")
+    return 0
 
 
 def cmd_user_create(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
@@ -1155,7 +1178,13 @@ def cmd_user_create(args: argparse.Namespace, paths: Optional[UserPaths] = None)
         repositories.create_user(db.connection, paths.user)
     finally:
         db.close()
-    paths.user_dir.mkdir(parents=True, exist_ok=True)
+    # Pre-create both subdirectories the import / report commands write
+    # into so they exist from day one. Otherwise the first import has to
+    # mkdir its way through `statements/<adapter>/<account>/<YYYY>/<MM>/`
+    # — still safe, but less obvious to a user inspecting the layout
+    # before they've imported anything.
+    paths.statements_dir.mkdir(parents=True, exist_ok=True)
+    paths.reports_dir.mkdir(parents=True, exist_ok=True)
     print(f"Created user '{paths.user}' (DB row + {paths.user_dir}).")
     print(f"Next: riskbalancer plan create --user {paths.user} (or --from <peer>)")
     return 0
