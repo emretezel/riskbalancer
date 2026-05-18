@@ -757,9 +757,11 @@ def cmd_plan_create(args: argparse.Namespace, paths: Optional[UserPaths] = None)
         catalog = build_catalog_from_db(db.connection, current_user_id=user_id)
         if not catalog:
             print(
-                "No categories defined. Run `rb portfolio import` against a statement "
-                "(which auto-creates instruments and prompts for categories) or have "
-                "an existing user share their plan via `rb plan create --from <peer>`.",
+                "No categories defined. Build a category tree first via "
+                "`rb category add --parent <path> --name <leaf> --volatility V "
+                "--adjustment A` (one row per leaf), import a broker statement "
+                "with `rb portfolio import`, or clone a peer's plan with "
+                "`rb plan create --from <peer>`.",
                 file=sys.stderr,
             )
             return 1
@@ -907,6 +909,53 @@ def cmd_plan_adjust(args: argparse.Namespace, paths: Optional[UserPaths] = None)
             return 0
         repositories.write_plan_tree(db.connection, user_id, nodes)
         print(f"Wrote updated plan for user '{paths.user}' ({len(changes)} leaf changes).")
+        return 0
+    finally:
+        db.close()
+
+
+def cmd_plan_delete(args: argparse.Namespace, paths: Optional[UserPaths] = None) -> int:
+    """`rb plan delete` — drop every `plan_node` row for the user.
+
+    The user row itself stays. Less destructive than `rb user delete`; the
+    plan can be regenerated with `rb plan create`. Prompts for y/N
+    confirmation by default; `--yes` skips it for scripted use.
+    """
+    paths = paths if paths is not None else _paths_from_args(args)
+    skip_confirm = bool(getattr(args, "yes", False))
+    db = _open_database(paths)
+    try:
+        user_id = repositories.find_user_id(db.connection, paths.user)
+        if user_id is None or not repositories.plan_exists(db.connection, user_id):
+            print(
+                f"plan delete failed: user '{paths.user}' has no plan to delete.",
+                file=sys.stderr,
+            )
+            return 1
+
+        io: IO = StdIO()
+        if not skip_confirm:
+            try:
+                ok = _prompt_yes_no(
+                    io,
+                    f"Delete plan for user '{paths.user}'? [y/N]: ",
+                    default=False,
+                )
+            except PlanCreationAborted as exc:
+                print(f"plan delete aborted: {exc}", file=sys.stderr)
+                return 1
+            if not ok:
+                print("plan delete aborted: user declined.")
+                return 0
+
+        db.connection.execute("BEGIN")
+        try:
+            repositories.delete_plan(db.connection, user_id)
+            db.connection.execute("COMMIT")
+        except Exception:
+            db.connection.execute("ROLLBACK")
+            raise
+        print(f"Deleted plan for user '{paths.user}'.")
         return 0
     finally:
         db.close()
@@ -1969,6 +2018,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the y/N confirm for targeted single-leaf edits",
     )
     plan_adjust.set_defaults(func=cmd_plan_adjust)
+
+    plan_delete = plan_sub.add_parser(
+        "delete",
+        parents=[user_parent],
+        help="Delete every plan_node row for the user (the user row itself stays)",
+    )
+    plan_delete.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the y/N confirmation prompt.",
+    )
+    plan_delete.set_defaults(func=cmd_plan_delete)
 
     plan_export = plan_sub.add_parser(
         "export",
