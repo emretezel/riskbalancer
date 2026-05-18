@@ -1,6 +1,9 @@
 """
 Citibank Holdings CSV adapter for RiskBalancer.
 
+The export is USD-denominated; the adapter emits positions in their native
+USD and lets the report layer convert to GBP via the `fx_rate` table.
+
 Author: Emre Tezel
 """
 
@@ -8,26 +11,16 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Optional, Sequence, TextIO, Union
+from typing import Sequence, TextIO, Union
 
-from ..models import CategoryPath, Investment
+from ..models import Investment
 from .base import StatementAdapter
 
 
 class CitiCSVAdapter(StatementAdapter):
-    """Adapter for Citibank holdings exports (converts USD to GBP)."""
+    """Adapter for Citibank holdings exports."""
 
-    def __init__(
-        self,
-        *,
-        default_category: Optional[CategoryPath] = None,
-        default_volatility: float = 0.2,
-        fx_rates: Optional[dict[str, float]] = None,
-    ):
-        super().__init__("Citi CSV")
-        self.default_category = default_category or CategoryPath("Uncategorized", "Pending Review")
-        self.default_volatility = default_volatility
-        self.fx_rates = {k.upper(): v for k, v in (fx_rates or {}).items()}
+    source_name = "Citi CSV"
 
     def parse_path(self, path: Union[str, Path]) -> Sequence[Investment]:
         with open(path, "r", encoding="utf-8-sig") as handle:
@@ -57,26 +50,16 @@ class CitiCSVAdapter(StatementAdapter):
             market_value = self._parse_currency(record.get("Market Value", ""))
             if market_value == 0:
                 continue
-            gbp_value = self._convert_to_gbp("USD", market_value)
             investments.append(
                 Investment(
                     instrument_id=symbol or description,
                     description=description or symbol,
-                    market_value=gbp_value,
-                    category=self.default_category,
-                    volatility=self.default_volatility,
+                    market_value=market_value,
+                    currency="USD",
                     source="citi",
                 )
             )
         return investments
-
-    def _convert_to_gbp(self, currency: str, value: float) -> float:
-        if currency.upper() == "GBP":
-            return value
-        rate = self.fx_rates.get(currency.upper())
-        if rate is None:
-            raise ValueError(f"Missing FX rate for {currency}. Please update your FX YAML.")
-        return value * rate
 
     @staticmethod
     def _parse_currency(value: str | None) -> float:

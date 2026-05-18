@@ -1,6 +1,9 @@
 """
 AJ Bell statement adapter for RiskBalancer.
 
+AJ Bell exports are GBP-only. The adapter emits positions in their native
+currency (GBP) and lets the report layer handle any FX conversion later.
+
 Author: Emre Tezel
 """
 
@@ -10,22 +13,14 @@ import csv
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence, TextIO, Union
 
-from ..models import CategoryPath, Investment
+from ..models import Investment
 from .base import StatementAdapter
 
 
 class AJBellCSVAdapter(StatementAdapter):
     """Adapter that parses AJ Bell CSV statements."""
 
-    def __init__(
-        self,
-        *,
-        default_category: Optional[CategoryPath] = None,
-        default_volatility: float = 0.2,
-    ):
-        super().__init__("AJ Bell CSV")
-        self.default_category = default_category or CategoryPath("Uncategorized", "Pending Review")
-        self.default_volatility = default_volatility
+    source_name = "AJ Bell CSV"
 
     def parse_path(self, path: Union[str, Path]) -> Sequence[Investment]:
         with open(path, "r", encoding="utf-8-sig") as handle:
@@ -63,8 +58,7 @@ class AJBellCSVAdapter(StatementAdapter):
             instrument_id=ticker or name,
             description=name,
             market_value=market_value,
-            category=self.default_category,
-            volatility=self.default_volatility,
+            currency="GBP",
             source="aj_bell",
         )
 

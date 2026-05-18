@@ -10,7 +10,7 @@ import csv
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence, TextIO, Union
 
-from ..models import CategoryPath, Investment
+from ..models import Investment
 from .base import StatementAdapter
 
 
@@ -22,15 +22,7 @@ class AegonCSVAdapter(StatementAdapter):
     sits between sections; it is skipped here because it carries no holding.
     """
 
-    def __init__(
-        self,
-        *,
-        default_category: Optional[CategoryPath] = None,
-        default_volatility: float = 0.2,
-    ):
-        super().__init__("Aegon CSV")
-        self.default_category = default_category or CategoryPath("Uncategorized", "Pending Review")
-        self.default_volatility = default_volatility
+    source_name = "Aegon CSV"
 
     def parse_path(self, path: Union[str, Path]) -> Sequence[Investment]:
         # ``utf-8-sig`` matches the other CSV adapters and tolerates a BOM
@@ -76,8 +68,7 @@ class AegonCSVAdapter(StatementAdapter):
             instrument_id=name,
             description=name,
             market_value=market_value,
-            category=self.default_category,
-            volatility=self.default_volatility,
+            currency="GBP",
             source="aegon",
         )
 

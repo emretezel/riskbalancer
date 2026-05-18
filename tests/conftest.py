@@ -5,14 +5,14 @@ Two responsibilities:
 
 1. Put the project's `src/` on `sys.path` so the tests can `import riskbalancer`
    without having to install the package first.
-2. Provide a handful of helpers that every CLI test depends on:
+2. Provide helpers that every CLI test depends on:
    - `sandboxed_paths` — a `UserPaths` whose every on-disk and database
      location lands inside `tmp_path`. Tests that exercise commands which
      touch the database MUST use this so they never write to the real
      `private/riskbalancer.db`.
-   - `seed_test_database` — seed the committed YAML catalog into a
-     sandboxed database. Most plan/portfolio tests need the categories
-     present before they can write a plan.
+   - `populate_test_catalog` — build a minimal in-memory category tree
+     directly via `repositories` so tests have a base catalog to plan
+     against without needing any YAML seed files.
    - `write_plan_yaml_to_db` — convert a YAML plan blob into rows in the
      database. The historical test corpus describes plans as YAML strings;
      this helper bridges that to the DB-backed world.
@@ -35,12 +35,12 @@ if str(SRC) not in sys.path:
 from riskbalancer.configuration import load_category_nodes_from_yaml  # noqa: E402
 from riskbalancer.db import Database  # noqa: E402
 from riskbalancer.paths import UserPaths  # noqa: E402
-from riskbalancer.repositories import find_or_create_user, write_plan_tree  # noqa: E402
-from riskbalancer.seed import seed_from_yaml  # noqa: E402
-
-# Real seed sources used by tests that need a populated catalog.
-_SEED_PLAN_PATH = ROOT / "config" / "seed_plan.yaml"
-_SHARED_MAPPINGS_DIR = ROOT / "config" / "mappings"
+from riskbalancer.repositories import (  # noqa: E402
+    find_or_create_category,
+    find_or_create_user,
+    upsert_category_attribute,
+    write_plan_tree,
+)
 
 
 def sandboxed_paths(tmp_path: Path, user: str = "emre") -> UserPaths:
@@ -48,41 +48,82 @@ def sandboxed_paths(tmp_path: Path, user: str = "emre") -> UserPaths:
 
     Use this in every CLI test that exercises commands that touch the
     database. Without it, the test would write to the real
-    `private/riskbalancer.db` and pollute developer state. The legacy
-    per-user fields (`plan`, `portfolio`, `manual_mappings`) are kept so
-    existing assertions about file paths still resolve to a path object
-    even when no file is actually written there.
+    `private/riskbalancer.db` and pollute developer state.
     """
     users_root = tmp_path / "private" / "users"
     user_dir = users_root / user
     return replace(
         UserPaths.for_user(user),
+        root=tmp_path,
         users_root=users_root,
         user_dir=user_dir,
-        plan=user_dir / "plan.yaml",
-        portfolio=user_dir / "portfolio.json",
         statements_dir=user_dir / "statements",
         reports_dir=user_dir / "reports",
-        overrides_dir=user_dir / "mappings",
-        manual_mappings=user_dir / "mappings" / "manual.yaml",
         db_path=tmp_path / "riskbalancer.db",
     )
 
 
-def seed_test_database(paths: UserPaths) -> None:
-    """Open the sandboxed database and seed it from the committed YAML catalog.
+# Minimal test catalog. Most tests only need a couple of leaves to plan
+# against; the few that need more should hand-build via the same
+# repository helpers.
+_TEST_CATALOG = [
+    # (parent_path, name, volatility, adjustment)
+    # Equities
+    (("Equities",), "Developed", 0.18, 1.0),
+    (("Equities",), "EM", 0.22, 1.0),
+    (("Equities", "Developed"), "NAM", 0.17, 1.0),
+    (("Equities", "Developed"), "Europe", 0.18, 1.0),
+    (("Equities", "EM"), "Asia", 0.22, 1.0),
+    # Bonds
+    (("Bonds",), "Developed", 0.05, 1.0),
+    (("Bonds",), "Inflation", 0.08, 1.35),
+    (("Bonds", "Developed"), "NAM", 0.05, 1.0),
+    (("Bonds", "Developed"), "UK", 0.05, 1.0),
+    # Cash
+    (("Cash",), "GBP", 0.01, 0.0),
+]
 
-    Called by tests that need to reference seed-defined categories (e.g.
-    `Equities`, `Bonds / Developed / NAM / Govt`). The DB file is created
-    if missing. Idempotent — re-running it does not multiply rows.
+
+def populate_test_catalog(paths: UserPaths) -> None:
+    """Seed a minimal category tree into the sandboxed DB.
+
+    Idempotent — re-running it just re-finds the existing rows. Most tests
+    that need "a category exists" should call this from a fixture rather
+    than constructing rows by hand.
     """
     db = Database.connect(paths.db_path)
     try:
-        seed_from_yaml(
-            db.connection,
-            seed_plan_path=_SEED_PLAN_PATH,
-            mappings_dir=_SHARED_MAPPINGS_DIR,
-        )
+        # Resolve parent ids by walking the prefix tuples.
+        parent_cache: dict[tuple[str, ...], int] = {}
+        for parent_path, name, vol, adj in _TEST_CATALOG:
+            # Resolve every ancestor first so child inserts have a parent_id.
+            current_parent_id = None
+            running: list[str] = []
+            for segment in parent_path:
+                running.append(segment)
+                key = tuple(running)
+                if key in parent_cache:
+                    current_parent_id = parent_cache[key]
+                else:
+                    current_parent_id = find_or_create_category(
+                        db.connection,
+                        parent_id=current_parent_id,
+                        name=segment,
+                    )
+                    parent_cache[key] = current_parent_id
+            leaf_id = find_or_create_category(
+                db.connection,
+                parent_id=current_parent_id,
+                name=name,
+            )
+            upsert_category_attribute(
+                db.connection,
+                category_id=leaf_id,
+                volatility=vol,
+                adjustment=adj,
+            )
+            parent_cache[tuple(list(parent_path) + [name])] = leaf_id
+        db.connection.commit()
     finally:
         db.close()
 
@@ -92,11 +133,9 @@ def write_plan_yaml_to_db(paths: UserPaths, yaml_text: str) -> None:
 
     Historical tests describe plans inline as YAML strings (the legacy
     on-disk format). This bridge keeps those fixtures usable without
-    rewriting every test to construct `CategoryNode` trees by hand.
-    Auto-seeds the DB if the catalog is empty so the test's plan can
-    reference seed-defined categories.
+    rewriting every test to construct `CategoryNode` trees by hand. The
+    referenced categories are auto-created in the DB on the fly.
     """
-    # Persist the YAML to a temporary file so we can hand it to the loader.
     paths.user_dir.mkdir(parents=True, exist_ok=True)
     temp_plan = paths.user_dir / "_plan_fixture.yaml"
     temp_plan.write_text(yaml_text, encoding="utf-8")
@@ -107,18 +146,6 @@ def write_plan_yaml_to_db(paths: UserPaths, yaml_text: str) -> None:
 
     db = Database.connect(paths.db_path)
     try:
-        # Auto-seed on first touch so the categories referenced by the plan
-        # have a tree to attach to. Subsequent calls are no-ops.
-        from riskbalancer.repositories import find_or_create_user as _foc_user
-
-        _foc_user  # noqa: B018 — silence unused-import without exposing internals
-        empty = db.connection.execute("SELECT COUNT(*) AS n FROM category").fetchone()["n"]
-        if empty == 0:
-            seed_from_yaml(
-                db.connection,
-                seed_plan_path=_SEED_PLAN_PATH,
-                mappings_dir=_SHARED_MAPPINGS_DIR,
-            )
         user_id = find_or_create_user(db.connection, paths.user)
         write_plan_tree(db.connection, user_id, nodes)
     finally:

@@ -179,11 +179,12 @@ def test_plan_list_missing_plan_errors(tmp_path, capsys):
 
 
 def test_plan_list_missing_user_errors(tmp_path, capsys):
+    """With no user resolved, the plan lookup falls through to a plan-missing error."""
     paths = _paths_for(tmp_path, user="")
     rc = cmd_plan_list(_list_args(user=""), paths=paths)
     assert rc == 1
     err = capsys.readouterr().err
-    assert "No user resolved" in err
+    assert "No plan found" in err
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +394,9 @@ def test_adjust_missing_plan_errors_with_helpful_message(tmp_path, capsys):
 
 
 def test_adjust_missing_user_errors(tmp_path, capsys):
+    """With no user resolved, the lookup falls through to a plan-missing error."""
     paths = _paths_for(tmp_path, user="")
     rc = cmd_plan_adjust(_args(user=""), paths=paths)
     assert rc == 1
     err = capsys.readouterr().err
-    assert "No user resolved" in err
+    assert "No plan found" in err

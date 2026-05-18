@@ -1,6 +1,12 @@
+"""
+Adapter parsing tests.
+
+Adapters now return native amounts and currencies — FX conversion to GBP
+happens at report time using the `fx_rate` table, not in the adapter.
+"""
+
 from pathlib import Path
 
-from riskbalancer import CategoryPath
 from riskbalancer.adapters import (
     AegonCSVAdapter,
     AJBellCSVAdapter,
@@ -10,79 +16,71 @@ from riskbalancer.adapters import (
     SchwabCSVAdapter,
 )
 
-FIXTURE = Path(__file__).parent / "fixtures" / "aj_bell_sample.csv"
-IBKR_FIXTURE = Path(__file__).parent / "fixtures" / "ibkr_sample.csv"
-MS401K_FIXTURE = Path(__file__).parent / "fixtures" / "ms401k_sample.csv"
-SCHWAB_FIXTURE = Path(__file__).parent / "fixtures" / "schwab_sample.csv"
-CITI_FIXTURE = Path(__file__).parent / "fixtures" / "citi_sample.csv"
-AEGON_FIXTURE = Path(__file__).parent / "fixtures" / "aegon_sample.csv"
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_aj_bell_adapter_parses_sample_rows():
-    adapter = AJBellCSVAdapter(default_volatility=0.15)
+    adapter = AJBellCSVAdapter()
 
-    investments = adapter.parse_path(FIXTURE)
+    investments = adapter.parse_path(FIXTURES / "aj_bell_sample.csv")
     assert len(investments) == 3
 
     amd = next(inv for inv in investments if inv.instrument_id == "AMD")
     assert amd.market_value == 17717.24
-    assert amd.category.levels()[0] == "Uncategorized"
-    assert amd.volatility == 0.15
+    assert amd.currency == "GBP"
+    assert amd.source == "aj_bell"
 
 
-def test_ibkr_adapter_converts_using_fx(tmp_path):
-    adapter = IBKRCSVAdapter(
-        default_category=CategoryPath("Other", "Other"),
-        fx_rates={"USD": 0.8},
-    )
-    investments = adapter.parse_path(IBKR_FIXTURE)
+def test_ibkr_adapter_emits_native_currency():
+    """IBKR rows carry their native currency through; no in-adapter FX."""
+    adapter = IBKRCSVAdapter()
+    investments = adapter.parse_path(FIXTURES / "ibkr_sample.csv")
     assert len(investments) == 2
-    values = {inv.instrument_id: inv.market_value for inv in investments}
-    assert values["EMIM"] == 3500.0  # GBP row unchanged
-    assert values["PLTR"] == 10500 * 0.8  # USD converted via FX
+    by_id = {inv.instrument_id: inv for inv in investments}
+    # GBP row stays GBP at the row's native amount.
+    assert by_id["EMIM"].currency == "GBP"
+    assert by_id["EMIM"].market_value == 3500.0
+    # USD row is still USD — the report layer converts.
+    assert by_id["PLTR"].currency == "USD"
+    assert by_id["PLTR"].market_value == 10500.0
 
 
-def test_ms401k_adapter_requires_fx_and_converts():
-    adapter = MS401KCSVAdapter(
-        default_category=CategoryPath("Other", "Other"),
-        fx_rates={"USD": 0.75},
-    )
-    investments = adapter.parse_path(MS401K_FIXTURE)
+def test_ms401k_adapter_emits_usd():
+    adapter = MS401KCSVAdapter()
+    investments = adapter.parse_path(FIXTURES / "ms401k_sample.csv")
     assert len(investments) == 1
     investment = investments[0]
     assert investment.instrument_id == "Bond_Fund"
-    assert investment.market_value == 1100.0 * 0.75
+    assert investment.market_value == 1100.0
+    assert investment.currency == "USD"
 
 
-def test_schwab_adapter_converts_usd_rows():
-    adapter = SchwabCSVAdapter(
-        default_category=CategoryPath("Other", "Other"),
-        fx_rates={"USD": 0.8},
-    )
-    investments = adapter.parse_path(SCHWAB_FIXTURE)
+def test_schwab_adapter_emits_usd():
+    adapter = SchwabCSVAdapter()
+    investments = adapter.parse_path(FIXTURES / "schwab_sample.csv")
     assert len(investments) == 2
     values = {inv.instrument_id: inv.market_value for inv in investments}
-    assert values["AAPL"] == 2000 * 0.8
-    assert values["Cash & Cash Investments"] == 500 * 0.8
+    currencies = {inv.instrument_id: inv.currency for inv in investments}
+    assert values["AAPL"] == 2000
+    assert values["Cash & Cash Investments"] == 500
+    assert currencies["AAPL"] == "USD"
 
 
 def test_citi_adapter_parses_after_header():
-    adapter = CitiCSVAdapter(
-        default_category=CategoryPath("Other", "Other"),
-        fx_rates={"USD": 0.8},
-    )
-    investments = adapter.parse_path(CITI_FIXTURE)
+    adapter = CitiCSVAdapter()
+    investments = adapter.parse_path(FIXTURES / "citi_sample.csv")
     assert len(investments) == 2
     values = {inv.instrument_id: inv.market_value for inv in investments}
-    assert values["BDP"] == 1538.62 * 0.8
-    assert values["C"] == 23871.40 * 0.8
+    currencies = {inv.instrument_id: inv.currency for inv in investments}
+    assert values["BDP"] == 1538.62
+    assert values["C"] == 23871.40
+    assert currencies["BDP"] == "USD"
 
 
 def test_aegon_adapter_parses_and_skips_total():
-    adapter = AegonCSVAdapter(default_volatility=0.18)
+    adapter = AegonCSVAdapter()
 
-    investments = adapter.parse_path(AEGON_FIXTURE)
-    # Four real holdings; the inline ``TOTAL`` summary row must be dropped.
+    investments = adapter.parse_path(FIXTURES / "aegon_sample.csv")
     assert len(investments) == 4
 
     ids = {inv.instrument_id for inv in investments}
@@ -91,15 +89,12 @@ def test_aegon_adapter_parses_and_skips_total():
     world = next(
         inv for inv in investments if inv.instrument_id == "AGN BLK World (ex UK) Eq Idx (BLK)"
     )
-    # Fund name with spaces and parentheses must round-trip verbatim.
     assert world.description == "AGN BLK World (ex UK) Eq Idx (BLK)"
     assert world.market_value == 20000.00
     assert world.source == "aegon"
-    assert world.volatility == 0.18
-    assert world.category.levels()[0] == "Uncategorized"
+    assert world.currency == "GBP"
 
     brsp = next(
         inv for inv in investments if inv.instrument_id == "BRSP Default Strategy 2046-2048"
     )
-    # Confirms the row after the TOTAL marker is still parsed.
     assert brsp.market_value == 10000.00

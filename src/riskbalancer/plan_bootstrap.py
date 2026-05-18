@@ -1,38 +1,31 @@
 """
-Plan bootstrap: build a new user's `plan.yaml` from the catalog of categories
-the system already knows about.
+Plan bootstrap: build a new user's category plan by walking the global
+category tree stored in the DB.
 
-The catalog is derived at runtime by unioning every visible peer-user plan,
-the committed `config/seed_plan.yaml`, and the leaf paths referenced by every
-file in `config/mappings/`. The interactive walker then lets the user pick,
-at every level of the tree, which categories to keep and how to weight them.
+The catalog the walker offers is unioned from three DB sources, in priority
+order: peer-user plans, categories with explicit fundamentals on the
+`category` table, and category paths referenced by any mapping. The
+interactive walker then lets the user pick, at every level of the tree,
+which categories to keep and how to weight them.
 
 Author: Emre Tezel
 """
 
 from __future__ import annotations
 
-import os
 import re
-import shutil
 import sqlite3
 import sys
-import tempfile
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Iterable, List, Optional, Protocol, Sequence
-
-import yaml
+from typing import List, Optional, Protocol, Sequence
 
 from . import repositories
 from .configuration import (
     CategoryNode,
     collect_category_weight_validation_failures,
     format_category_weight_validation_failures,
-    load_category_nodes_from_yaml,
 )
-from .paths import UserPaths
-from .seed import MICROS_SCALE
+from .repositories import MICROS_SCALE
 
 DEFAULT_ADJUSTMENT = 1.0
 
@@ -79,30 +72,6 @@ class CatalogNode:
 # ---------------------------------------------------------------------------
 # Catalog construction
 # ---------------------------------------------------------------------------
-
-
-def build_catalog(paths: UserPaths) -> list[CatalogNode]:
-    """Build the merged catalog of categories the system already knows.
-
-    Priority order (highest first): peer-user plans, the committed
-    `config/seed_plan.yaml`, and finally mapping-leaf paths that no plan has
-    yet included. When a node appears in multiple sources, the
-    highest-priority source wins for `suggested_volatility` and
-    `suggested_adjustment`; child sets are unioned in first-seen order so the
-    user is offered every option that has ever been described.
-
-    Deprecated YAML-backed variant kept around during the database
-    migration so legacy tests still pass. New code should call
-    `build_catalog_from_db` directly.
-    """
-    catalog: list[CatalogNode] = []
-    for source_nodes in _peer_plan_sources(paths):
-        _merge_nodes_into_catalog(source_nodes, catalog)
-    if paths.seed_plan.exists():
-        _merge_nodes_into_catalog(load_category_nodes_from_yaml(paths.seed_plan), catalog)
-    for leaf_path in _collect_mapping_leaves(paths):
-        _ensure_leaf_in_catalog(catalog, leaf_path)
-    return catalog
 
 
 def build_catalog_from_db(
@@ -190,20 +159,6 @@ def _merge_seed_leaves_into_catalog(
             cursor = existing.children
 
 
-def _peer_plan_sources(paths: UserPaths) -> Iterable[list[CategoryNode]]:
-    """Yield CategoryNode lists for every visible peer-user plan."""
-    if not paths.users_root.exists():
-        return
-    for user_dir in sorted(paths.users_root.iterdir()):
-        if not user_dir.is_dir():
-            continue
-        if user_dir.name == paths.user:
-            continue  # the user being created has no plan yet
-        peer_plan = user_dir / "plan.yaml"
-        if peer_plan.exists():
-            yield load_category_nodes_from_yaml(peer_plan)
-
-
 def _merge_nodes_into_catalog(source: Sequence[CategoryNode], catalog: list[CatalogNode]) -> None:
     for node in source:
         existing = _find_by_name(catalog, node.name)
@@ -236,44 +191,6 @@ def _find_by_name(catalog: Sequence[CatalogNode], name: str) -> Optional[Catalog
         if node.name == name:
             return node
     return None
-
-
-def _collect_mapping_leaves(paths: UserPaths) -> list[tuple[str, ...]]:
-    """Return every category path referenced by any adapter mapping file.
-
-    Pulls from the shared `config/mappings/` directory and the user's own
-    overrides directory. Paths are returned as tuples of components in
-    deterministic insertion order.
-    """
-    leaves: list[tuple[str, ...]] = []
-    seen: set[tuple[str, ...]] = set()
-    candidate_dirs = [paths.shared_mappings_dir, paths.overrides_dir]
-    for directory in candidate_dirs:
-        if not directory.exists():
-            continue
-        for mapping_file in sorted(directory.glob("*.yaml")):
-            data = yaml.safe_load(mapping_file.read_text(encoding="utf-8")) or {}
-            if not isinstance(data, dict):
-                continue
-            for payload in data.values():
-                if not isinstance(payload, dict):
-                    continue
-                allocations = payload.get("allocations") or []
-                if not allocations and payload.get("category"):
-                    allocations = [payload["category"]]
-                for entry in allocations:
-                    if isinstance(entry, str):
-                        label = entry
-                    elif isinstance(entry, dict):
-                        label = entry.get("category", "")
-                    else:
-                        continue
-                    parts = tuple(p.strip() for p in label.split("/") if p.strip())
-                    if not parts or parts in seen:
-                        continue
-                    seen.add(parts)
-                    leaves.append(parts)
-    return leaves
 
 
 def _ensure_leaf_in_catalog(catalog: list[CatalogNode], path: tuple[str, ...]) -> None:
@@ -844,41 +761,8 @@ def _parse_weight_input(raw: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Persistence
+# Rendering
 # ---------------------------------------------------------------------------
-
-
-def write_plan_yaml(path: Path, nodes: Sequence[CategoryNode]) -> None:
-    """Serialise a plan tree to YAML in the canonical `assets:` shape.
-
-    Writes via a sibling temp file plus `os.replace` so an interrupted write
-    cannot leave the user's plan half-written. A failed serialisation or
-    rename leaves the original file untouched and unlinks the temp file.
-    """
-    payload = {"assets": [_node_to_dict(node) for node in nodes]}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    serialised = yaml.safe_dump(payload, sort_keys=False)
-    fd, tmp_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f"{path.name}.",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(serialised)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_name, path)
-    except BaseException:
-        # On any failure (serialisation, fsync, rename), make sure we don't
-        # leave a stray `.tmp` sibling behind. The original file — if any —
-        # is still intact because `os.replace` is the only step that touches
-        # it, and it either succeeds atomically or doesn't run at all.
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-        raise
 
 
 def _render_plan_tree(nodes: Sequence[CategoryNode]) -> str:
@@ -907,86 +791,9 @@ def _append_tree_lines(nodes: Sequence[CategoryNode], *, indent: int, out: list[
             out.append(f"{name_field:<40} {weight_pct:>5}   {details}")
 
 
-def confirm_and_write_plan(
-    plan_path: Path,
-    nodes: Sequence[CategoryNode],
-    io: IO,
-) -> None:
-    """Show a tree summary and write `nodes` to `plan_path` only on confirm.
-
-    Raises `PlanCreationAborted` if the user declines the save prompt, types
-    `quit` / `exit`, presses Ctrl+C, or sends EOF — same abort path as any
-    other prompt in the walker. Nothing is written to disk on the abort
-    path.
-    """
-    io.info("\n—— Plan summary ——")
-    io.info(_render_plan_tree(nodes))
-    if not _prompt_yes_no(io, f"\nSave this plan to {plan_path}? [y/N]: ", default=False):
-        raise PlanCreationAborted("user declined to save plan")
-    write_plan_yaml(plan_path, nodes)
-
-
-def _node_to_dict(node: CategoryNode) -> dict:
-    payload: dict = {"name": node.name, "weight": node.weight}
-    if node.volatility is not None:
-        payload["volatility"] = node.volatility
-    if node.adjustment != DEFAULT_ADJUSTMENT:
-        payload["adjustment"] = node.adjustment
-    if node.children:
-        payload["children"] = [_node_to_dict(child) for child in node.children]
-    return payload
-
-
-def clone_plan(source: UserPaths, target: UserPaths) -> None:
-    """Copy `source.plan` to `target.plan` and validate the result.
-
-    Raises FileNotFoundError if the source plan does not exist; raises
-    ValueError if the cloned plan fails weight validation (which would only
-    happen if the source plan was already invalid).
-    """
-    if not source.plan.exists():
-        raise FileNotFoundError(f"Source plan {source.plan} does not exist")
-    target.plan.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(source.plan, target.plan)
-    nodes = load_category_nodes_from_yaml(target.plan)
-    failures = collect_category_weight_validation_failures(nodes)
-    if failures:
-        raise ValueError(format_category_weight_validation_failures(failures))
-
-
 # ---------------------------------------------------------------------------
 # Catalog helpers used by the CLI
 # ---------------------------------------------------------------------------
-
-
-def describe_catalog_sources(paths: UserPaths) -> str:
-    """Render a one-line summary of which sources fed the catalog."""
-    parts: List[str] = []
-    if paths.users_root.exists():
-        peers = [
-            user_dir.name
-            for user_dir in sorted(paths.users_root.iterdir())
-            if (
-                user_dir.is_dir()
-                and user_dir.name != paths.user
-                and (user_dir / "plan.yaml").exists()
-            )
-        ]
-        if peers:
-            parts.append(f"{len(peers)} peer plan(s): {', '.join(peers)}")
-    if paths.seed_plan.exists():
-        parts.append("config/seed_plan.yaml")
-    mapping_count = sum(
-        1
-        for directory in (paths.shared_mappings_dir, paths.overrides_dir)
-        if directory.exists()
-        for _ in directory.glob("*.yaml")
-    )
-    if mapping_count:
-        parts.append(f"{mapping_count} adapter mapping file(s)")
-    if not parts:
-        return "Catalog: empty"
-    return "Catalog: " + ", ".join(parts)
 
 
 def count_unique_categories(catalog: Sequence[CatalogNode]) -> int:

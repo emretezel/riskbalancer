@@ -14,12 +14,14 @@ from ..models import Investment
 
 
 class StatementAdapter(ABC):
-    """Base class for broker statement ingestion."""
+    """Base class for broker statement ingestion.
 
-    source_name: str
+    Subclasses set `source_name` as a class attribute (or in their own
+    `__init__`) and implement `parse_file` to produce a sequence of
+    `Investment` rows in the position's native currency.
+    """
 
-    def __init__(self, source_name: str):
-        self.source_name = source_name
+    source_name: str = "unknown"
 
     def parse_path(self, path: Union[str, Path]) -> Sequence[Investment]:
         with open(path, "r", encoding="utf-8") as handle:

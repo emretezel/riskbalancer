@@ -165,11 +165,12 @@ def test_export_missing_plan_errors(tmp_path, capsys):
 
 
 def test_export_missing_user_errors(tmp_path, capsys):
+    """With no user resolved, export falls through to a plan-missing error."""
     paths = _paths_for(tmp_path, user="")
     rc = cmd_plan_export(_export_args(user=""), paths=paths)
     assert rc == 1
     err = capsys.readouterr().err
-    assert "No user resolved" in err
+    assert "No plan found" in err
 
 
 # ---------------------------------------------------------------------------
@@ -376,11 +377,12 @@ def test_import_missing_file_errors(tmp_path, capsys):
 
 
 def test_import_missing_user_errors(tmp_path, capsys):
+    """With no user resolved, plan-import surfaces the file-not-found error first."""
     paths = _paths_for(tmp_path, user="")
     rc = cmd_plan_import(_import_args(tmp_path / "any.csv", user=""), paths=paths)
     assert rc == 1
     err = capsys.readouterr().err
-    assert "No user resolved" in err
+    assert "not found" in err
 
 
 # ---------------------------------------------------------------------------

@@ -21,14 +21,42 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import UTC, datetime
-from typing import Iterator, Optional, Sequence
+from typing import Iterable, Iterator, Optional, Sequence
 
 from .configuration import CategoryNode
-from .seed import MICROS_SCALE, fraction_to_micros
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+# Integer scale used for every `*_micros` column in the schema (weights,
+# volatility, adjustment, FX rates). `0.55` ⇒ `550_000`; `1.0` ⇒ `1_000_000`.
+MICROS_SCALE = 1_000_000
+
+# Integer scale used for every `*_decithou` money column. £1.2345 ⇒ `12_345`.
+# Four decimal places of precision with no floating-point error.
+DECITHOU_SCALE = 10_000
+
+
+def fraction_to_micros(value: float) -> int:
+    """Round a real-valued fraction to integer parts-per-million.
+
+    Centralised helper for every place that writes a `*_micros` column. The
+    rounding (rather than truncation) means a clean `0.62 + 0.05 + 0.13 +
+    0.2` round-trips to exactly `1_000_000`.
+    """
+    return round(value * MICROS_SCALE)
+
+
+def amount_to_decithou(value: float) -> int:
+    """Round a real-valued monetary amount to integer ten-thousandths.
+
+    Used wherever the schema expects a `*_decithou` column (positions,
+    market values). Rounded so a typical float-precision input doesn't
+    truncate the final penny.
+    """
+    return round(value * DECITHOU_SCALE)
 
 
 def _utc_now_iso() -> str:
@@ -655,3 +683,357 @@ def get_fx_rate(
     if row is None:
         return None
     return float(row["gbp_rate_micros"]) / MICROS_SCALE
+
+
+def latest_fx_rate_on_or_before(
+    connection: sqlite3.Connection,
+    *,
+    as_of: str,
+    currency: str,
+) -> Optional[float]:
+    """Return the most recent GBP rate at or before `as_of`, or None.
+
+    Used by the report's GBP conversion: positions store native amounts,
+    and the report joins each non-GBP currency to the closest `fx_rate`
+    row at or before the statement's `as_of` date.
+    """
+    if currency.upper() == "GBP":
+        return 1.0
+    row = connection.execute(
+        """
+        SELECT gbp_rate_micros
+        FROM fx_rate
+        WHERE currency = ? AND rate_date <= ?
+        ORDER BY rate_date DESC
+        LIMIT 1
+        """,
+        (currency.upper(), as_of),
+    ).fetchone()
+    if row is None:
+        return None
+    return float(row["gbp_rate_micros"]) / MICROS_SCALE
+
+
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+
+
+def find_or_create_account(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+    source_id: int,
+    name: str,
+) -> int:
+    """Find or insert an `account` row for `(user_id, source_id, name)`.
+
+    The natural key matches the schema's `UNIQUE (user_id, source_id, name)`.
+    The same broker has separate rows for each user (Emre's IBKR taxable vs
+    Tani's IBKR taxable are different accounts).
+    """
+    clean = name.strip()
+    if not clean:
+        raise ValueError("account name must be non-empty")
+    row = connection.execute(
+        "SELECT id FROM account WHERE user_id = ? AND source_id = ? AND name = ?",
+        (user_id, source_id, clean),
+    ).fetchone()
+    if row is not None:
+        return int(row["id"])
+    cursor = connection.execute(
+        "INSERT INTO account (user_id, source_id, name) VALUES (?, ?, ?)",
+        (user_id, source_id, clean),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError(f"Failed to insert account {clean!r}")
+    return int(cursor.lastrowid)
+
+
+# ---------------------------------------------------------------------------
+# Statement imports
+# ---------------------------------------------------------------------------
+
+
+def replace_statement_import(
+    connection: sqlite3.Connection,
+    *,
+    account_id: int,
+    as_of: str,
+    statement_path: Optional[str],
+) -> int:
+    """Insert a fresh `statement_import` row for `(account_id, as_of)`.
+
+    If a prior row exists for the same `(account_id, as_of)` it is deleted
+    first (cascading through `position`), then a new row is inserted. This
+    matches the schema doc's §3.10 contract: re-imports replace the
+    previous import in a single transaction. Caller is responsible for
+    wrapping in a BEGIN/COMMIT for atomicity across the position upserts.
+    """
+    if statement_path is not None:
+        statement_path = statement_path.strip() or None
+    connection.execute(
+        "DELETE FROM statement_import WHERE account_id = ? AND as_of = ?",
+        (account_id, as_of),
+    )
+    cursor = connection.execute(
+        """
+        INSERT INTO statement_import
+          (account_id, as_of, statement_path, imported_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (account_id, as_of, statement_path, _utc_now_iso()),
+    )
+    if cursor.lastrowid is None:
+        raise RuntimeError(
+            f"Failed to insert statement_import (account_id={account_id}, as_of={as_of})"
+        )
+    return int(cursor.lastrowid)
+
+
+# ---------------------------------------------------------------------------
+# Positions
+# ---------------------------------------------------------------------------
+
+
+def insert_position(
+    connection: sqlite3.Connection,
+    *,
+    statement_import_id: int,
+    instrument_id: int,
+    description: Optional[str],
+    market_value_native: float,
+    currency: str,
+) -> None:
+    """Insert one `position` row.
+
+    Native amount, no GBP conversion. The schema's `UNIQUE
+    (statement_import_id, instrument_id)` means one row per instrument per
+    import — split allocations are computed at mapping-resolution time, not
+    duplicated here.
+    """
+    if description is not None:
+        description = description.strip() or None
+    decithou = amount_to_decithou(market_value_native)
+    if decithou < 0:
+        raise ValueError("market value must be non-negative (long-only model)")
+    connection.execute(
+        """
+        INSERT INTO position
+          (statement_import_id, instrument_id, description,
+           market_value_native_decithou, currency)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            statement_import_id,
+            instrument_id,
+            description,
+            decithou,
+            currency.upper(),
+        ),
+    )
+
+
+def iter_current_positions(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+) -> Iterator[dict]:
+    """Yield every position in the user's most-recent import per account.
+
+    Reads through the `current_position` view. Returns dicts with the
+    columns the report needs: instrument_id, instrument_id_text, adapter,
+    account_name, as_of, currency, market_value_native (as a Python float
+    in native units), description.
+    """
+    rows = connection.execute(
+        """
+        SELECT
+            cp.id AS position_id,
+            cp.instrument_id AS instrument_id,
+            cp.description AS description,
+            cp.market_value_native_decithou AS decithou,
+            cp.currency AS currency,
+            cp.as_of AS as_of,
+            cp.account_id AS account_id,
+            a.name AS account_name,
+            s.adapter AS adapter,
+            i.instrument_id_text AS instrument_id_text,
+            i.description AS instrument_description
+        FROM current_position cp
+        JOIN account a ON a.id = cp.account_id
+        JOIN source s ON s.id = a.source_id
+        JOIN instrument i ON i.id = cp.instrument_id
+        WHERE cp.user_id = ?
+        ORDER BY s.adapter, a.name, i.instrument_id_text
+        """,
+        (user_id,),
+    ).fetchall()
+    for row in rows:
+        yield {
+            "position_id": int(row["position_id"]),
+            "instrument_id": int(row["instrument_id"]),
+            "instrument_id_text": str(row["instrument_id_text"]),
+            "instrument_description": (
+                str(row["instrument_description"])
+                if row["instrument_description"] is not None
+                else None
+            ),
+            "description": (str(row["description"]) if row["description"] is not None else None),
+            "currency": str(row["currency"]),
+            "market_value_native": float(row["decithou"]) / DECITHOU_SCALE,
+            "as_of": str(row["as_of"]),
+            "account_id": int(row["account_id"]),
+            "account_name": str(row["account_name"]),
+            "adapter": str(row["adapter"]),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Mappings (richer accessors used by CRUD commands and import)
+# ---------------------------------------------------------------------------
+
+
+def get_mappings_for_instrument(
+    connection: sqlite3.Connection,
+    instrument_id: int,
+) -> list[tuple[int, int]]:
+    """Return `[(category_id, weight_micros), …]` for the instrument.
+
+    Empty list means the instrument has no mapping at all — the caller is
+    expected to surface this as an "uncategorised" condition rather than
+    silently dropping the position.
+    """
+    rows = connection.execute(
+        """
+        SELECT category_id, weight_micros
+        FROM mapping
+        WHERE instrument_id = ?
+        ORDER BY id
+        """,
+        (instrument_id,),
+    ).fetchall()
+    return [(int(r["category_id"]), int(r["weight_micros"])) for r in rows]
+
+
+def list_unmapped_instrument_ids(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+) -> list[int]:
+    """Return instrument ids that the user holds but have no mapping.
+
+    "Holds" means the instrument appears in at least one current position
+    for the user. Useful for the post-import prompt that asks the user to
+    categorise newly-encountered instruments.
+    """
+    rows = connection.execute(
+        """
+        SELECT DISTINCT cp.instrument_id AS id
+        FROM current_position cp
+        WHERE cp.user_id = ?
+          AND NOT EXISTS (
+              SELECT 1 FROM mapping m WHERE m.instrument_id = cp.instrument_id
+          )
+        ORDER BY id
+        """,
+        (user_id,),
+    ).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
+def delete_mappings_for_instrument(
+    connection: sqlite3.Connection,
+    instrument_id: int,
+) -> int:
+    """Remove every mapping row for this instrument; return rows deleted.
+
+    Used when the caller wants to replace an instrument's full mapping
+    set with a fresh one (the per-instrument weights must sum to 1.0, so a
+    partial replacement is rarely what the user wants).
+    """
+    cursor = connection.execute(
+        "DELETE FROM mapping WHERE instrument_id = ?",
+        (instrument_id,),
+    )
+    return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Bulk lookups used by the report
+# ---------------------------------------------------------------------------
+
+
+def get_instrument_by_id(
+    connection: sqlite3.Connection,
+    instrument_id: int,
+) -> Optional[tuple[int, str, Optional[str]]]:
+    """Return `(source_id, instrument_id_text, description)` for the row, or None."""
+    row = connection.execute(
+        "SELECT source_id, instrument_id_text, description FROM instrument WHERE id = ?",
+        (instrument_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return (
+        int(row["source_id"]),
+        str(row["instrument_id_text"]),
+        str(row["description"]) if row["description"] is not None else None,
+    )
+
+
+def get_plan_leaf_for_node(
+    connection: sqlite3.Connection,
+    *,
+    plan_node_id: int,
+) -> dict:
+    """Return summary info for a plan-leaf node id.
+
+    Returns `{"category_id", "path", "volatility", "adjustment"}` — the
+    fields the report needs to aggregate by leaf and compute risk-parity
+    weights. Raises if the node has children (i.e. isn't a leaf) or if
+    fundamentals are missing on the leaf's category.
+    """
+    row = connection.execute(
+        """
+        SELECT pn.category_id AS category_id,
+               cp.path AS path,
+               c.volatility_micros AS vol_micros,
+               c.adjustment_micros AS adj_micros
+        FROM plan_node pn
+        JOIN category c ON c.id = pn.category_id
+        JOIN category_path cp ON cp.id = pn.category_id
+        WHERE pn.id = ?
+        """,
+        (plan_node_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"plan_node {plan_node_id} not found")
+    if row["vol_micros"] is None:
+        raise ValueError(
+            f"plan-leaf at {row['path']!r} is missing volatility/adjustment fundamentals"
+        )
+    return {
+        "category_id": int(row["category_id"]),
+        "path": str(row["path"]),
+        "volatility": float(row["vol_micros"]) / MICROS_SCALE,
+        "adjustment": float(row["adj_micros"]) / MICROS_SCALE,
+    }
+
+
+def currencies_in_current_positions(
+    connection: sqlite3.Connection,
+    *,
+    user_id: int,
+) -> Iterable[str]:
+    """Return the distinct set of currencies the user currently holds."""
+    rows = connection.execute(
+        """
+        SELECT DISTINCT currency
+        FROM current_position
+        WHERE user_id = ?
+        ORDER BY currency
+        """,
+        (user_id,),
+    ).fetchall()
+    return [str(row["currency"]) for row in rows]

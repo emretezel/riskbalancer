@@ -7,7 +7,7 @@ Author: Emre Tezel
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple, Union
+from typing import Iterable, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -90,24 +90,26 @@ class CategoryTarget:
 
 @dataclass
 class Investment:
-    """Normalized view of a single line item coming from a broker statement."""
+    """Normalized view of a single line item coming from a broker statement.
+
+    `market_value` is in the position's native `currency` — no FX conversion
+    happens at parse time. The database stores the native amount; GBP
+    equivalents are derived at report time by joining `fx_rate`.
+    """
 
     instrument_id: str
     description: str
     market_value: float
-    category: CategoryPath
-    volatility: float
+    currency: str = "GBP"
     source: str = "unknown"
-    # `adapter` and `account` together identify the brokerage account that
-    # produced this position. They are absent on manual entries.
-    adapter: Optional[str] = None
-    account: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.market_value < 0:
             raise ValueError("market_value must not be negative")
-        if self.volatility <= 0:
-            raise ValueError("volatility must be positive")
+        normalised = self.currency.strip().upper()
+        if len(normalised) != 3:
+            raise ValueError("currency must be a 3-letter ISO code")
+        self.currency = normalised
 
 
 @dataclass(frozen=True)

@@ -11,8 +11,11 @@ Author: Emre Tezel
 from __future__ import annotations
 
 import argparse
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
+
+import pytest
 
 from conftest import sandboxed_paths
 from riskbalancer.cli import cmd_user_create, cmd_user_delete, cmd_user_list
@@ -53,8 +56,8 @@ def test_cmd_user_create_refuses_when_db_row_exists(tmp_path: Path, capsys) -> N
     assert "already exists" in captured.err
 
 
-def test_cmd_user_create_requires_user(tmp_path: Path, capsys) -> None:
-    # Empty user simulates "no --user, no env var, no default_user config".
+def test_cmd_user_create_rejects_empty_user(tmp_path: Path) -> None:
+    """An empty user name reaches the DB and is rejected by the schema CHECK."""
     paths = replace(
         UserPaths.for_user(""),
         users_root=tmp_path / "private" / "users",
@@ -62,13 +65,11 @@ def test_cmd_user_create_requires_user(tmp_path: Path, capsys) -> None:
     )
     assert paths.user == ""
 
-    result = cmd_user_create(argparse.Namespace(), paths=paths)
-
-    assert result == 1
-    captured = capsys.readouterr()
-    assert "No user resolved" in captured.err
-    # Nothing should have been created under the users root.
-    assert not paths.users_root.exists()
+    # The DB's `length(name) > 0` CHECK rejects the empty string. The argparse
+    # layer enforces --user is non-empty in production; this test exercises
+    # the belt-and-braces guard at the schema level.
+    with pytest.raises(sqlite3.IntegrityError):
+        cmd_user_create(argparse.Namespace(), paths=paths)
 
 
 def test_cmd_user_list_includes_user_without_plan(tmp_path: Path, capsys) -> None:

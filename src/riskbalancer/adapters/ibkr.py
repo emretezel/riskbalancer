@@ -1,6 +1,11 @@
 """
 Interactive Brokers CSV adapter for RiskBalancer.
 
+The adapter emits positions in their native currency — IBKR statements
+report USD, EUR, GBP, etc. depending on the holding. FX conversion to GBP
+happens at report time using the `fx_rate` table; the adapter does not
+need any FX rates injected.
+
 Author: Emre Tezel
 """
 
@@ -8,26 +13,16 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Mapping, Optional, Sequence, TextIO, Union
+from typing import Optional, Sequence, TextIO, Union
 
-from ..models import CategoryPath, Investment
+from ..models import Investment
 from .base import StatementAdapter
 
 
 class IBKRCSVAdapter(StatementAdapter):
-    """Adapter that parses Interactive Brokers MTM CSV exports and converts to GBP."""
+    """Adapter that parses Interactive Brokers MTM CSV exports."""
 
-    def __init__(
-        self,
-        *,
-        default_category: Optional[CategoryPath] = None,
-        default_volatility: float = 0.2,
-        fx_rates: Optional[Mapping[str, float]] = None,
-    ):
-        super().__init__("Interactive Brokers CSV")
-        self.default_category = default_category or CategoryPath("Uncategorized", "Pending Review")
-        self.default_volatility = default_volatility
-        self.fx_rates = {k.upper(): v for k, v in (fx_rates or {}).items()}
+    source_name = "Interactive Brokers CSV"
 
     def parse_path(self, path: Union[str, Path]) -> Sequence[Investment]:
         with open(path, "r", encoding="utf-8-sig") as handle:
@@ -63,7 +58,7 @@ class IBKRCSVAdapter(StatementAdapter):
         if len(row) < 18:
             return None
         discriminator = row[2]
-        currency = (row[4] or "").strip().upper()
+        currency = (row[4] or "").strip().upper() or "GBP"
         symbol = (row[5] or "").strip()
         description = (row[6] or "").strip()
         if not symbol or not description:
@@ -71,29 +66,13 @@ class IBKRCSVAdapter(StatementAdapter):
         if discriminator != "Summary":
             return None
         market_value = self._parse_number(row[12])
-        gbp_market_value = self._convert_to_gbp(currency, market_value)
-        category = self.default_category
         return Investment(
             instrument_id=symbol or description,
             description=description or symbol,
-            market_value=gbp_market_value,
-            category=category,
-            volatility=self.default_volatility,
+            market_value=market_value,
+            currency=currency,
             source="ibkr",
         )
-
-    def _convert_to_gbp(self, currency: str, value: float) -> float:
-        if currency in {"", "GBP"}:
-            return value
-        if not self.fx_rates:
-            raise ValueError(
-                f"FX rates are required to convert {currency} to GBP. "
-                "Supply --fx when building the portfolio."
-            )
-        rate = self.fx_rates.get(currency)
-        if rate is None:
-            raise ValueError(f"Missing FX rate for {currency} in the supplied FX file")
-        return value * rate
 
     @staticmethod
     def _parse_number(value: str) -> float:

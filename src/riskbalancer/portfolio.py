@@ -1,21 +1,21 @@
 """
-Portfolio planning and analysis utilities for RiskBalancer.
+Portfolio plan container.
+
+The `PortfolioPlan` is the in-memory shape the report consumes: a flat list of
+`CategoryTarget` rows, one per plan-leaf, with target weight + intrinsic
+volatility + adjustment. The richer `Portfolio`/`PortfolioAnalyzer` pair was
+removed when positions migrated to the SQLite `position` table — aggregation
+and risk-parity computation now live in the report command directly, reading
+from the `current_position` view.
 
 Author: Emre Tezel
 """
 
 from __future__ import annotations
 
-from collections import defaultdict
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, Iterable, Sequence
 
-from .models import (
-    CategoryPath,
-    CategoryStatus,
-    CategoryTarget,
-    Investment,
-    normalize_weights,
-)
+from .models import CategoryPath, CategoryTarget
 
 
 class PortfolioPlan:
@@ -53,87 +53,3 @@ class PortfolioPlan:
             if target.path in seen_paths:
                 raise ValueError(f"Duplicate category path specified: {target.path.label()}")
             seen_paths.add(target.path)
-
-
-class Portfolio:
-    """Mutable container for normalized investments."""
-
-    def __init__(self):
-        self._investments: List[Investment] = []
-
-    @property
-    def investments(self) -> Sequence[Investment]:
-        return tuple(self._investments)
-
-    def add_investment(self, investment: Investment) -> None:
-        self._investments.append(investment)
-
-    def extend(self, investments: Iterable[Investment]) -> None:
-        for investment in investments:
-            self.add_investment(investment)
-
-    def add_manual_investment(
-        self,
-        *,
-        instrument_id: str,
-        description: str,
-        market_value: float,
-        category: CategoryPath,
-        volatility: float,
-    ) -> Investment:
-        investment = Investment(
-            instrument_id=instrument_id,
-            description=description,
-            market_value=market_value,
-            category=category,
-            volatility=volatility,
-            source="manual",
-        )
-        self.add_investment(investment)
-        return investment
-
-    def total_value(self) -> float:
-        return sum(inv.market_value for inv in self._investments)
-
-
-class PortfolioAnalyzer:
-    """Computes risk-parity cash weights and diagnostics for a portfolio."""
-
-    def __init__(self, plan: PortfolioPlan, portfolio: Portfolio):
-        self.plan = plan
-        self.portfolio = portfolio
-
-    def _aggregate_by_category(self) -> Dict[CategoryPath, float]:
-        totals: Dict[CategoryPath, float] = defaultdict(float)
-        for investment in self.portfolio.investments:
-            totals[investment.category] += investment.market_value
-        return totals
-
-    def cash_weights(self) -> Dict[CategoryPath, float]:
-        """Risk-parity cash weights derived from target weights and vol."""
-        risk_units = []
-        paths = []
-        for target in self.plan:
-            paths.append(target.path)
-            risk_units.append(target.target_weight / target.volatility)
-        normalized = normalize_weights(risk_units)
-        return {path: weight for path, weight in zip(paths, normalized)}
-
-    def category_status(self) -> List[CategoryStatus]:
-        totals = self._aggregate_by_category()
-        total_value = self.portfolio.total_value()
-        if total_value <= 0:
-            raise ValueError("Portfolio total value must be positive to compute weights")
-
-        cash_weights = self.cash_weights()
-        statuses: List[CategoryStatus] = []
-        for target in self.plan:
-            actual_weight = totals.get(target.path, 0.0) / total_value
-            statuses.append(
-                CategoryStatus(
-                    path=target.path,
-                    actual_weight=actual_weight,
-                    target_cash_weight=cash_weights[target.path],
-                )
-            )
-        return statuses

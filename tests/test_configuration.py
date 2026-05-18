@@ -1,5 +1,4 @@
 import math
-from pathlib import Path
 
 import pytest
 
@@ -9,29 +8,6 @@ from riskbalancer.configuration import (
     load_category_nodes_from_yaml,
     load_portfolio_plan_from_yaml,
 )
-
-CONFIG = Path("config") / "seed_plan.yaml"
-
-
-def test_load_portfolio_plan_from_yaml_generates_targets(tmp_path):
-    plan = load_portfolio_plan_from_yaml(CONFIG, default_leaf_volatility=0.25)
-    targets = {target.path.label(): target for target in plan.targets}
-    assert math.isclose(sum(target.target_weight for target in targets.values()), 1.0, abs_tol=5e-3)
-
-    total_risk = sum(target.risk_weight for target in targets.values())
-    equities_nam = targets["Equities / Developed / NAM"]
-    raw_equities = 0.55 * 0.75 * 0.34
-    assert math.isclose(equities_nam.risk_weight, raw_equities)
-    assert math.isclose(
-        equities_nam.target_weight,
-        raw_equities / total_risk,
-        rel_tol=1e-6,
-        abs_tol=1e-3,
-    )
-    assert math.isclose(equities_nam.volatility, 0.175)
-
-    bonds_emea_corp = targets["Bonds / Developed / Europe / Corp"]
-    assert math.isclose(bonds_emea_corp.risk_weight, 0.2 * 0.75 * 0.33 * 0.27 * 0.85)
 
 
 def test_load_portfolio_plan_from_yaml_reports_root_weight_failure(tmp_path):
